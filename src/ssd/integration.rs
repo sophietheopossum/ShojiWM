@@ -734,10 +734,12 @@ impl ShojiWM {
         let windows_pass_started_at = Instant::now();
         for window in windows {
             let primary_output_name = self.primary_output_name_for_window(&window);
-            if let Some(target_output_name) = target_output_name {
-                if primary_output_name.as_deref() != Some(target_output_name) {
-                    continue;
-                }
+            if !should_process_window_for_refresh(
+                primary_output_name.as_deref(),
+                target_output_name,
+                force_async_asset_refresh,
+            ) {
+                continue;
             }
             if let Some(primary_output_name) = primary_output_name {
                 self.window_primary_output_names
@@ -3892,6 +3894,19 @@ fn freeze_manual_shader_buffers(
     }
 }
 
+fn should_process_window_for_refresh(
+    primary_output_name: Option<&str>,
+    target_output_name: Option<&str>,
+    force_async_asset_refresh: bool,
+) -> bool {
+    if force_async_asset_refresh {
+        return true;
+    }
+
+    target_output_name
+        .is_none_or(|target_output_name| primary_output_name == Some(target_output_name))
+}
+
 fn collect_keyed_rect_damage<K>(
     previous: impl IntoIterator<Item = (K, (LogicalRect, String))>,
     next: impl IntoIterator<Item = (K, (LogicalRect, String))>,
@@ -3928,6 +3943,25 @@ mod tests {
         BorderStyle, BoxNode, Color, DecorationNode, DecorationNodeKind, DecorationStyle, Edges,
         LayoutDirection, StylePosition,
     };
+
+    #[test]
+    fn async_asset_refresh_processes_windows_outside_target_output() {
+        assert!(should_process_window_for_refresh(
+            Some("eDP-1"),
+            Some("DP-4"),
+            true,
+        ));
+        assert!(!should_process_window_for_refresh(
+            Some("eDP-1"),
+            Some("DP-4"),
+            false,
+        ));
+        assert!(should_process_window_for_refresh(
+            Some("DP-4"),
+            Some("DP-4"),
+            false,
+        ));
+    }
 
     #[test]
     fn layout_for_client_aligns_window_slot_with_client_rect() {
