@@ -10,9 +10,9 @@ use smithay::{
     desktop::{
         Space, Window, layer_map_for_output,
         utils::{
-            OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
-            surface_primary_scanout_output, update_surface_primary_scanout_output,
-            with_surfaces_surface_tree,
+            OutputPresentationFeedback, send_frames_surface_tree,
+            surface_presentation_feedback_flags_from_states, surface_primary_scanout_output,
+            update_surface_primary_scanout_output, with_surfaces_surface_tree,
         },
     },
     output::Output,
@@ -243,6 +243,11 @@ impl ShojiWM {
         for layer_surface in map.layers() {
             layer_surface.send_frame(output, time, throttle, &should_send);
         }
+        drop(map);
+
+        if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &self.cursor_status {
+            send_frames_surface_tree(surface, output, time, throttle, &should_send);
+        }
 
         if debug {
             info!(
@@ -321,6 +326,15 @@ impl ShojiWM {
         let map = layer_map_for_output(output);
         for layer_surface in map.layers() {
             layer_surface.send_frame(output, time, throttle, &should_send);
+        }
+        drop(map);
+
+        // Cursor surfaces (e.g. Xwayland cursor surfaces forwarded by xwayland-satellite)
+        // also need frame callbacks so the client can commit subsequent cursor buffers — without
+        // these, set_cursor calls following the first one stall and the cursor type stops
+        // updating.
+        if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &self.cursor_status {
+            send_frames_surface_tree(surface, output, time, throttle, &should_send);
         }
 
         if debug {
@@ -506,6 +520,50 @@ impl ShojiWM {
         }
 
         drop(map);
+
+        // Update fractional scale on cursor surfaces too. This matters for Xwayland-via-
+        // satellite, which sizes its cursor buffers based on the preferred scale; without
+        // these notifications it never learns that the cursor moved to a different-scale
+        // output and renders cursors at the wrong size (most visibly: huge near monitor edges
+        // and after crossing scale boundaries).
+        if let smithay::input::pointer::CursorImageStatus::Surface(cursor_surface) =
+            &self.cursor_status
+        {
+            with_surfaces_surface_tree(cursor_surface, |surface, states| {
+                let primary_scanout_output = surface_primary_scanout_output(surface, states);
+                if let Some(scanout) = primary_scanout_output.as_ref() {
+                    let scale = scanout.current_scale().fractional_scale();
+                    with_fractional_scale(states, |fractional_scale| {
+                        if debug_scale {
+                            let protocol_id = surface.id().protocol_id();
+                            let prev = previous_preferred_scale(protocol_id, scale);
+                            if prev != Some(scale) {
+                                info!(
+                                    surface = ?surface.id(),
+                                    output = %scanout.name(),
+                                    prev_scale = ?prev,
+                                    new_scale = scale,
+                                    "preferred scale changed for cursor surface"
+                                );
+                            }
+                        }
+                        fractional_scale.set_preferred_scale(scale);
+                    });
+                }
+                let fifo_barrier = states
+                    .cached_state
+                    .get::<FifoBarrierCachedState>()
+                    .current()
+                    .barrier
+                    .take();
+                if let Some(fifo_barrier) = fifo_barrier {
+                    fifo_barrier.signal();
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
+                }
+            });
+        }
 
         let dh = self.display_handle.clone();
         for client in clients.into_values() {

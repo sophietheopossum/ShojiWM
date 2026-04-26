@@ -136,6 +136,26 @@ impl CompositorHandler for ShojiWM {
                 // / xdg-shell / mapped-window tracking, so we must schedule the redraw here
                 // (niri does the equivalent via its own cursor-surface branch).
                 cursor_surface_committed = true;
+                // Apply the role-specific buffer offset to the hotspot so the cursor stays
+                // anchored when the client attaches a buffer at a non-zero (x, y).
+                if surface == &root {
+                    with_states(surface, |states| {
+                        if let Some(attrs) = states
+                            .data_map
+                            .get::<Mutex<smithay::input::pointer::CursorImageAttributes>>()
+                        {
+                            let buffer_delta = states
+                                .cached_state
+                                .get::<SurfaceAttributes>()
+                                .current()
+                                .buffer_delta
+                                .take();
+                            if let Some(buffer_delta) = buffer_delta {
+                                attrs.lock().unwrap().hotspot -= buffer_delta;
+                            }
+                        }
+                    });
+                }
             }
             if x11_browser_cpu_debug_enabled() {
                 if let Some(window) = mapped_window {
