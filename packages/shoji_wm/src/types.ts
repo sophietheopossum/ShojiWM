@@ -347,15 +347,19 @@ export interface OutputController {
 
 export type ProcessEnv = Record<string, string>;
 
+/**
+ * How a process is launched.
+ *
+ * - When `command` is a single string, it's run via `/bin/sh -lc <command>`,
+ *   so shell features like pipes, redirection and environment expansion work.
+ * - When `command` is a string array, it's exec'd directly with no shell
+ *   involvement (each element is one argv entry, taken literally).
+ */
 export interface ProcessCommandSpec {
-  command: string[];
+  command: string | string[];
 }
 
-export interface ProcessShellSpec {
-  shell: string;
-}
-
-export type ProcessLaunchSpec = ProcessCommandSpec | ProcessShellSpec;
+export type ProcessLaunchSpec = ProcessCommandSpec;
 
 export interface ProcessBaseSpec {
   cwd?: string;

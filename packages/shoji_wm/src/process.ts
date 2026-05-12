@@ -19,16 +19,14 @@ interface RuntimeProcessConfigEntryCommon {
 interface RuntimeOnceProcessConfigEntry extends RuntimeProcessConfigEntryCommon {
   kind: "once";
   runPolicy: StartupProcessRunPolicy;
-  command?: string[];
-  shell?: string;
+  command: string | string[];
 }
 
 interface RuntimeServiceProcessConfigEntry extends RuntimeProcessConfigEntryCommon {
   kind: "service";
   restart: ManagedProcessRestartPolicy;
   reload: ManagedProcessReloadPolicy;
-  command?: string[];
-  shell?: string;
+  command: string | string[];
 }
 
 type RuntimeProcessConfigEntry =
@@ -38,8 +36,7 @@ type RuntimeProcessConfigEntry =
 interface RuntimeSpawnProcessAction {
   cwd?: string;
   env?: ProcessEnv;
-  command?: string[];
-  shell?: string;
+  command: string | string[];
 }
 
 let processBaseDir = "/";
@@ -59,19 +56,11 @@ function cloneEnv(env: ProcessEnv | undefined): ProcessEnv | undefined {
   return Object.fromEntries(Object.entries(env).map(([key, value]) => [key, String(value)]));
 }
 
-function cloneLaunch(spec: ProcessLaunchSpec): {
-  command?: string[];
-  shell?: string;
-} {
-  if ("command" in spec) {
-    return {
-      command: spec.command.map((part) => String(part)),
-    };
+function cloneLaunch(spec: ProcessLaunchSpec): { command: string | string[] } {
+  if (Array.isArray(spec.command)) {
+    return { command: spec.command.map((part) => String(part)) };
   }
-
-  return {
-    shell: String(spec.shell),
-  };
+  return { command: String(spec.command) };
 }
 
 function normalizeCwd(cwd: string | undefined): string | undefined {
@@ -86,7 +75,7 @@ function cloneConfigEntry(
 ): RuntimeProcessConfigEntry {
   return {
     ...entry,
-    command: entry.command ? [...entry.command] : undefined,
+    command: Array.isArray(entry.command) ? [...entry.command] : entry.command,
     env: cloneEnv(entry.env),
   };
 }
@@ -182,7 +171,7 @@ export function takePendingProcessConfig():
 export function drainPendingProcessActions(): RuntimeSpawnProcessAction[] {
   return pendingSpawnActions.splice(0, pendingSpawnActions.length).map((action) => ({
     ...action,
-    command: action.command ? [...action.command] : undefined,
+    command: Array.isArray(action.command) ? [...action.command] : action.command,
     env: cloneEnv(action.env),
   }));
 }

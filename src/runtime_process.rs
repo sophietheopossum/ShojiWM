@@ -53,18 +53,25 @@ pub struct RuntimeProcessAction {
     pub env: BTreeMap<String, String>,
 }
 
+/// How a runtime process should be launched.
+///
+/// Distinguished purely by the *type* of the `command` JSON field:
+/// - a string is interpreted as a shell command line (`/bin/sh -lc <command>`),
+///   which is what you want when the command needs pipes, redirection, or
+///   environment expansion.
+/// - an array of strings is exec'd directly with no shell involvement.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(untagged)]
 pub enum RuntimeProcessLaunch {
+    Shell { command: String },
     Command { command: Vec<String> },
-    Shell { shell: String },
 }
 
 impl RuntimeProcessLaunch {
     pub fn is_valid(&self) -> bool {
         match self {
             Self::Command { command } => !command.is_empty(),
-            Self::Shell { shell } => !shell.trim().is_empty(),
+            Self::Shell { command } => !command.trim().is_empty(),
         }
     }
 }
@@ -137,15 +144,15 @@ pub fn spawn_runtime_process(
             }
             cmd
         }
-        RuntimeProcessLaunch::Shell { shell } => {
-            if shell.trim().is_empty() {
+        RuntimeProcessLaunch::Shell { command } => {
+            if command.trim().is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "process shell command must not be empty",
                 ));
             }
             let mut cmd = Command::new("/bin/sh");
-            cmd.arg("-lc").arg(shell);
+            cmd.arg("-lc").arg(command);
             cmd
         }
     };
