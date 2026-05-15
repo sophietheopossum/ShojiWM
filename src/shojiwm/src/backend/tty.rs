@@ -1094,7 +1094,13 @@ fn render_surface(
                 "mpv frame debug: render_start"
             );
         }
-        let mut cursor_elements: Vec<TtyRenderElements> = Vec::new();
+        // The raw `PointerRenderElement` Vec is kept separately so the
+        // toplevel image-copy-capture path can wrap each cursor with a
+        // window-local `RelocateRenderElement` before rendering. After the
+        // capture pass we move the same elements into the unified
+        // `TtyRenderElements::Cursor` list used by the DRM render and the
+        // other capture queues.
+        let mut cursor_pointer_elements: Vec<PointerRenderElement<GlesRenderer>> = Vec::new();
         let mut frame_had_transform_snapshot_damage = false;
         let mut frame_transform_snapshot_window_count = 0usize;
         let mut frame_snapshot_damage_window_count = 0usize;
@@ -1176,12 +1182,11 @@ fn render_surface(
                 .to_physical(scale)
                 .to_i32_round();
 
-            cursor_elements.extend(
-                pointer_element
-                    .render_elements(&mut backend.renderer, cursor_location, scale, 1.0)
-                    .into_iter()
-                    .map(TtyRenderElements::Cursor),
-            );
+            cursor_pointer_elements.extend(pointer_element.render_elements::<
+                PointerRenderElement<GlesRenderer>,
+            >(
+                &mut backend.renderer, cursor_location, scale, 1.0
+            ));
         }
         let cursor_elapsed_ms = cursor_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.cursor_elapsed_ms = cursor_elapsed_ms;
@@ -3641,7 +3646,7 @@ fn render_surface(
         content_for_capture.extend(content_elements);
         // The element count for diagnostics — final elements is built below
         // after capture has run against the by-reference slices.
-        timing.render_element_count = cursor_elements.len() + content_for_capture.len();
+        timing.render_element_count = cursor_pointer_elements.len() + content_for_capture.len();
 
         trace!(
             ?node,
@@ -3653,6 +3658,26 @@ fn render_surface(
             "rendering tty surface"
         );
 
+        // Phase 5b-iii / 5f: drain toplevel captures first while we still
+        // have the raw cursor PointerRenderElement Vec (those need window-
+        // local translation that we can't apply after wrapping into
+        // TtyRenderElements::Cursor).
+        let presented = start_time.elapsed();
+        crate::backend::image_copy_capture_render::process_image_copy_capture_for_toplevels(
+            image_copy_capture_pending,
+            space,
+            &mut backend.renderer,
+            &cursor_pointer_elements,
+            presented,
+        );
+
+        // Now wrap cursor elements into the unified TtyRenderElements list
+        // used by the output capture paths and the DRM render.
+        let cursor_elements: Vec<TtyRenderElements> = cursor_pointer_elements
+            .into_iter()
+            .map(TtyRenderElements::Cursor)
+            .collect();
+
         crate::backend::screencopy_render::process_screencopy_queue_for_output(
             screencopy_state,
             loop_handle,
@@ -3661,23 +3686,13 @@ fn render_surface(
             &content_for_capture,
             &cursor_elements,
         );
-
         // Phase 5b-ii: serve ext-image-copy-capture-v1 frames for this output
         // alongside the existing wlr-screencopy queue.
-        let presented = start_time.elapsed();
         crate::backend::image_copy_capture_render::process_image_copy_capture_for_output(
             image_copy_capture_pending,
             &mut backend.renderer,
             &output,
             &content_for_capture,
-            &cursor_elements,
-            presented,
-        );
-        // Phase 5b-iii: drain queued toplevel captures.
-        crate::backend::image_copy_capture_render::process_image_copy_capture_for_toplevels(
-            image_copy_capture_pending,
-            space,
-            &mut backend.renderer,
             &cursor_elements,
             presented,
         );

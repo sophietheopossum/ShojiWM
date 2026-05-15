@@ -245,7 +245,23 @@ fn resolve_source_size(
         })?;
         let geom = window.geometry();
         if geom.size.w > 0 && geom.size.h > 0 {
-            return Some(geom.size.to_buffer(1, Transform::Normal));
+            // Buffer dims must match the scale the render path uses (cursor
+            // elements come in at output-physical scale; rendering at
+            // anything else creates a cursor / window scale mismatch). Pick
+            // the scale of the output the window is primarily on.
+            let scale = state
+                .space
+                .outputs_for_element(window)
+                .into_iter()
+                .next()
+                .map(|o| o.current_scale().fractional_scale())
+                .unwrap_or(1.0);
+            let w = (geom.size.w as f64 * scale).round().max(1.0) as i32;
+            let h = (geom.size.h as f64 * scale).round().max(1.0) as i32;
+            return Some(
+                smithay::utils::Size::<i32, smithay::utils::Logical>::from((w, h))
+                    .to_buffer(1, Transform::Normal),
+            );
         }
     }
     None

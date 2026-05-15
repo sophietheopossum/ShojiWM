@@ -16,16 +16,31 @@ use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement
 use smithay::backend::renderer::element::{AsRenderElements, RenderElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame as _, Offscreen, Renderer};
+use smithay::backend::renderer::{
+    Bind, Color32F, ExportMem, Frame as _, ImportAll, ImportMem, Offscreen, Renderer,
+};
 use smithay::desktop::{Space, Window};
 use smithay::output::{Output, WeakOutput};
 use smithay::reexports::wayland_server::protocol::wl_shm;
+use smithay::render_elements;
 use smithay::utils::{Physical, Rectangle, Scale, Size, Transform};
 use smithay::wayland::foreign_toplevel_list::{ForeignToplevelHandle, ForeignToplevelWeakHandle};
 use smithay::wayland::image_copy_capture::{CaptureFailureReason, Frame};
 use smithay::wayland::shm;
 
 use crate::backend::tty::TtyRenderElements;
+use crate::drawing::PointerRenderElement;
+
+// Sum type used only by the toplevel-capture render path so we can hand a
+// single iterator (window content + translated cursor) to `render_to_shm`.
+// The cursor is wrapped by reference because `PointerRenderElement` isn't
+// `Clone` (its inner `WaylandSurfaceRenderElement` lacks the impl) and the
+// raw cursor stack is still needed afterwards for the DRM render.
+render_elements! {
+    pub ToplevelCaptureElement<'a, R> where R: ImportAll + ImportMem;
+    Window=WaylandSurfaceRenderElement<R>,
+    TranslatedCursor=RelocateRenderElement<&'a PointerRenderElement<R>>,
+}
 
 /// A pending image-copy-capture frame held in the global queue. Drained by
 /// whichever backend code path can satisfy it (outputs in 5b-ii, toplevels in
@@ -105,7 +120,7 @@ pub fn process_image_copy_capture_for_toplevels(
     pending: &mut Vec<PendingCapture>,
     space: &Space<Window>,
     renderer: &mut GlesRenderer,
-    cursor_elements: &[TtyRenderElements],
+    cursor_pointer_elements: &[PointerRenderElement<GlesRenderer>],
     presented: Duration,
 ) {
     let mut i = 0;
@@ -132,7 +147,11 @@ pub fn process_image_copy_capture_for_toplevels(
             space,
             &handle,
             &frame,
-            if draw_cursor { cursor_elements } else { &[] },
+            if draw_cursor {
+                cursor_pointer_elements
+            } else {
+                &[]
+            },
         ) {
             Ok(()) => {
                 frame.success(Transform::Normal, None, presented);
@@ -150,14 +169,8 @@ fn render_frame_for_toplevel(
     space: &Space<Window>,
     handle: &ForeignToplevelHandle,
     frame: &Frame,
-    _cursor_elements: &[TtyRenderElements],
+    cursor_pointer_elements: &[PointerRenderElement<GlesRenderer>],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Cursor compositing for per-window captures is intentionally not done
-    // here: the cursor element stack uses workspace-physical coordinates and
-    // would need wrapping in RelocateRenderElement<TtyRenderElements> to
-    // land in the window's local frame. TtyRenderElements doesn't include
-    // that variant today. Until we add it, toplevel capture is always
-    // cursor-less regardless of the session's paint_cursors option.
     let window = space
         .elements()
         .find(|w| {
@@ -171,12 +184,58 @@ fn render_frame_for_toplevel(
     if geom.size.w <= 0 || geom.size.h <= 0 {
         return Err("window has zero geometry".into());
     }
-    let size: Size<i32, Physical> = (geom.size.w, geom.size.h).into();
-    let scale: Scale<f64> = (1.0_f64).into();
+    // Cursor elements were built in `tty.rs` at the output's fractional
+    // scale: their embedded location is in physical pixels at that scale. To
+    // make their coordinates line up with the window content, render the
+    // whole frame at the same scale rather than at 1.0. Window content uses
+    // logical coords internally and renders cleanly at any scale, so this
+    // also gives crisper output for HiDPI windows.
+    //
+    // `resolve_source_size` in handlers/mod.rs advertises the buffer at the
+    // same scale so the negotiated buffer dims and our render size match.
+    let scale: Scale<f64> = space
+        .outputs_for_element(&window)
+        .into_iter()
+        .next()
+        .map(|o| o.current_scale().fractional_scale().into())
+        .unwrap_or_else(|| (1.0_f64).into());
+    let size: Size<i32, Physical> = (
+        ((geom.size.w as f64) * scale.x).round().max(1.0) as i32,
+        ((geom.size.h as f64) * scale.y).round().max(1.0) as i32,
+    )
+        .into();
 
-    let location: smithay::utils::Point<i32, Physical> = (-geom.loc.x, -geom.loc.y).into();
-    let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+    // Window content: render with origin at (0,0) of the buffer. `geom.loc`
+    // can be non-zero (CSD insets); subtract it (scaled to physical) so the
+    // buffer lines up with the window's natural top-left.
+    let location: smithay::utils::Point<i32, Physical> = (
+        (-(geom.loc.x as f64) * scale.x).round() as i32,
+        (-(geom.loc.y as f64) * scale.y).round() as i32,
+    )
+        .into();
+    let mut elements: Vec<ToplevelCaptureElement<'_, GlesRenderer>> =
         window.render_elements(renderer, location, scale, 1.0);
+
+    // Compose cursor on top in window-local coords. Cursor sits at workspace-
+    // physical-at-output-scale; subtract the window's geometry-origin position
+    // in the same coordinate system to land it in buffer-local space.
+    if !cursor_pointer_elements.is_empty()
+        && let Some(window_loc) = space.element_location(&window)
+    {
+        let geom_origin_phys: smithay::utils::Point<i32, Physical> = (
+            ((window_loc.x + geom.loc.x) as f64 * scale.x).round() as i32,
+            ((window_loc.y + geom.loc.y) as f64 * scale.y).round() as i32,
+        )
+            .into();
+        for cursor in cursor_pointer_elements {
+            let translated = RelocateRenderElement::from_element(
+                cursor,
+                (-geom_origin_phys.x, -geom_origin_phys.y),
+                Relocate::Relative,
+            );
+            elements.push(ToplevelCaptureElement::TranslatedCursor(translated));
+        }
+    }
 
     let buffer = frame.buffer();
     render_to_shm(
