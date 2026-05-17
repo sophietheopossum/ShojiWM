@@ -44,6 +44,15 @@ pub struct WindowPositionSnapshot {
     pub height: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedWindowRectSnapshot {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WaylandLayerSnapshot {
@@ -125,6 +134,44 @@ impl Default for WindowTransform {
 pub struct TransformOrigin {
     pub x: f64,
     pub y: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedWindowState {
+    #[serde(default)]
+    pub managed: bool,
+    pub rect: Option<ManagedWindowRectSnapshot>,
+    pub workspace: Option<serde_json::Value>,
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    #[serde(default)]
+    pub idle: bool,
+    #[serde(default = "default_true")]
+    pub interactive: bool,
+    #[serde(default)]
+    pub z_index: i32,
+    #[serde(default)]
+    pub transform: WindowTransform,
+}
+
+impl Default for ManagedWindowState {
+    fn default() -> Self {
+        Self {
+            rect: None,
+            managed: false,
+            workspace: None,
+            visible: true,
+            idle: false,
+            interactive: true,
+            z_index: 0,
+            transform: WindowTransform::default(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]

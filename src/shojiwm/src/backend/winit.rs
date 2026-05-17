@@ -228,10 +228,11 @@ pub fn init_winit(
                         let output_geo = state.space.output_geometry(&output).unwrap();
                         let scale =
                             smithay::utils::Scale::from(output.current_scale().fractional_scale());
-                        let windows: Vec<_> =
-                            state.space.elements_for_output(&output).cloned().collect();
-                        let windows_top_to_bottom: Vec<_> =
-                            windows.iter().rev().cloned().collect();
+                        let windows_top_to_bottom: Vec<_> = state
+                            .windows_for_output_top_to_bottom(&output)
+                            .into_iter()
+                            .cloned()
+                            .collect();
                         let mut extra_damage = state.pending_decoration_damage.clone();
                         if state.force_full_damage {
                             extra_damage.push(crate::ssd::LogicalRect::new(
@@ -268,6 +269,13 @@ pub fn init_winit(
                             else {
                                 continue;
                             };
+                            if state
+                                .window_decorations
+                                .get(window)
+                                .is_some_and(|decoration| !decoration.managed_window_allows_render())
+                            {
+                                continue;
+                            }
                             if state.closing_window_snapshots.contains_key(&window_id) {
                                 continue;
                             }

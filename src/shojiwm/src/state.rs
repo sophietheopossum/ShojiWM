@@ -1744,10 +1744,13 @@ impl ShojiWM {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.space.elements().rev().find_map(|window| {
+        self.windows_top_to_bottom().into_iter().find_map(|window| {
             let location = self.space.element_location(window)?;
 
             if let Some(decoration) = self.window_decorations.get(window) {
+                if !decoration.managed_window_allows_input() {
+                    return None;
+                }
                 let local_pos = inverse_transform_point(
                     pos,
                     decoration.layout.root.rect,
@@ -1835,8 +1838,11 @@ impl ShojiWM {
         &self,
         logical_pos: LogicalPoint,
     ) -> Option<(&Window, &WindowDecorationState)> {
-        self.space.elements().rev().find_map(|window| {
+        self.windows_top_to_bottom().into_iter().find_map(|window| {
             let decoration = self.window_decorations.get(window)?;
+            if !decoration.managed_window_allows_input() {
+                return None;
+            }
             let transformed_root =
                 transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
             transformed_root
@@ -1846,7 +1852,12 @@ impl ShojiWM {
     }
 
     pub fn raw_window_under(&self, logical_pos: LogicalPoint) -> Option<(&Window, LogicalRect)> {
-        self.space.elements().rev().find_map(|window| {
+        self.windows_top_to_bottom().into_iter().find_map(|window| {
+            if let Some(decoration) = self.window_decorations.get(window)
+                && !decoration.managed_window_allows_input()
+            {
+                return None;
+            }
             let location = self.space.element_location(window)?;
             let bbox = window.bbox();
             let rect = LogicalRect::new(
@@ -1857,6 +1868,37 @@ impl ShojiWM {
             );
             rect.contains(logical_pos).then_some((window, rect))
         })
+    }
+
+    pub fn windows_top_to_bottom(&self) -> Vec<&Window> {
+        self.sorted_windows_top_to_bottom(self.space.elements())
+    }
+
+    pub fn windows_for_output_top_to_bottom<'a>(&'a self, output: &'a Output) -> Vec<&'a Window> {
+        self.sorted_windows_top_to_bottom(self.space.elements_for_output(output))
+    }
+
+    fn sorted_windows_top_to_bottom<'a, I>(&self, windows: I) -> Vec<&'a Window>
+    where
+        I: IntoIterator<Item = &'a Window>,
+    {
+        let mut indexed = windows.into_iter().enumerate().collect::<Vec<_>>();
+        indexed.sort_by(|(left_index, left), (right_index, right)| {
+            let left_z = self.managed_window_z_index(left);
+            let right_z = self.managed_window_z_index(right);
+            right_z
+                .cmp(&left_z)
+                .then_with(|| right_index.cmp(left_index))
+        });
+        indexed.into_iter().map(|(_, window)| window).collect()
+    }
+
+    pub fn managed_window_z_index(&self, window: &Window) -> i32 {
+        self.window_decorations
+            .get(window)
+            .filter(|decoration| decoration.managed_window.managed)
+            .map(|decoration| decoration.managed_window.z_index)
+            .unwrap_or(0)
     }
 
     pub fn layer_surface_under(&self, pos: Point<f64, Logical>) -> Option<LayerSurface> {

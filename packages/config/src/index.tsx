@@ -18,13 +18,12 @@ import {
     seconds,
     cubicBezier,
     useState,
-    computed,
-    shaderInput,
     shaderStage,
     loadShader,
     windowSource,
+    ManagedWindow,
 } from "shoji_wm";
-import type { DecorationRenderable, Direction, MaybeSignal } from "shoji_wm/types";
+import type { DecorationRenderable, ManagedWindowRect, WindowPosition } from "shoji_wm/types";
 
 const NOCTALIA_SHELL_PATH = "/home/bea4dev/Documents/development/noctalia-shell-shojiwm";
 
@@ -84,8 +83,7 @@ WINDOW_MANAGER.output.applyDisplayConfig((display) => {
     };
 });
 
-const openAnimation = animationVariable("window.open")
-const focusAnimation = animationVariable("window.focus");
+const openAnimation = animationVariable("window.open");
 
 WINDOW_MANAGER.effect.background_effect = compileEffect({
     input: backdropSource(),
@@ -141,14 +139,16 @@ WINDOW_MANAGER.effect.window = (window) => ({
 
 const OPEN_CLOSE_ANIMATION_DURATION = seconds(1.0)
 
+const WINDOW_RECTS = new Map<string, WindowPosition>();
+
 WINDOW_MANAGER.event.onOpen((window) => {
+    WINDOW_RECTS.set(window.id, window.rect ?? { x: 100, y: 200, width: 100, height: 100 });
     window.setCloseAnimationDuration(OPEN_CLOSE_ANIMATION_DURATION);
     window.animation.start(openAnimation, {
         duration: OPEN_CLOSE_ANIMATION_DURATION,
         to: 1,
         easing: cubicBezier(0.1, 0.93, 0.1, 0.93)
     });
-    window.animation.set(focusAnimation, window.isFocused() ? 1 : 1);
 });
 
 WINDOW_MANAGER.event.onStartClose((window) => {
@@ -169,17 +169,16 @@ WINDOW_MANAGER.event.onFocus((window, focused) => {
 });
 
 WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
-    const scale = window.animation.signal(focusAnimation);
+    const baseRect = { x: 100, y: 200, width: 700, height: 700 };
     const openVariable = window.animation.signal(openAnimation);
     const opacity = openVariable;
     const translateY = openVariable(variable => (1 - variable) * 200);
-
-    window.transform.origin = { x: 0.5, y: 0.5 };
-    window.transform.translateX = 0;
-    window.transform.translateY = translateY;
-    window.transform.scaleX = scale;
-    window.transform.scaleY = scale;
-    window.transform.opacity = opacity;
+    const rect: ManagedWindowRect = {
+        x: baseRect.x,
+        y: translateY(value => baseRect.y + value),
+        width: baseRect.width,
+        height: baseRect.height
+    };
 
     const borderColor = window.isFocused(focused => focused ? "#d7ba7d" : "#4f5666");
     const titlebarBackground = window.isFocused(focused => focused ? "#1f243080" : "#2a2f3a80");
@@ -271,20 +270,22 @@ WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
     }
 
     return (
-        <WindowBorder
-            style={{
-                border: { px: 2, color: borderColor },
-                borderRadius: 10,
-                background: "#10131900",
-                padding: 0,
-                paddingX: 0,
-                paddingRight: 0,
-            }}
-        >
-            <Box direction="row">
-                {innerComponents}
-            </Box>
-        </WindowBorder>
+        <ManagedWindow rect={rect} opacity={opacity}>
+            <WindowBorder
+                style={{
+                    border: { px: 2, color: borderColor },
+                    borderRadius: 10,
+                    background: "#10131900",
+                    padding: 0,
+                    paddingX: 0,
+                    paddingRight: 0,
+                }}
+            >
+                <Box direction="row">
+                    {innerComponents}
+                </Box>
+            </WindowBorder>
+        </ManagedWindow>
     );
 };
 

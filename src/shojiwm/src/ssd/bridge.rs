@@ -364,6 +364,9 @@ impl TryFrom<WireDecorationNode> for DecorationNode {
             }),
             "Window" => DecorationNodeKind::WindowSlot,
             "WindowBorder" => DecorationNodeKind::WindowBorder,
+            "ManagedWindow" => DecorationNodeKind::Box(BoxNode {
+                direction: LayoutDirection::Column,
+            }),
             "Fragment" => DecorationNodeKind::Box(BoxNode {
                 direction: LayoutDirection::Column,
             }),

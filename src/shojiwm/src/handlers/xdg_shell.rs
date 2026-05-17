@@ -16,7 +16,7 @@ use smithay::{
             protocol::{wl_seat, wl_surface::WlSurface},
         },
     },
-    utils::{Rectangle, Serial},
+    utils::{Rectangle, Serial, Size},
     wayland::{
         compositor::with_states,
         shell::xdg::{
@@ -107,6 +107,37 @@ impl XdgShellHandler for ShojiWM {
 
         self.space
             .map_element(window.clone(), initial_location, false);
+        let mapped_snapshot = self.snapshot_window(&window);
+        let initial_managed_client_rect =
+            match self.initial_managed_window_client_rect(&mapped_snapshot) {
+                Ok(rect) => rect,
+                Err(error) => {
+                    warn!(
+                        window_id = mapped_snapshot.id,
+                        title = mapped_snapshot.title,
+                        app_id = mapped_snapshot.app_id,
+                        error = ?error,
+                        "failed to compute initial managed window rect"
+                    );
+                    None
+                }
+            };
+        if let Some(client_rect) = initial_managed_client_rect {
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.size = Some(Size::from((client_rect.width, client_rect.height)));
+                });
+                toplevel.send_configure();
+            }
+            let geometry = window.geometry();
+            self.space.relocate_element(
+                &window,
+                (
+                    client_rect.x - geometry.loc.x,
+                    client_rect.y - geometry.loc.y,
+                ),
+            );
+        }
         // Announce the new toplevel on ext-foreign-toplevel-list-v1 so shells
         // and the portal picker can see it. Has to happen after map so the
         // initial title/app_id reads from xdg state succeed.

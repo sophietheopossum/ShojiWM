@@ -1109,8 +1109,30 @@ fn render_surface(
         let pointer_pos = seat.get_pointer().unwrap().current_location();
         let output_geo = space.output_geometry(&output).unwrap();
         let scale = Scale::from(output.current_scale().fractional_scale());
-        let windows: Vec<_> = space.elements_for_output(&output).cloned().collect();
-        let windows_top_to_bottom: Vec<_> = windows.iter().rev().cloned().collect();
+        let mut indexed_windows_top_to_bottom: Vec<_> = space
+            .elements_for_output(&output)
+            .cloned()
+            .enumerate()
+            .collect();
+        indexed_windows_top_to_bottom.sort_by(|(left_index, left), (right_index, right)| {
+            let left_z = window_decorations
+                .get(left)
+                .filter(|decoration| decoration.managed_window.managed)
+                .map(|decoration| decoration.managed_window.z_index)
+                .unwrap_or(0);
+            let right_z = window_decorations
+                .get(right)
+                .filter(|decoration| decoration.managed_window.managed)
+                .map(|decoration| decoration.managed_window.z_index)
+                .unwrap_or(0);
+            right_z
+                .cmp(&left_z)
+                .then_with(|| right_index.cmp(left_index))
+        });
+        let windows_top_to_bottom: Vec<_> = indexed_windows_top_to_bottom
+            .into_iter()
+            .map(|(_, window)| window)
+            .collect();
         let all_windows: Vec<_> = space.elements().cloned().collect();
         let window_count = all_windows.len();
         let closing_snapshots = closing_window_snapshots
@@ -1182,11 +1204,14 @@ fn render_surface(
                 .to_physical(scale)
                 .to_i32_round();
 
-            cursor_pointer_elements.extend(pointer_element.render_elements::<
-                PointerRenderElement<GlesRenderer>,
-            >(
-                &mut backend.renderer, cursor_location, scale, 1.0
-            ));
+            cursor_pointer_elements.extend(
+                pointer_element.render_elements::<PointerRenderElement<GlesRenderer>>(
+                    &mut backend.renderer,
+                    cursor_location,
+                    scale,
+                    1.0,
+                ),
+            );
         }
         let cursor_elapsed_ms = cursor_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.cursor_elapsed_ms = cursor_elapsed_ms;
@@ -1257,6 +1282,12 @@ fn render_surface(
             else {
                 continue;
             };
+            if window_decorations
+                .get(window)
+                .is_some_and(|decoration| !decoration.managed_window_allows_render())
+            {
+                continue;
+            }
             if closing_window_snapshots.contains_key(&window_id) {
                 if close_debug {
                     tracing::info!(

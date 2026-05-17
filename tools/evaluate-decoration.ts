@@ -3,12 +3,8 @@ import { pathToFileURL } from "node:url";
 import { existsSync } from "node:fs";
 
 import {
-  createComponentStateStore,
-  createReactiveWindow,
+  createDecorationEvaluationCache,
   installAssetResolverBridge,
-  serializeDecorationTree,
-  withComponentRenderRoot,
-  type DecorationSerializationContext,
   type DecorationFunction,
   type WaylandWindowActions,
   type WaylandWindowSnapshot,
@@ -69,21 +65,8 @@ async function main() {
     },
   };
 
-  const handle = createReactiveWindow(snapshot, actions);
-  const componentStateStore = createComponentStateStore();
-  const tree = withComponentRenderRoot(snapshot.id, componentStateStore, () =>
-    decoration(handle.window)
-  );
-  let nextHandlerId = 1;
-  const context: DecorationSerializationContext = {
-    registerClickHandler(key) {
-      return `${key}-eval-${nextHandlerId++}`;
-    },
-    registerInteractionHandler(key) {
-      return `${key}-eval-${nextHandlerId++}`;
-    },
-  };
-  const serialized = serializeDecorationTree(tree, context);
+  const cache = createDecorationEvaluationCache(snapshot, actions, decoration);
+  const serialized = cache.reevaluate().serialized;
 
   console.log(JSON.stringify(serialized, null, 2));
 }

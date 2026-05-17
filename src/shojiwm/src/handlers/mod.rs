@@ -311,7 +311,13 @@ impl XdgActivationHandler for ShojiWM {
             .cloned();
 
         if let Some(window) = window {
-            self.space.raise_element(&window, true);
+            if !self
+                .window_decorations
+                .get(&window)
+                .is_some_and(|decoration| decoration.managed_window.managed)
+            {
+                self.space.raise_element(&window, true);
+            }
             self.set_window_keyboard_focus_target(Some(&window));
             self.focus_layer_surface_if_on_demand(None);
             self.update_keyboard_focus(Serial::from(0));

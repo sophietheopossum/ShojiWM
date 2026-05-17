@@ -19,6 +19,9 @@ import type {
   BoxProps,
   ButtonProps,
   LabelProps,
+  ManagedWindowProps,
+  ManagedWindowState,
+  ManagedWindowTransform,
   MaybeSignal,
   SSDStyle,
   BackdropSourceHandle,
@@ -268,6 +271,9 @@ export type {
   EffectInvalidationPolicyHandle,
   AutomaticEffectInvalidationPolicyHandle,
   LabelProps,
+  ManagedWindowProps,
+  ManagedWindowState,
+  ManagedWindowTransform,
   MaybeSignal,
   SSDStyle,
   BackdropSourceHandle,
@@ -360,6 +366,7 @@ export function Image(props: ImageProps) {
   return ImageIntrinsic({ ...props, src: resolved });
 }
 export const ShaderEffect = defineIntrinsicComponent<ShaderEffectProps>("ShaderEffect");
+export const ManagedWindow = defineIntrinsicComponent<ManagedWindowProps>("ManagedWindow");
 export const ClientWindow = defineIntrinsicComponent<ClientWindowProps>("Window");
 export const Window = ClientWindow;
 export const WindowBorder = defineIntrinsicComponent<WindowBorderProps>("WindowBorder");

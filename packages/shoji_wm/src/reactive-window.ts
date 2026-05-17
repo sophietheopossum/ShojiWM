@@ -8,7 +8,9 @@ import type {
   TransformOrigin,
   WaylandWindowActions,
   WaylandWindowSnapshot,
+  ManagedWindowState,
   WindowIcon,
+  WindowPosition,
 } from "./types";
 
 interface MutableWindowSignals {
@@ -70,6 +72,7 @@ export function createReactiveWindow(
   let transformScaleX: MaybeSignal<number> = 1;
   let transformScaleY: MaybeSignal<number> = 1;
   let transformOpacity: MaybeSignal<number> = 1;
+  let managedRect: WindowPosition | undefined;
 
   const position = {
     get x() {
@@ -134,6 +137,9 @@ export function createReactiveWindow(
     get position() {
       return position;
     },
+    get rect() {
+      return managedRect;
+    },
     isFocused: signals.isFocused,
     isFloating: signals.isFloating,
     isMaximized: signals.isMaximized,
@@ -172,6 +178,9 @@ export function createReactiveWindow(
       signals.isXwayland.value = nextSnapshot.isXwayland;
       signals.icon.value = nextSnapshot.icon;
       signals.interaction.value = nextSnapshot.interaction;
+    },
+    updateManagedWindow(state: ManagedWindowState) {
+      managedRect = state.rect;
     },
   };
 }

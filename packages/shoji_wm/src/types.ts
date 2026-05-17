@@ -33,6 +33,7 @@ export interface WaylandWindow {
   readonly title: import("./signals").ReadonlySignal<string>;
   readonly appId: import("./signals").ReadonlySignal<string | undefined>;
   readonly position: WindowPosition;
+  readonly rect: WindowPosition | undefined;
   readonly transform: WindowTransform;
   readonly animation: import("./animation").AnimationController;
   readonly isFocused: import("./signals").ReadonlySignal<boolean>;
@@ -86,6 +87,33 @@ export interface TransformOrigin {
   y: MaybeSignal<number>;
 }
 
+export interface ManagedWindowRect {
+  x: MaybeSignal<number>;
+  y: MaybeSignal<number>;
+  width: MaybeSignal<number>;
+  height: MaybeSignal<number>;
+}
+
+export interface ManagedWindowTransform {
+  origin?: MaybeSignal<TransformOrigin>;
+  translateX?: MaybeSignal<number>;
+  translateY?: MaybeSignal<number>;
+  scale?: MaybeSignal<number>;
+  scaleX?: MaybeSignal<number>;
+  scaleY?: MaybeSignal<number>;
+}
+
+export interface ManagedWindowState {
+  managed: boolean;
+  rect?: WindowPosition;
+  workspace?: string | number;
+  visible: boolean;
+  idle: boolean;
+  interactive: boolean;
+  zIndex: number;
+  transform: WindowTransform;
+}
+
 export type PrimitiveChild = string | number;
 export type WindowIcon = string | { name?: string; bytes?: Uint8Array };
 
@@ -119,6 +147,7 @@ export type DecorationNodeType =
   | "AppIcon"
   | "Image"
   | "ShaderEffect"
+  | "ManagedWindow"
   | "Window"
   | "WindowBorder"
   | "Fragment";
@@ -527,6 +556,18 @@ export interface ShaderEffectProps extends ComponentProps {
   id?: string;
 }
 
+export interface ManagedWindowProps extends ComponentProps {
+  rect?: MaybeSignal<ManagedWindowRect>;
+  workspace?: MaybeSignal<string | number>;
+  visible?: MaybeSignal<boolean>;
+  idle?: MaybeSignal<boolean>;
+  interactive?: MaybeSignal<boolean>;
+  zIndex?: MaybeSignal<number>;
+  opacity?: MaybeSignal<number>;
+  transform?: MaybeSignal<ManagedWindowTransform>;
+  id?: string;
+}
+
 export interface ClientWindowProps extends ComponentProps {
   style?: SSDStyle;
   id?: string;
@@ -618,6 +659,7 @@ export interface ReactiveWaylandWindowHandle {
   readonly window: ReactiveWaylandWindow;
   readonly transform: WindowTransform;
   update(snapshot: WaylandWindowSnapshot): void;
+  updateManagedWindow(state: ManagedWindowState): void;
 }
 
 export interface ReactiveWaylandLayerHandle {

@@ -14,12 +14,17 @@ import {
 } from "./serialize";
 import type {
   DecorationChild,
+  DecorationElementNode,
   DecorationRenderable,
   DecorationFunction,
+  ManagedWindowProps,
+  ManagedWindowRect,
+  ManagedWindowState,
   ReactiveWaylandWindowHandle,
   SerializableDecorationChild,
   WaylandWindowActions,
   WaylandWindowSnapshot,
+  WindowPosition,
   WindowTransform,
 } from "./types";
 
@@ -41,6 +46,7 @@ export interface DecorationEvaluationResult {
   tree: DecorationChild;
   serialized: SerializableDecorationChild;
   transform: WindowTransform;
+  managedWindow: ManagedWindowState;
   version: number;
 }
 
@@ -50,6 +56,7 @@ export interface DecorationEvaluationCache {
   readonly lastSerialized: SerializableDecorationChild;
   readonly lastTree: DecorationChild;
   readonly lastTransform: WindowTransform;
+  readonly lastManagedWindow: ManagedWindowState;
   update(snapshot: WaylandWindowSnapshot): DecorationEvaluationResult | null;
   reevaluate(dirtyNodeIds?: readonly string[]): DecorationEvaluationResult;
   invokeHandler(handlerId: string): boolean;
@@ -121,6 +128,8 @@ export function createDecorationEvaluationCache(
   let tree: DecorationChild;
   let serialized: SerializableDecorationChild;
   let transform: WindowTransform;
+  let managedWindow: ManagedWindowState;
+  let managedWindowProps: ManagedWindowProps | undefined;
   let nextHandlerId = 1;
   let runtimeHandlers = new Map<string, () => void>();
   const handlerIdsByKey = new Map<string, string>();
@@ -144,13 +153,16 @@ export function createDecorationEvaluationCache(
     runtimeHandlers = new Map();
     enterWindowDependencyScope(currentSnapshot.id);
     try {
-      tree = normalizeRootDecoration(
-        withComponentRenderRoot(currentSnapshot.id, componentStateStore, () =>
-          evaluate(handle.window)
-        )
+      const rendered = withComponentRenderRoot(currentSnapshot.id, componentStateStore, () =>
+        evaluate(handle.window)
       );
+      const extracted = extractManagedWindowRoot(rendered, handle);
+      tree = extracted.tree;
+      managedWindow = extracted.managedWindow;
+      managedWindowProps = extracted.props;
+      handle.updateManagedWindow(managedWindow);
       serialized = serializeDecorationTree(tree, serializationContext);
-      transform = snapshotTransform(handle);
+      transform = managedWindow.transform;
     } finally {
       leaveWindowDependencyScope();
     }
@@ -160,6 +172,7 @@ export function createDecorationEvaluationCache(
       tree,
       serialized,
       transform,
+      managedWindow,
       version,
     };
   };
@@ -178,7 +191,9 @@ export function createDecorationEvaluationCache(
         dirtyNodeIdSet,
         serializationContext,
       );
-      transform = snapshotTransform(handle);
+      managedWindow = snapshotManagedWindow(managedWindowProps, handle);
+      handle.updateManagedWindow(managedWindow);
+      transform = managedWindow.transform;
     } finally {
       leaveWindowDependencyScope();
     }
@@ -188,6 +203,7 @@ export function createDecorationEvaluationCache(
       tree,
       serialized,
       transform,
+      managedWindow,
       version,
     };
   };
@@ -210,6 +226,9 @@ export function createDecorationEvaluationCache(
     },
     get lastTransform() {
       return transform;
+    },
+    get lastManagedWindow() {
+      return managedWindow;
     },
     update(nextSnapshot) {
       if (!shouldReevaluateDecoration(currentSnapshot, nextSnapshot)) {
@@ -246,6 +265,110 @@ function normalizeRootDecoration(rendered: DecorationRenderable): DecorationChil
   }
 
   return rendered;
+}
+
+function extractManagedWindowRoot(
+  rendered: DecorationRenderable,
+  handle: ReactiveWaylandWindowHandle,
+): {
+  tree: DecorationChild;
+  managedWindow: ManagedWindowState;
+  props?: ManagedWindowProps;
+} {
+  const normalized = normalizeRootDecoration(rendered);
+  if (!isManagedWindowNode(normalized)) {
+    return {
+      tree: normalized,
+      managedWindow: snapshotManagedWindow(undefined, handle),
+    };
+  }
+
+  return {
+    tree: managedWindowChildrenAsRoot(normalized),
+    managedWindow: snapshotManagedWindow(normalized.props as ManagedWindowProps, handle),
+    props: normalized.props as ManagedWindowProps,
+  };
+}
+
+function managedWindowChildrenAsRoot(node: DecorationElementNode): DecorationChild {
+  if (node.children.length === 1) {
+    return node.children[0] ?? createElementNode("Fragment", {});
+  }
+
+  return createElementNode("Fragment", {
+    children: node.children,
+  });
+}
+
+function isManagedWindowNode(node: DecorationChild): node is DecorationElementNode {
+  return typeof node !== "string" && typeof node !== "number" && node.type === "ManagedWindow";
+}
+
+function snapshotManagedWindow(
+  props: ManagedWindowProps | undefined,
+  handle: ReactiveWaylandWindowHandle,
+): ManagedWindowState {
+  const legacyTransform = snapshotTransform(handle);
+  const transform = snapshotManagedWindowTransform(props?.transform, legacyTransform);
+  const opacity = props?.opacity === undefined ? transform.opacity : read(props.opacity);
+  const visible = props?.visible === undefined ? true : read(props.visible);
+  const idle = props?.idle === undefined ? false : read(props.idle);
+
+  return {
+    managed: props !== undefined,
+    rect: props?.rect === undefined ? undefined : snapshotManagedWindowRect(read(props.rect)),
+    workspace: props?.workspace === undefined ? undefined : read(props.workspace),
+    visible,
+    idle,
+    interactive: props?.interactive === undefined ? true : read(props.interactive),
+    zIndex: props?.zIndex === undefined ? 0 : read(props.zIndex),
+    transform: {
+      ...transform,
+      opacity: visible && !idle ? opacity : 0,
+    },
+  };
+}
+
+function snapshotManagedWindowRect(rect: ManagedWindowRect): WindowPosition {
+  return {
+    x: read(rect.x),
+    y: read(rect.y),
+    width: read(rect.width),
+    height: read(rect.height),
+  };
+}
+
+function snapshotManagedWindowTransform(
+  transform: ManagedWindowProps["transform"] | undefined,
+  fallback: WindowTransform,
+): WindowTransform {
+  const resolved = transform === undefined ? undefined : read(transform);
+  if (!resolved) {
+    return fallback;
+  }
+
+  const origin = resolved.origin === undefined ? read(fallback.origin) : read(resolved.origin);
+  const scale = resolved.scale === undefined ? undefined : read(resolved.scale);
+
+  return {
+    origin: {
+      x: read(origin.x),
+      y: read(origin.y),
+    },
+    translateX:
+      resolved.translateX === undefined ? read(fallback.translateX) : read(resolved.translateX),
+    translateY:
+      resolved.translateY === undefined ? read(fallback.translateY) : read(resolved.translateY),
+    scaleX:
+      resolved.scaleX === undefined
+        ? scale ?? read(fallback.scaleX)
+        : read(resolved.scaleX),
+    scaleY:
+      resolved.scaleY === undefined
+        ? scale ?? read(fallback.scaleY)
+        : read(resolved.scaleY),
+    opacity: read(fallback.opacity),
+  };
 }
 
 function snapshotTransform(

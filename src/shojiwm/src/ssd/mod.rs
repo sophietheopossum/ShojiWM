@@ -34,10 +34,10 @@ pub use integration::{
 };
 pub use interaction::DecorationInteractionSnapshot;
 pub use window_model::{
-    LayerKindSnapshot, LayerPositionSnapshot, OutputModeSnapshot, OutputPositionSnapshot,
-    TransformOrigin, WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandWindowAction,
-    WaylandWindowSnapshot, WindowIconSnapshot, WindowPositionSnapshot, WindowTransform,
-    layer_runtime_id,
+    LayerKindSnapshot, LayerPositionSnapshot, ManagedWindowState, OutputModeSnapshot,
+    OutputPositionSnapshot, TransformOrigin, WaylandLayerSnapshot, WaylandOutputSnapshot,
+    WaylandWindowAction, WaylandWindowSnapshot, WindowIconSnapshot, WindowPositionSnapshot,
+    WindowTransform, layer_runtime_id,
 };
 
 /// Top-level decoration tree.

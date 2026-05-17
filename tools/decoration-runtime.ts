@@ -60,6 +60,7 @@ import {
   type WaylandWindowActions,
   type WaylandWindowSnapshot,
   type WindowEffectAssignment,
+  type ManagedWindowState,
   type WindowTransform,
 } from "shoji_wm";
 
@@ -152,6 +153,7 @@ interface EvaluateSuccess {
   kind: "evaluate";
   serialized: unknown;
   transform: WindowTransform;
+  managedWindow: ManagedWindowState;
   windowEffects?: WindowEffectAssignment | null;
   dirtyNodeIds?: string[];
   nextPollInMs?: number;
@@ -199,6 +201,7 @@ interface InvokeHandlerSuccess {
   invoked: boolean;
   serialized?: unknown;
   transform?: WindowTransform;
+  managedWindow?: ManagedWindowState;
   windowEffects?: WindowEffectAssignment | null;
   dirtyWindowIds: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
@@ -234,6 +237,7 @@ interface StartCloseSuccess {
   invoked: boolean;
   serialized?: unknown;
   transform?: WindowTransform;
+  managedWindow?: ManagedWindowState;
   windowEffects?: WindowEffectAssignment | null;
   dirtyWindowIds: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
@@ -351,6 +355,7 @@ const dirtyLayerIds = new Set<string>();
 let runtimeDirty = false;
 let nextPollId = 1;
 let currentSchedulerTimeMs = 0;
+let lastAnimationAdvanceMs: number | undefined;
 
 interface RuntimeCacheEntry {
   latestSnapshot: WaylandWindowSnapshot;
@@ -400,6 +405,10 @@ function hasRuntimeTimestamp(request: RuntimeRequest): request is RuntimeRequest
 
 function beginRuntimeTurn(nowMs: number): void {
   currentSchedulerTimeMs = nowMs;
+  if (lastAnimationAdvanceMs === nowMs) {
+    return;
+  }
+  lastAnimationAdvanceMs = nowMs;
   // A runtime turn may evaluate declarations or run user handlers, both of
   // which can start animations. Synchronizing once at the turn boundary keeps
   // every newly-created timeline anchored to the compositor timestamp for this
@@ -479,6 +488,8 @@ async function main() {
           serialized: result.serialized,
           transform: cacheByWindowId.get(request.snapshot.id)?.cache.lastTransform ??
             identityTransform(),
+          managedWindow: cacheByWindowId.get(request.snapshot.id)?.cache.lastManagedWindow ??
+            identityManagedWindow(),
           windowEffects: result.windowEffects,
           dirtyNodeIds: takeDirtyWindowNodeIds(request.snapshot.id),
           nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
@@ -502,7 +513,7 @@ async function main() {
             dirtyWindowNodeIds: tick.dirtyWindowNodeIds,
             dirtyLayerNodeIds: tick.dirtyLayerNodeIds,
             actions: tick.actions,
-            nextPollInMs: tick.nextPollInMs,
+            nextPollInMs: hasActiveAnimations() ? 0 : tick.nextPollInMs,
             displayConfig: pendingDisplayConfigPayload(),
             keyBindingConfig,
             processConfig,
@@ -548,6 +559,7 @@ async function main() {
             kind: "evaluateCached",
             serialized: result.serialized,
             transform: result.transform,
+            managedWindow: result.managedWindow,
             windowEffects: result.windowEffects,
             dirtyNodeIds: result.dirtyNodeIds,
             nextPollInMs: hasActiveAnimations() ? 0 : result.nextPollInMs,
@@ -629,6 +641,7 @@ function evaluateCached(
 ): {
   serialized: unknown;
   transform: WindowTransform;
+  managedWindow: ManagedWindowState;
   windowEffects: WindowEffectAssignment | null;
   dirtyNodeIds?: string[];
   nextPollInMs?: number;
@@ -643,6 +656,7 @@ function evaluateCached(
   return {
     serialized: reevaluated.serialized,
     transform: entry.cache.lastTransform,
+    managedWindow: entry.cache.lastManagedWindow,
     windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
     dirtyNodeIds,
     nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
@@ -879,6 +893,17 @@ function identityTransform(): WindowTransform {
   };
 }
 
+function identityManagedWindow(): ManagedWindowState {
+  return {
+    managed: false,
+    visible: true,
+    idle: false,
+    interactive: true,
+    zIndex: 0,
+    transform: identityTransform(),
+  };
+}
+
 function registerPoll(
   intervalMs: number,
   callback: PollCallback,
@@ -1085,6 +1110,7 @@ function startClose(
     invoked: true,
     serialized: reevaluated.serialized,
     transform: entry.cache.lastTransform,
+    managedWindow: entry.cache.lastManagedWindow,
     windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
     dirtyWindowIds: [windowId],
     dirtyWindowNodeIds: { [windowId]: dirtyNodeIds },
@@ -1140,6 +1166,7 @@ function invokeHandler(
     invoked: true,
     serialized: reevaluated.serialized,
     transform: entry.cache.lastTransform,
+    managedWindow: entry.cache.lastManagedWindow,
     windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
     dirtyWindowIds: [windowId],
     dirtyWindowNodeIds: { [windowId]: dirtyNodeIds },

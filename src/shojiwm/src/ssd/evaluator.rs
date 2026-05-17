@@ -10,7 +10,8 @@ use std::{
 use tracing::{debug, error, info, warn};
 
 use super::window_model::{
-    WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
+    ManagedWindowState, WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandWindowAction,
+    WaylandWindowSnapshot,
 };
 use super::{
     BackgroundEffectConfig, DecorationBridgeError, DecorationLayoutError, DecorationNode,
@@ -22,6 +23,11 @@ use crate::{
     runtime_key_binding::RuntimeKeyBindingConfigUpdate,
     runtime_process::{RuntimeProcessAction, RuntimeProcessConfigUpdate},
 };
+
+fn managed_rect_debug_enabled() -> bool {
+    std::env::var_os("SHOJI_MANAGED_RECT_DEBUG")
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
 
 /// Dynamic decoration evaluation boundary.
 ///
@@ -95,6 +101,7 @@ pub trait DecorationEvaluator {
 pub struct DecorationEvaluationResult {
     pub node: DecorationNode,
     pub transform: WindowTransform,
+    pub managed_window: ManagedWindowState,
     pub window_effects: Option<WindowEffectConfig>,
     pub dirty_node_ids: Vec<String>,
     pub next_poll_in_ms: Option<u64>,
@@ -123,6 +130,7 @@ pub struct DecorationHandlerInvocation {
     pub invoked: bool,
     pub node: Option<DecorationNode>,
     pub transform: Option<WindowTransform>,
+    pub managed_window: Option<ManagedWindowState>,
     pub window_effects: Option<WindowEffectConfig>,
     pub dirty_window_ids: Vec<String>,
     pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
@@ -258,6 +266,7 @@ impl DecorationEvaluator for StaticDecorationEvaluator {
         Ok(DecorationEvaluationResult {
             node: decode_tree_json(&json)?,
             transform: WindowTransform::default(),
+            managed_window: ManagedWindowState::default(),
             window_effects: None,
             dirty_node_ids: Vec::new(),
             next_poll_in_ms: None,
@@ -432,6 +441,8 @@ struct RuntimeEvaluateResponse {
     ok: bool,
     serialized: Option<serde_json::Value>,
     transform: Option<WindowTransform>,
+    #[serde(rename = "managedWindow")]
+    managed_window: Option<ManagedWindowState>,
     #[serde(rename = "windowEffects")]
     window_effects: Option<WireWindowEffectConfig>,
     #[serde(rename = "dirtyNodeIds")]
@@ -502,6 +513,8 @@ struct RuntimeInvokeHandlerResponse {
     invoked: Option<bool>,
     serialized: Option<serde_json::Value>,
     transform: Option<WindowTransform>,
+    #[serde(rename = "managedWindow")]
+    managed_window: Option<ManagedWindowState>,
     #[serde(rename = "windowEffects")]
     window_effects: Option<WireWindowEffectConfig>,
     #[serde(rename = "dirtyWindowIds")]
@@ -531,6 +544,8 @@ struct RuntimeStartCloseResponse {
     invoked: Option<bool>,
     serialized: Option<serde_json::Value>,
     transform: Option<WindowTransform>,
+    #[serde(rename = "managedWindow")]
+    managed_window: Option<ManagedWindowState>,
     #[serde(rename = "windowEffects")]
     window_effects: Option<WireWindowEffectConfig>,
     #[serde(rename = "dirtyWindowIds")]
@@ -1123,6 +1138,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         Ok(DecorationEvaluationResult {
             node: decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?,
             transform: response.transform.unwrap_or_default(),
+            managed_window: response.managed_window.unwrap_or_default(),
             window_effects: response
                 .window_effects
                 .map(TryInto::try_into)
@@ -1213,6 +1229,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         Ok(DecorationEvaluationResult {
             node: decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?,
             transform: response.transform.unwrap_or_default(),
+            managed_window: response.managed_window.unwrap_or_default(),
             window_effects: response
                 .window_effects
                 .map(TryInto::try_into)
@@ -1293,6 +1310,17 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
                     .error
                     .unwrap_or_else(|| "runtime returned failure".into()),
             ));
+        }
+
+        if managed_rect_debug_enabled() {
+            info!(
+                now_ms,
+                dirty = response.dirty.unwrap_or(false),
+                dirty_window_ids = ?response.dirty_window_ids,
+                dirty_window_node_ids = ?response.dirty_window_node_ids,
+                next_poll_in_ms = ?response.next_poll_in_ms,
+                "managed rect debug: runtime scheduler tick"
+            );
         }
 
         Ok(DecorationSchedulerTick {
@@ -1462,6 +1490,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             invoked: response.invoked.unwrap_or(false),
             node,
             transform: response.transform,
+            managed_window: response.managed_window,
             window_effects: response
                 .window_effects
                 .map(TryInto::try_into)
@@ -1646,6 +1675,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             invoked: response.invoked.unwrap_or(false),
             node,
             transform: response.transform,
+            managed_window: response.managed_window,
             window_effects: response
                 .window_effects
                 .map(TryInto::try_into)
