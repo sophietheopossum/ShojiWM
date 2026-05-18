@@ -2950,42 +2950,20 @@ fn render_surface(
                 client_phase_started_at.elapsed().as_secs_f64() * 1000.0;
             let mut current_window_elements: Vec<TtyRenderElements> = Vec::new();
             let popup_phase_started_at = Instant::now();
-            let popup_elements = if clip_all_client_surfaces {
-                content_clip
-                    .and_then(|content_clip| {
-                        window_render::clipped_popup_elements(
-                            window,
-                            &mut backend.renderer,
-                            physical_location,
-                            output_geo.loc,
-                            scale,
-                            snap_scale,
-                            visual_state.opacity,
-                            content_clip,
-                        )
-                        .inspect_err(|error| {
-                            warn!(?error, "failed to build clipped popup elements");
-                        })
-                        .ok()
-                    })
-                    .map(|elements| transform_clipped_elements(elements, visual_state))
-                    .unwrap_or_default()
-            } else {
-                transform_window_elements(
-                    window_render::popup_elements(
-                        window,
-                        &mut backend.renderer,
-                        physical_location,
-                        scale,
-                        visual_state.opacity,
-                    ),
-                    visual_state,
-                    TtyRenderElements::Window,
-                    TtyRenderElements::TransformedWindow,
-                )
-            };
+            let popup_elements = transform_window_elements(
+                window_render::popup_elements(
+                    window,
+                    &mut backend.renderer,
+                    physical_location,
+                    scale,
+                    visual_state.opacity,
+                ),
+                visual_state,
+                TtyRenderElements::Window,
+                TtyRenderElements::TransformedWindow,
+            );
             current_window_elements.extend(popup_elements);
-            if use_full_window_snapshot && !clip_all_client_surfaces {
+            if use_full_window_snapshot {
                 current_window_elements.extend(non_root_surface_elements_for_window(
                     window,
                     &mut backend.renderer,
@@ -7860,47 +7838,21 @@ fn window_scene_elements_for_capture(
         }
     }
 
-    if window_decorations
-        .get(window)
-        .is_some_and(|decoration| decoration.managed_window.clip_to_rect)
-    {
-        if let Some(content_clip) = window_decorations
-            .get(window)
-            .and_then(|decoration| decoration.content_clip)
-        {
-            elements.extend(
-                window_render::clipped_popup_elements(
-                    window,
-                    renderer,
-                    physical_location,
-                    capture_geo.loc,
-                    scale,
-                    scale,
-                    visual_state.opacity,
-                    content_clip,
-                )
-                .map(|popup_elements| transform_clipped_elements(popup_elements, visual_state))
-                .unwrap_or_default()
-                .into_iter(),
-            );
-        }
-    } else {
-        elements.extend(
-            transform_window_elements(
-                window_render::popup_elements(
-                    window,
-                    renderer,
-                    physical_location,
-                    scale,
-                    visual_state.opacity,
-                ),
-                visual_state,
-                TtyRenderElements::Window,
-                TtyRenderElements::TransformedWindow,
-            )
-            .into_iter(),
-        );
-    }
+    elements.extend(
+        transform_window_elements(
+            window_render::popup_elements(
+                window,
+                renderer,
+                physical_location,
+                scale,
+                visual_state.opacity,
+            ),
+            visual_state,
+            TtyRenderElements::Window,
+            TtyRenderElements::TransformedWindow,
+        )
+        .into_iter(),
+    );
 
     Ok(elements)
 }

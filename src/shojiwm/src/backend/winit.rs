@@ -806,50 +806,22 @@ pub fn init_winit(
                                     WinitRenderElements::TransformedWindow,
                                 )
                             };
-                            let popup_elements = if clip_all_client_surfaces {
-                                content_clip
-                                    .and_then(|content_clip| {
-                                        window_render::clipped_popup_elements(
-                                            window,
-                                            renderer,
-                                            physical_location,
-                                            output_geo.loc,
-                                            scale,
-                                            if use_full_window_snapshot { scale } else { snap_scale },
-                                            if use_full_window_snapshot {
-                                                1.0
-                                            } else {
-                                                visual_state.opacity
-                                            },
-                                            content_clip,
-                                        )
-                                        .inspect_err(|error| {
-                                            warn!(?error, "failed to build clipped popup elements");
-                                        })
-                                        .ok()
-                                    })
-                                    .map(|elements| {
-                                        transform_clipped_elements(elements, composition_visual)
-                                    })
-                                    .unwrap_or_default()
-                            } else {
-                                transform_window_elements(
-                                    window_render::popup_elements(
-                                        window,
-                                        renderer,
-                                        physical_location,
-                                        scale,
-                                        if use_full_window_snapshot {
-                                            1.0
-                                        } else {
-                                            visual_state.opacity
-                                        },
-                                    ),
-                                    composition_visual,
-                                    WinitRenderElements::Window,
-                                    WinitRenderElements::TransformedWindow,
-                                )
-                            };
+                            let popup_elements = transform_window_elements(
+                                window_render::popup_elements(
+                                    window,
+                                    renderer,
+                                    physical_location,
+                                    scale,
+                                    if use_full_window_snapshot {
+                                        1.0
+                                    } else {
+                                        visual_state.opacity
+                                    },
+                                ),
+                                composition_visual,
+                                WinitRenderElements::Window,
+                                WinitRenderElements::TransformedWindow,
+                            );
                             if use_full_window_snapshot {
                                 let full_rect = state
                                     .window_decorations
@@ -3667,49 +3639,21 @@ fn window_scene_elements_for_capture(
         }
     }
 
-    if state
-        .window_decorations
-        .get(window)
-        .is_some_and(|decoration| decoration.managed_window.clip_to_rect)
-    {
-        if let Some(content_clip) = state
-            .window_decorations
-            .get(window)
-            .and_then(|decoration| decoration.content_clip)
-        {
-            elements.extend(
-                window_render::clipped_popup_elements(
-                    window,
-                    renderer,
-                    physical_location,
-                    output_origin,
-                    scale,
-                    scale,
-                    visual_state.opacity,
-                    content_clip,
-                )
-                .map(|popup_elements| transform_clipped_elements(popup_elements, visual_state))
-                .unwrap_or_default()
-                .into_iter(),
-            );
-        }
-    } else {
-        elements.extend(
-            transform_window_elements(
-                window_render::popup_elements(
-                    window,
-                    renderer,
-                    physical_location,
-                    scale,
-                    visual_state.opacity,
-                ),
-                visual_state,
-                WinitRenderElements::Window,
-                WinitRenderElements::TransformedWindow,
-            )
-            .into_iter(),
-        );
-    }
+    elements.extend(
+        transform_window_elements(
+            window_render::popup_elements(
+                window,
+                renderer,
+                physical_location,
+                scale,
+                visual_state.opacity,
+            ),
+            visual_state,
+            WinitRenderElements::Window,
+            WinitRenderElements::TransformedWindow,
+        )
+        .into_iter(),
+    );
 
     elements
 }

@@ -535,7 +535,7 @@ pub fn clipped_surface_elements(
     clip_scale: Scale<f64>,
     alpha: f32,
     clip: Option<ContentClip>,
-    clip_all_surfaces: bool,
+    _clip_all_surfaces: bool,
 ) -> Result<Vec<WindowClipElement>, smithay::backend::renderer::gles::GlesError> {
     if std::env::var_os("SHOJI_GAP_BYPASS_CLIP").is_some() {
         return Ok(Vec::new());
@@ -633,6 +633,35 @@ pub fn clipped_surface_elements(
         );
     }
     match clip {
+        Some(clip) if matches!(window.underlying_surface(), WindowSurface::Wayland(_)) => {
+            // CSS-like parent clipping belongs to the toplevel/root surface. Subsurfaces are
+            // separate protocol surfaces and are allowed to extend outside the root surface, so
+            // keep them raw even when ManagedWindow.clipToRect asks us to force the root content
+            // into a specific rectangle.
+            let root_elements =
+                root_surface_elements(window, renderer, location, output_scale, alpha);
+            let root_count = root_elements.len();
+            let mut output = Vec::with_capacity(elements.len());
+            for element in root_elements {
+                output.push(WindowClipElement::Clipped(ClippedSurfaceElement::new(
+                    renderer,
+                    element,
+                    output_scale,
+                    clip_scale,
+                    output_origin,
+                    clip,
+                    geometry,
+                    debug_label.clone(),
+                )?));
+            }
+            output.extend(
+                elements
+                    .into_iter()
+                    .skip(root_count)
+                    .map(WindowClipElement::Raw),
+            );
+            Ok(output)
+        }
         Some(clip) => elements
             .into_iter()
             .enumerate()
@@ -649,7 +678,7 @@ pub fn clipped_surface_elements(
                         "gap debug clipped surface candidate",
                     );
                 }
-                if clip_all_surfaces || geometry_override.is_some() {
+                if geometry_override.is_some() {
                     ClippedSurfaceElement::new(
                         renderer,
                         element,
