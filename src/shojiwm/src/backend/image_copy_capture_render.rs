@@ -161,15 +161,18 @@ pub fn process_image_copy_capture_for_toplevels(
                 .is_some_and(|h| h.matches(&handle))
         }) && let Some(desired) = compute_desired_buffer_size(space, window)
         {
-            let buffer_dims = smithay::wayland::shm::with_buffer_contents(
-                &frame.buffer(),
-                |_, _, data| (data.width, data.height),
-            );
+            let buffer_dims =
+                smithay::wayland::shm::with_buffer_contents(&frame.buffer(), |_, _, data| {
+                    (data.width, data.height)
+                });
             if let Ok((bw, bh)) = buffer_dims
                 && (bw != desired.w || bh != desired.h)
             {
                 tracing::debug!(
-                    bw, bh, desired_w = desired.w, desired_h = desired.h,
+                    bw,
+                    bh,
+                    desired_w = desired.w,
+                    desired_h = desired.h,
                     "toplevel resized; pushing new constraints"
                 );
                 session.update_constraints(BufferConstraints {

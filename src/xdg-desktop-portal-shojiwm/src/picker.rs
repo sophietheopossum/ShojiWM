@@ -223,11 +223,9 @@ fn view(state: &State, _id: window::Id) -> Element<'_, Message> {
     .spacing(8);
 
     if active.sources.is_empty() {
-        let no_sources = container(text(i18n::t("picker.no_sources")))
-            .padding(16);
+        let no_sources = container(text(i18n::t("picker.no_sources"))).padding(16);
         return container(
-            column![text(i18n::t("picker.heading")).size(18), tabs, no_sources]
-                .spacing(12),
+            column![text(i18n::t("picker.heading")).size(18), tabs, no_sources].spacing(12),
         )
         .padding(16)
         .into();
@@ -289,11 +287,9 @@ fn view(state: &State, _id: window::Id) -> Element<'_, Message> {
         button(text(i18n::t("picker.cancel"))).on_press(Message::Cancelled),
     ];
 
-    container(
-        column![text(i18n::t("picker.heading")).size(18), tabs, body, footer,].spacing(12),
-    )
-    .padding(16)
-    .into()
+    container(column![text(i18n::t("picker.heading")).size(18), tabs, body, footer,].spacing(12))
+        .padding(16)
+        .into()
 }
 
 fn tab_button(label: String, selected: bool, kind: Tab) -> Element<'static, Message> {

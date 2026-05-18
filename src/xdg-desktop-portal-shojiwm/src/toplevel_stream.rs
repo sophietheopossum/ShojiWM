@@ -410,7 +410,9 @@ fn run(
             }
             if let Some(stream) = stream_clone {
                 tracing::info!(
-                    new_w, new_h, "toplevel: pushing renegotiated PW stream params"
+                    new_w,
+                    new_h,
+                    "toplevel: pushing renegotiated PW stream params"
                 );
                 match (
                     build_video_format_param(new_w, new_h, framerate),
