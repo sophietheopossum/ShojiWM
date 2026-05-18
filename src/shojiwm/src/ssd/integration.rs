@@ -2072,6 +2072,7 @@ impl ShojiWM {
     }
 
     fn apply_managed_window_rects(&mut self) {
+        let mut applied_any_rect = false;
         let windows = self
             .window_decorations
             .iter()
@@ -2088,10 +2089,11 @@ impl ShojiWM {
                     window.clone(),
                     managed.clip_to_rect,
                     desired_root,
+                    decoration.tree.clone(),
                     decoration.layout.root.rect,
-                    decoration.content_clip,
                     decoration.client_rect,
                     decoration.snapshot.id.clone(),
+                    decoration.layout_scale,
                 ))
             })
             .collect::<Vec<_>>();
@@ -2100,39 +2102,28 @@ impl ShojiWM {
             window,
             clip_to_rect,
             desired_root,
+            tree,
             current_root,
-            content_clip,
             current_client,
             window_id,
+            layout_scale,
         ) in windows
         {
-            let Some(content_clip) = content_clip else {
-                if managed_rect_debug_enabled() {
-                    info!(
-                        window_id,
-                        desired_root = %format_rect(desired_root),
-                        current_root = %format_rect(current_root),
-                        current_client = %format_rect(current_client),
-                        "managed rect debug: skip apply without content clip"
-                    );
-                }
-                continue;
-            };
-
-            let left = content_clip.rect.loc.x - current_root.x;
-            let top = content_clip.rect.loc.y - current_root.y;
-            let right = (current_root.x + current_root.width)
-                - (content_clip.rect.loc.x + content_clip.rect.size.w);
-            let bottom = (current_root.y + current_root.height)
-                - (content_clip.rect.loc.y + content_clip.rect.size.h);
-            let desired_client_width = (desired_root.width - left - right).max(1);
-            let desired_client_height = (desired_root.height - top - bottom).max(1);
-            let desired_client = LogicalRect::new(
-                desired_root.x + left,
-                desired_root.y + top,
-                desired_client_width,
-                desired_client_height,
-            );
+            let desired_client =
+                match managed_client_rect_for_root(&tree, desired_root, layout_scale) {
+                    Ok(rect) => rect,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            window_id,
+                            desired_root = %format_rect(desired_root),
+                            current_root = %format_rect(current_root),
+                            current_client = %format_rect(current_client),
+                            "failed to compute managed rect client hit-test geometry"
+                        );
+                        continue;
+                    }
+                };
 
             if desired_client == current_client {
                 continue;
@@ -2152,7 +2143,6 @@ impl ShojiWM {
                     current_root = %format_rect(current_root),
                     current_client = %format_rect(current_client),
                     desired_client = %format_rect(desired_client),
-                    content_clip = ?content_clip.rect,
                     dx,
                     dy,
                     position_changed,
@@ -2251,6 +2241,12 @@ impl ShojiWM {
             self.snapshot_dirty_window_ids.insert(window_id);
             self.window_scene_generation = self.window_scene_generation.wrapping_add(1);
             self.schedule_redraw();
+            applied_any_rect = true;
+        }
+
+        if applied_any_rect {
+            let now_msec = std::time::Duration::from(self.clock.now()).as_millis() as u32;
+            self.refresh_pointer_focus(now_msec);
         }
     }
 }

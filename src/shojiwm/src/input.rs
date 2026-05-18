@@ -1007,6 +1007,8 @@ impl ShojiWM {
             },
         );
         pointer.frame(self);
+        self.update_decoration_hover_target(location);
+        self.update_decoration_cursor_icon(location);
     }
 }
 
