@@ -232,7 +232,7 @@ pub struct ManagedWindowState {
     #[serde(default)]
     pub clip_to_rect: bool,
     #[serde(default)]
-    pub z_index: i32,
+    pub z_index: Option<i32>,
     #[serde(default)]
     pub transform: WindowTransform,
 }
@@ -247,7 +247,7 @@ impl Default for ManagedWindowState {
             idle: false,
             interactive: true,
             clip_to_rect: false,
-            z_index: 0,
+            z_index: None,
             transform: WindowTransform::default(),
         }
     }

@@ -1118,12 +1118,12 @@ fn render_surface(
             let left_z = window_decorations
                 .get(left)
                 .filter(|decoration| decoration.managed_window.managed)
-                .map(|decoration| decoration.managed_window.z_index)
+                .and_then(|decoration| decoration.managed_window.z_index)
                 .unwrap_or(0);
             let right_z = window_decorations
                 .get(right)
                 .filter(|decoration| decoration.managed_window.managed)
-                .map(|decoration| decoration.managed_window.z_index)
+                .and_then(|decoration| decoration.managed_window.z_index)
                 .unwrap_or(0);
             right_z
                 .cmp(&left_z)

@@ -3,7 +3,7 @@ use smithay::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
         KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
-    desktop::Window,
+    desktop::{Window, WindowSurfaceType},
     input::{
         keyboard::{FilterResult, keysyms},
         pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent},
@@ -12,9 +12,10 @@ use smithay::{
     utils::{SERIAL_COUNTER, Serial},
 };
 use std::time::Instant;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::{
+    backend::visual::{inverse_transform_point, transformed_root_rect},
     grabs::{
         move_grab::MoveSurfaceGrab,
         resize_grab::{ResizeEdge, ResizeSurfaceGrab},
@@ -44,6 +45,10 @@ fn pointer_button_debug_enabled() -> bool {
 fn unfocused_popup_focus_debug_enabled() -> bool {
     std::env::var_os("SHOJI_UNFOCUSED_POPUP_FOCUS_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+fn stack_hit_debug_enabled() -> bool {
+    std::env::var_os("SHOJI_STACK_HIT_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 impl ShojiWM {
@@ -319,6 +324,10 @@ impl ShojiWM {
                     }
                     self.pointer_contents = self.pointer_contents_at(pointer.current_location());
                     let under = self.pointer_contents.surface.clone();
+                    self.log_stack_hit_debug(
+                        "button-press-before-motion",
+                        pointer.current_location(),
+                    );
                     if layer_focus_debug_enabled() {
                         debug!(
                             pointer_location = ?pointer.current_location(),
@@ -370,6 +379,17 @@ impl ShojiWM {
                     }
                     let layer_under_pointer = self.pointer_contents.layer.clone();
                     let _ = self.refresh_window_decorations();
+                    // Runtime decoration refresh can change ManagedWindow zIndex
+                    // (for example createWindowStack().raise() on open/focus).
+                    // Recompute the pointer target before SSD hit-test gating;
+                    // otherwise pointer_allows_window_interaction can compare
+                    // the newly topmost decoration against a stale client
+                    // surface from the previously topmost window.
+                    self.pointer_contents = self.pointer_contents_at(pointer.current_location());
+                    self.log_stack_hit_debug(
+                        "button-press-after-refresh",
+                        pointer.current_location(),
+                    );
                     self.update_decoration_hover_target(pointer.current_location());
                     if button == 272 {
                         self.press_decoration_active_target(pointer.current_location());
@@ -850,6 +870,124 @@ impl ShojiWM {
             .is_some_and(|toplevel| toplevel.wl_surface() == &root)
     }
 
+    fn non_popup_window_for_surface(
+        &self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) -> Option<smithay::desktop::Window> {
+        if self.surface_has_popup_ancestor(surface) {
+            return None;
+        }
+
+        let mut root = surface.clone();
+        while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+            root = parent;
+        }
+
+        self.space
+            .elements()
+            .find(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|toplevel| toplevel.wl_surface() == &root)
+                    || window
+                        .x11_surface()
+                        .and_then(|x11| x11.wl_surface())
+                        .as_ref()
+                        == Some(&root)
+            })
+            .cloned()
+    }
+
+    fn surface_root(
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) -> smithay::reexports::wayland_server::protocol::wl_surface::WlSurface {
+        let mut root = surface.clone();
+        while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+            root = parent;
+        }
+        root
+    }
+
+    fn surface_owner_debug(
+        &self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) -> Option<(usize, String, String, Option<String>, i32)> {
+        let root = Self::surface_root(surface);
+        self.windows_top_to_bottom()
+            .into_iter()
+            .enumerate()
+            .find_map(|(stack_index, window)| {
+                let owns_root = window
+                    .toplevel()
+                    .is_some_and(|toplevel| toplevel.wl_surface() == &root)
+                    || window
+                        .x11_surface()
+                        .and_then(|x11| x11.wl_surface())
+                        .as_ref()
+                        == Some(&root);
+                owns_root.then(|| {
+                    let snapshot = self.snapshot_window(window);
+                    (
+                        stack_index,
+                        snapshot.id,
+                        snapshot.title,
+                        snapshot.app_id,
+                        self.managed_window_z_index(window),
+                    )
+                })
+            })
+    }
+
+    fn surface_is_window_root_for_debug(
+        window: &smithay::desktop::Window,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) -> bool {
+        window
+            .toplevel()
+            .is_some_and(|toplevel| toplevel.wl_surface() == surface)
+            || window
+                .x11_surface()
+                .and_then(|x11| x11.wl_surface())
+                .as_ref()
+                == Some(surface)
+    }
+
+    fn surface_hit_debug(
+        &self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        origin: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) -> (
+        u32,
+        smithay::utils::Point<f64, smithay::utils::Logical>,
+        u32,
+        bool,
+        Option<(usize, String, String, Option<String>, i32)>,
+    ) {
+        (
+            surface.id().protocol_id(),
+            origin,
+            Self::surface_root(surface).id().protocol_id(),
+            self.surface_has_popup_ancestor(surface),
+            self.surface_owner_debug(surface),
+        )
+    }
+
+    fn window_is_at_or_below(
+        &self,
+        candidate: &smithay::desktop::Window,
+        target: &smithay::desktop::Window,
+    ) -> bool {
+        for window in self.windows_top_to_bottom() {
+            if window == target {
+                return true;
+            }
+            if window == candidate {
+                return false;
+            }
+        }
+        false
+    }
+
     fn pointer_allows_window_interaction(
         &self,
         pointer_surface: Option<
@@ -862,9 +1000,201 @@ impl ShojiWM {
         }
 
         match pointer_surface {
-            Some(surface) => self.surface_is_over_window_non_popup_tree(surface, window),
+            Some(surface) => {
+                if self.surface_has_popup_ancestor(surface) {
+                    return false;
+                }
+                self.surface_is_over_window_non_popup_tree(surface, window)
+                    || self
+                        .non_popup_window_for_surface(surface)
+                        .is_some_and(|surface_window| {
+                            self.window_is_at_or_below(&surface_window, window)
+                        })
+            }
             None => true,
         }
+    }
+
+    fn log_stack_hit_debug(
+        &self,
+        label: &'static str,
+        pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        if !stack_hit_debug_enabled() {
+            return;
+        }
+
+        let logical_pos = LogicalPoint::new(pos.x.floor() as i32, pos.y.floor() as i32);
+        let pointer_surface = self
+            .pointer_contents
+            .surface
+            .as_ref()
+            .map(|(surface, origin)| (surface.id().protocol_id(), *origin));
+        let pointer_surface_detail = self
+            .pointer_contents
+            .surface
+            .as_ref()
+            .map(|(surface, origin)| self.surface_hit_debug(surface, *origin));
+        let fresh_surface = self
+            .surface_under(pos)
+            .map(|(surface, origin)| (surface.id().protocol_id(), origin));
+        let fresh_surface_detail = self
+            .surface_under(pos)
+            .map(|(surface, origin)| self.surface_hit_debug(&surface, origin));
+        let decoration_under = self.decoration_under(pos).map(|(window, hit)| {
+            let snapshot = self.snapshot_window(&window);
+            let allowed = self.pointer_allows_window_interaction(
+                self.pointer_contents
+                    .surface
+                    .as_ref()
+                    .map(|(surface, _)| surface),
+                &window,
+            );
+            (
+                snapshot.id,
+                snapshot.title,
+                snapshot.app_id,
+                self.managed_window_z_index(&window),
+                hit,
+                allowed,
+            )
+        });
+        let surface_hits_by_window = self
+            .windows_top_to_bottom()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(stack_index, window)| {
+                let snapshot = self.snapshot_window(window);
+                let location = self.space.element_location(window)?;
+                let local_pos = if let Some(decoration) = self.window_decorations.get(window) {
+                    if !decoration.managed_window_allows_input() {
+                        return None;
+                    }
+                    inverse_transform_point(
+                        pos,
+                        decoration.layout.root.rect,
+                        decoration.visual_transform,
+                    ) - location.to_f64()
+                } else {
+                    pos - location.to_f64()
+                };
+                let (surface, loc) = window.surface_under(local_pos, WindowSurfaceType::ALL)?;
+                Some((
+                    stack_index,
+                    snapshot.id,
+                    snapshot.title,
+                    snapshot.app_id,
+                    self.managed_window_z_index(window),
+                    local_pos,
+                    surface.id().protocol_id(),
+                    loc,
+                    Self::surface_root(&surface).id().protocol_id(),
+                    self.surface_has_popup_ancestor(&surface),
+                    Self::surface_is_window_root_for_debug(window, &surface),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let transformed_window_under =
+            self.window_under_transformed(logical_pos)
+                .map(|(window, _)| {
+                    let snapshot = self.snapshot_window(window);
+                    (
+                        snapshot.id,
+                        snapshot.title,
+                        snapshot.app_id,
+                        self.managed_window_z_index(window),
+                    )
+                });
+        let raw_window_under = self.raw_window_under(logical_pos).map(|(window, rect)| {
+            let snapshot = self.snapshot_window(window);
+            (
+                snapshot.id,
+                snapshot.title,
+                snapshot.app_id,
+                self.managed_window_z_index(window),
+                rect,
+            )
+        });
+        let space_order = self
+            .space
+            .elements()
+            .enumerate()
+            .map(|(index, window)| {
+                let snapshot = self.snapshot_window(window);
+                (
+                    index,
+                    snapshot.id,
+                    snapshot.title,
+                    snapshot.app_id,
+                    snapshot.is_focused,
+                    self.managed_window_z_index(window),
+                    self.window_decorations.get(window).map(|decoration| {
+                        (
+                            decoration.managed_window.managed,
+                            decoration.managed_window.z_index,
+                            decoration.layout.root.rect,
+                            transformed_root_rect(
+                                decoration.layout.root.rect,
+                                decoration.visual_transform,
+                            )
+                            .contains(logical_pos),
+                        )
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let sorted_order = self
+            .windows_top_to_bottom()
+            .into_iter()
+            .enumerate()
+            .map(|(index, window)| {
+                let snapshot = self.snapshot_window(window);
+                (
+                    index,
+                    snapshot.id,
+                    snapshot.title,
+                    snapshot.app_id,
+                    snapshot.is_focused,
+                    self.managed_window_z_index(window),
+                    self.window_decorations.get(window).map(|decoration| {
+                        (
+                            decoration.managed_window.managed,
+                            decoration.managed_window.z_index,
+                            decoration.layout.root.rect,
+                            transformed_root_rect(
+                                decoration.layout.root.rect,
+                                decoration.visual_transform,
+                            )
+                            .contains(logical_pos),
+                        )
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        info!(
+            label,
+            pointer_location = ?pos,
+            logical_pos = ?logical_pos,
+            pointer_contents_surface = ?pointer_surface,
+            pointer_contents_surface_detail = ?pointer_surface_detail,
+            fresh_surface_under = ?fresh_surface,
+            fresh_surface_under_detail = ?fresh_surface_detail,
+            pointer_layer = ?self.pointer_contents.layer.as_ref().map(|layer| {
+                (
+                    layer.wl_surface().id().protocol_id(),
+                    layer.layer(),
+                    layer.cached_state().keyboard_interactivity,
+                )
+            }),
+            decoration_under = ?decoration_under,
+            transformed_window_under = ?transformed_window_under,
+            raw_window_under = ?raw_window_under,
+            surface_hits_by_window = ?surface_hits_by_window,
+            space_order = ?space_order,
+            sorted_order = ?sorted_order,
+            "stack hit debug"
+        );
     }
 
     fn tracked_decoration_interaction_target_under(
@@ -1051,7 +1381,9 @@ impl ShojiWM {
         if !self
             .window_decorations
             .get(window)
-            .is_some_and(|decoration| decoration.managed_window.managed)
+            .is_some_and(|decoration| {
+                decoration.managed_window.managed && decoration.managed_window.z_index.is_some()
+            })
         {
             self.space.raise_element(window, true);
         }

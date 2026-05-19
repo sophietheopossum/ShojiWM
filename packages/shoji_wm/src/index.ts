@@ -260,6 +260,13 @@ export {
   type WindowStateStore,
 } from "./window-state";
 export {
+  createWindowStack,
+  type WindowStack,
+  type WindowStackAddOptions,
+  type WindowStackOptions,
+  type WindowStackPlacement,
+} from "./window-stack";
+export {
   createPoll,
   createManagedPoll,
   installSchedulerBridge,

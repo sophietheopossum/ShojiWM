@@ -1797,75 +1797,138 @@ impl ShojiWM {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.windows_top_to_bottom().into_iter().find_map(|window| {
-            let location = self.space.element_location(window)?;
+        for window in self.windows_top_to_bottom() {
+            let Some(location) = self.space.element_location(window) else {
+                continue;
+            };
 
             if let Some(decoration) = self.window_decorations.get(window) {
                 if !decoration.managed_window_allows_input() {
-                    return None;
+                    continue;
                 }
                 let local_pos = inverse_transform_point(
                     pos,
                     decoration.layout.root.rect,
                     decoration.visual_transform,
                 );
-                return window
-                    .surface_under(local_pos - location.to_f64(), WindowSurfaceType::ALL)
-                    .and_then(|(surface, loc)| {
-                        if Self::is_window_root_surface(window, &surface)
-                            || self.surface_has_popup_ancestor_for_hit_test(&surface)
-                        {
-                            return None;
-                        }
-                        let desired_local = (local_pos - location.to_f64()) - loc.to_f64();
-                        let surface_origin = pos - desired_local;
-                        Some((surface, surface_origin))
-                    });
-            }
-
-            window
-                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                .and_then(|(surface, loc)| {
+                let window_local_pos = local_pos - location.to_f64();
+                if let Some((surface, loc)) =
+                    window.surface_under(window_local_pos, WindowSurfaceType::ALL)
+                {
                     if Self::is_window_root_surface(window, &surface)
                         || self.surface_has_popup_ancestor_for_hit_test(&surface)
                     {
                         return None;
                     }
-                    Some((surface, loc.to_f64() + location.to_f64()))
-                })
-        })
+                    let desired_local = window_local_pos - loc.to_f64();
+                    let surface_origin = pos - desired_local;
+                    return Some((surface, surface_origin));
+                }
+
+                let transformed_root =
+                    transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
+                if transformed_root.contains(LogicalPoint::new(
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                )) {
+                    return None;
+                }
+
+                continue;
+            }
+
+            let window_local_pos = pos - location.to_f64();
+            if let Some((surface, loc)) =
+                window.surface_under(window_local_pos, WindowSurfaceType::ALL)
+            {
+                if Self::is_window_root_surface(window, &surface)
+                    || self.surface_has_popup_ancestor_for_hit_test(&surface)
+                {
+                    return None;
+                }
+                return Some((surface, loc.to_f64() + location.to_f64()));
+            }
+
+            let bbox = window.bbox();
+            let rect = LogicalRect::new(
+                location.x + bbox.loc.x,
+                location.y + bbox.loc.y,
+                bbox.size.w,
+                bbox.size.h,
+            );
+            if rect.contains(LogicalPoint::new(
+                pos.x.floor() as i32,
+                pos.y.floor() as i32,
+            )) {
+                return None;
+            }
+        }
+
+        None
     }
 
     fn window_popup_surface_under(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.windows_top_to_bottom().into_iter().find_map(|window| {
-            let location = self.space.element_location(window)?;
+        for window in self.windows_top_to_bottom() {
+            let Some(location) = self.space.element_location(window) else {
+                continue;
+            };
 
             if let Some(decoration) = self.window_decorations.get(window) {
                 if !decoration.managed_window_allows_input() {
-                    return None;
+                    continue;
                 }
                 let local_pos = inverse_transform_point(
                     pos,
                     decoration.layout.root.rect,
                     decoration.visual_transform,
                 );
+                let window_local_pos = local_pos - location.to_f64();
 
-                return window
-                    .surface_under(local_pos - location.to_f64(), WindowSurfaceType::POPUP)
-                    .map(|(surface, loc)| {
-                        let desired_local = (local_pos - location.to_f64()) - loc.to_f64();
-                        let surface_origin = pos - desired_local;
-                        (surface, surface_origin)
-                    });
+                if let Some((surface, loc)) =
+                    window.surface_under(window_local_pos, WindowSurfaceType::POPUP)
+                {
+                    let desired_local = window_local_pos - loc.to_f64();
+                    let surface_origin = pos - desired_local;
+                    return Some((surface, surface_origin));
+                }
+
+                let transformed_root =
+                    transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
+                if transformed_root.contains(LogicalPoint::new(
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                )) {
+                    return None;
+                }
+
+                continue;
             }
 
-            window
-                .surface_under(pos - location.to_f64(), WindowSurfaceType::POPUP)
-                .map(|(surface, loc)| (surface, loc.to_f64() + location.to_f64()))
-        })
+            if let Some((surface, loc)) =
+                window.surface_under(pos - location.to_f64(), WindowSurfaceType::POPUP)
+            {
+                return Some((surface, loc.to_f64() + location.to_f64()));
+            }
+
+            let bbox = window.bbox();
+            let rect = LogicalRect::new(
+                location.x + bbox.loc.x,
+                location.y + bbox.loc.y,
+                bbox.size.w,
+                bbox.size.h,
+            );
+            if rect.contains(LogicalPoint::new(
+                pos.x.floor() as i32,
+                pos.y.floor() as i32,
+            )) {
+                return None;
+            }
+        }
+
+        None
     }
 
     fn layer_surface_under_with_policy(
@@ -2002,7 +2065,7 @@ impl ShojiWM {
         self.window_decorations
             .get(window)
             .filter(|decoration| decoration.managed_window.managed)
-            .map(|decoration| decoration.managed_window.z_index)
+            .and_then(|decoration| decoration.managed_window.z_index)
             .unwrap_or(0)
     }
 

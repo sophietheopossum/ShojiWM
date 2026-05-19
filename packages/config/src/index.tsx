@@ -24,6 +24,7 @@ import {
     windowSource,
     ManagedWindow,
     createWindowState,
+    createWindowStack,
 } from "shoji_wm";
 import type { DecorationRenderable, ManagedWindowRect, WindowPosition } from "shoji_wm/types";
 
@@ -145,8 +146,10 @@ const DEFAULT_WINDOW_RECT: WindowPosition = { x: 100, y: 200, width: 1000, heigh
 const WINDOW_STATE_RECT = createWindowState<ManagedWindowRect>("rect", {
     default: (window) => window.rect ?? DEFAULT_WINDOW_RECT,
 });
+const windowStack = createWindowStack();
 
 WINDOW_MANAGER.event.onOpen((window) => {
+    windowStack.add(window);
     window.state[WINDOW_STATE_RECT].set(window.rect ?? DEFAULT_WINDOW_RECT);
     window.setCloseAnimationDuration(OPEN_CLOSE_ANIMATION_DURATION);
     window.animation.start(openAnimation, {
@@ -164,7 +167,14 @@ WINDOW_MANAGER.event.onStartClose((window) => {
     });
 });
 
+WINDOW_MANAGER.event.onClose((window) => {
+    windowStack.remove(window);
+});
+
 WINDOW_MANAGER.event.onFocus((window, focused) => {
+    if (focused) {
+        windowStack.raise(window);
+    }
     /*
     window.animation.start(focusAnimation, {
         duration: seconds(0.5),
@@ -290,6 +300,7 @@ WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
     return (
         <ManagedWindow
             rect={rect}
+            zIndex={windowStack.zIndex(window)}
             clipToRect
             opacity={opacity}
         >

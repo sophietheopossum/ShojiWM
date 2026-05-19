@@ -112,7 +112,7 @@ export interface ManagedWindowState {
   idle: boolean;
   interactive: boolean;
   clipToRect: boolean;
-  zIndex: number;
+  zIndex?: number;
   transform: WindowTransform;
 }
 
