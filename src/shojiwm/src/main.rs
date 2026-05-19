@@ -9,6 +9,7 @@ use std::{
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+pub mod activation_environment;
 pub mod backend;
 pub mod config;
 pub mod cursor;
@@ -117,6 +118,7 @@ fn sanitize_inherited_compositor_environment() {
     unsafe {
         std::env::set_var("XDG_CURRENT_DESKTOP", "ShojiWM");
         std::env::set_var("XDG_SESSION_DESKTOP", "ShojiWM");
+        std::env::set_var("DESKTOP_SESSION", "ShojiWM");
     }
 }
 

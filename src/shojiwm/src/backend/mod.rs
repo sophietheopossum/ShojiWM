@@ -35,6 +35,7 @@ use smithay::{
 use tracing::{info, trace, warn};
 
 use crate::{
+    activation_environment::publish_activation_environment,
     backend::tty::{device_added, render_if_needed},
     config::tty_output_names_match,
     spawn_client,
@@ -66,6 +67,7 @@ fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let display: Display<ShojiWM> = Display::new()?;
     let mut state = ShojiWM::new(&mut event_loop, display);
     unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
+    publish_activation_environment("winit-wayland-display");
 
     info!("initializing winit backend");
     winit::init_winit(&mut event_loop, &mut state)?;
@@ -84,6 +86,7 @@ pub fn run_tty_udev() -> Result<(), Box<dyn std::error::Error>> {
     let display: Display<ShojiWM> = Display::new()?;
     let mut state = ShojiWM::new(&mut event_loop, display);
     unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
+    publish_activation_environment("tty-wayland-display");
     state.start_xwayland(&event_loop);
 
     let (mut session, _session_notifier) = LibSeatSession::new()?;

@@ -75,6 +75,7 @@ use smithay::{
 };
 use xcursor::parser::Image;
 
+use crate::activation_environment::publish_activation_environment;
 use crate::backend::tty::{apply_tty_output_mode, tty_output_available_modes};
 use crate::backend::visual::{inverse_transform_point, transformed_rect, transformed_root_rect};
 use crate::runtime_key_binding::{
@@ -960,6 +961,7 @@ impl ShojiWM {
                     unsafe {
                         std::env::set_var("DISPLAY", &instance.display_name);
                     }
+                    publish_activation_environment("xwayland-satellite-display");
                     info!(
                         display = %instance.display_name,
                         "xwayland-satellite started, DISPLAY exported"
@@ -1002,6 +1004,7 @@ impl ShojiWM {
         unsafe {
             std::env::set_var("DISPLAY", format!(":{}", display_number));
         }
+        publish_activation_environment("xwayland-display");
         info!(
             display = display_number,
             "XWayland spawned, DISPLAY exported"
