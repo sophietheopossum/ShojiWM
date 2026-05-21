@@ -260,7 +260,7 @@ const CloseButton = ({ window }: { window: WaylandWindow }) => {
     const background = hover(hover => hover ? "#F08080" : "#F0808080");
 
     var icon: CompositionRenderable | null = null;
-    if (hover()) {
+    if (true) {
         icon = (
             <Image
                 src="./assets/x.svg"

@@ -852,6 +852,7 @@ fn rounded_rect_element(
                 crate::ssd::BorderFit::Normal
             }
         });
+    let mut uses_paired_border_geometry = false;
     let geometry = if cached.border_width > 0.0 {
         border_outer_geometry(
             cached,
@@ -886,6 +887,7 @@ fn rounded_rect_element(
                     crate::ssd::BorderFit::Normal
                 }
             });
+        uses_paired_border_geometry = true;
         border_outer_geometry(
             border_cached,
             owner_border_fit,
@@ -1139,7 +1141,7 @@ fn rounded_rect_element(
     } else {
         inner
     };
-    let use_physical_anchor_space = cached.border_width > 0.0;
+    let use_physical_anchor_space = cached.border_width > 0.0 || uses_paired_border_geometry;
     let scale_x = scale.x.abs().max(0.0001) as f32;
     let scale_y = scale.y.abs().max(0.0001) as f32;
     let shader_rect = if use_physical_anchor_space {

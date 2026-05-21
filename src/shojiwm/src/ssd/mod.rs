@@ -2598,10 +2598,7 @@ impl LayoutDirection {
                 let aligned_px = bottom_px - child_px;
                 ResolvedLayoutValue::from_f32(aligned_px as f32 / scale)
             }
-            (LayoutDirection::Row, _) => {
-                let top_px = (rect.y.to_f32() * scale).round() as i32;
-                ResolvedLayoutValue::from_f32(top_px as f32 / scale)
-            }
+            (LayoutDirection::Row, _) => rect.y,
             (LayoutDirection::Column, AlignItems::Center) => {
                 let left_px = (rect.x.to_f32() * scale).round() as i32;
                 let right_px = ((rect.x.to_f32() + rect.width.to_f32()) * scale).round() as i32;
@@ -2615,10 +2612,7 @@ impl LayoutDirection {
                 let aligned_px = right_px - child_px;
                 ResolvedLayoutValue::from_f32(aligned_px as f32 / scale)
             }
-            (LayoutDirection::Column, _) => {
-                let left_px = (rect.x.to_f32() * scale).round() as i32;
-                ResolvedLayoutValue::from_f32(left_px as f32 / scale)
-            }
+            (LayoutDirection::Column, _) => rect.x,
         }
     }
 
@@ -4505,6 +4499,64 @@ mod tests {
 
         assert_eq!(button.resolved_rect.width.to_f32(), 18.125);
         assert_eq!(button.resolved_rect.height.to_f32(), 18.125);
+    }
+
+    #[test]
+    fn flow_child_and_absolute_overlay_share_fractional_parent_edge() {
+        let button = DecorationNode::new(DecorationNodeKind::Button(ButtonNode {
+            action: WindowAction::Close,
+        }))
+        .with_style(DecorationStyle {
+            width: Some(16),
+            height: Some(16),
+            border: Some(BorderStyle {
+                width: 1,
+                color: Color::WHITE,
+            }),
+            ..Default::default()
+        });
+        let image = DecorationNode::new(DecorationNodeKind::Image(ImageNode {
+            src: "/tmp/icon.svg".into(),
+            fit: ImageFit::Contain,
+        }))
+        .with_style(DecorationStyle {
+            width: Some(16),
+            height: Some(16),
+            position: Some(StylePosition::Absolute),
+            ..Default::default()
+        });
+        let overlay = DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
+            .with_style(DecorationStyle {
+                width: Some(16),
+                height: Some(16),
+                position: Some(StylePosition::Relative),
+                ..Default::default()
+            })
+            .with_children(vec![button, image]);
+        let root = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Row,
+        }))
+        .with_style(DecorationStyle {
+            border: Some(BorderStyle {
+                width: 2,
+                color: Color::WHITE,
+            }),
+            ..Default::default()
+        })
+        .with_children(vec![
+            overlay,
+            DecorationNode::new(DecorationNodeKind::WindowSlot),
+        ]);
+
+        let layout = DecorationTree::new(root)
+            .layout_for_client_with_scale(LogicalRect::new(0, 0, 100, 30), 1.25)
+            .expect("layout should succeed");
+        let overlay = &layout.root.children[0];
+        let button = &overlay.children[0];
+        let image = &overlay.children[1];
+
+        assert_eq!(button.resolved_rect.x, image.resolved_rect.x);
+        assert_eq!(button.resolved_rect.y, image.resolved_rect.y);
     }
 
     #[test]
