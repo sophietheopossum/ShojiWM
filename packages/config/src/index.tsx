@@ -20,7 +20,7 @@ import {
     ManagedWindow,
 } from "shoji_wm";
 import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
-import { HybridWindowManager, OPEN_ANIMATION, WINDOW_STATE_RECT } from "./window-manager";
+import { HybridWindowManager, OPEN_ANIMATION, WINDOW_STATE_MINIMIZED, WINDOW_STATE_RECT } from "./window-manager";
 
 const NOCTALIA_SHELL_PATH = "/home/bea4dev/Documents/development/noctalia-shell-shojiwm";
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
@@ -111,6 +111,21 @@ WINDOW_MANAGER.event.onWindowMove((event) => {
     HYBRID_WINDOW_MANAGER.onWindowMove(event);
 });
 
+WINDOW_MANAGER.event.onWindowMaximizeRequest((event) => {
+    console.log("max! " + event.maximized);
+    HYBRID_WINDOW_MANAGER.onWindowMaximizeRequest(event);
+});
+
+WINDOW_MANAGER.event.onWindowMinimizeRequest((event) => {
+    console.log("min!");
+    HYBRID_WINDOW_MANAGER.onWindowMinimizeRequest(event);
+});
+
+WINDOW_MANAGER.event.onWindowActivateRequest((event) => {
+    console.log("active!");
+    HYBRID_WINDOW_MANAGER.onWindowActivateRequest(event);
+});
+
 const WINDOW_BORDER_PX = 2;
 const TITLEBAR_HEIGHT = 30;
 
@@ -139,6 +154,7 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
         };
     });
     const forceRectSize = computed(() => window.isResizable() && !window.isTransient());
+    const minimized = window.state[WINDOW_STATE_MINIMIZED];
 
     const borderColor = window.isFocused(focused => focused ? "#d7ba7d" : "#4f5666");
     const titlebarBackground = window.isFocused(focused => focused ? "#1f243080" : "#2a2f3a80");
@@ -234,6 +250,8 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
             rect={rect}
             zIndex={HYBRID_WINDOW_MANAGER.getWindowZIndex(window)}
             forceRectSize={forceRectSize}
+            idle={minimized}
+            interactive={minimized(value => !value)}
             opacity={opacity}
         >
             <WindowBorder
@@ -260,7 +278,7 @@ const CloseButton = ({ window }: { window: WaylandWindow }) => {
     const background = hover(hover => hover ? "#F08080" : "#F0808080");
 
     var icon: CompositionRenderable | null = null;
-    if (true) {
+    if (hover()) {
         icon = (
             <Image
                 src="./assets/x.svg"

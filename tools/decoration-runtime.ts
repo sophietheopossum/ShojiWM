@@ -61,6 +61,9 @@ import {
   type PollHandle,
   type RuntimeWindowResizeEvent,
   type RuntimeWindowMoveEvent,
+  type RuntimeWindowMaximizeRequestEvent,
+  type RuntimeWindowMinimizeRequestEvent,
+  type RuntimeWindowActivateRequestEvent,
   type PointerMoveEvent,
   type RuntimeEventConfig,
   updateOutputState,
@@ -155,6 +158,36 @@ interface WindowMoveRequest {
   displayState: Record<string, OutputStateSnapshot>;
 }
 
+interface WindowMaximizeRequest {
+  requestId: number;
+  kind: "windowMaximizeRequest";
+  windowId: string;
+  snapshot: WaylandWindowSnapshot;
+  event: RuntimeWindowMaximizeRequestEvent;
+  nowMs: number;
+  displayState: Record<string, OutputStateSnapshot>;
+}
+
+interface WindowMinimizeRequest {
+  requestId: number;
+  kind: "windowMinimizeRequest";
+  windowId: string;
+  snapshot: WaylandWindowSnapshot;
+  event: RuntimeWindowMinimizeRequestEvent;
+  nowMs: number;
+  displayState: Record<string, OutputStateSnapshot>;
+}
+
+interface WindowActivateRequest {
+  requestId: number;
+  kind: "windowActivateRequest";
+  windowId: string;
+  snapshot: WaylandWindowSnapshot;
+  event: RuntimeWindowActivateRequestEvent;
+  nowMs: number;
+  displayState: Record<string, OutputStateSnapshot>;
+}
+
 interface PointerMoveAsyncRequest {
   requestId: number;
   kind: "pointerMoveAsync";
@@ -189,6 +222,9 @@ type RuntimeRequest =
   | InvokeKeyBindingRequest
   | WindowResizeRequest
   | WindowMoveRequest
+  | WindowMaximizeRequest
+  | WindowMinimizeRequest
+  | WindowActivateRequest
   | PointerMoveAsyncRequest
   | GetEffectConfigRequest
   | EvaluateLayerEffectsRequest;
@@ -311,6 +347,25 @@ interface WindowMoveSuccess {
   requestId: number;
   ok: true;
   kind: "windowMove";
+  invoked: boolean;
+  dirty: boolean;
+  dirtyWindowIds: string[];
+  dirtyWindowNodeIds?: Record<string, string[]>;
+  dirtyLayerNodeIds?: Record<string, string[]>;
+  actions: RuntimeWindowAction[];
+  nextPollInMs?: number;
+  displayConfig?: { outputs: DisplayConfigDraft };
+  keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
+  pointerConfig?: RuntimePointerConfig;
+  eventConfig?: RuntimeEventConfig;
+  processConfig?: { entries: RuntimeProcessConfigEntry[] };
+  processActions?: RuntimeProcessSpawnAction[];
+}
+
+interface WindowStateRequestSuccess {
+  requestId: number;
+  ok: true;
+  kind: "windowMaximizeRequest" | "windowMinimizeRequest" | "windowActivateRequest";
   invoked: boolean;
   dirty: boolean;
   dirtyWindowIds: string[];
@@ -573,6 +628,9 @@ const stats = {
   invokeKeyBinding: 0,
   windowResize: 0,
   windowMove: 0,
+  windowMaximizeRequest: 0,
+  windowMinimizeRequest: 0,
+  windowActivateRequest: 0,
   pointerMoveAsync: 0,
   getEffectConfig: 0,
   evaluateLayerEffects: 0,
@@ -680,6 +738,15 @@ async function main() {
             break;
           case "windowMove":
             stats.windowMove++;
+            break;
+          case "windowMaximizeRequest":
+            stats.windowMaximizeRequest++;
+            break;
+          case "windowMinimizeRequest":
+            stats.windowMinimizeRequest++;
+            break;
+          case "windowActivateRequest":
+            stats.windowActivateRequest++;
             break;
           case "pointerMoveAsync":
             stats.pointerMoveAsync++;
@@ -878,6 +945,81 @@ async function main() {
             requestId: request.requestId,
             ok: true,
             kind: "windowMove",
+            ...result,
+            displayConfig: pendingDisplayConfigPayload(),
+            keyBindingConfig,
+            pointerConfig,
+            eventConfig,
+            processConfig,
+            processActions,
+          });
+        } else if (request.kind === "windowMaximizeRequest") {
+          const result = invokeWindowMaximizeRequest(
+            composition,
+            events,
+            request.windowId,
+            request.snapshot,
+            request.event,
+          );
+          const keyBindingConfig = pendingKeyBindingConfigPayload();
+          const pointerConfig = pendingPointerConfigPayload();
+          const eventConfig = pendingEventConfigPayload(events);
+          const processConfig = pendingProcessConfigPayload();
+          const processActions = pendingProcessActionsPayload();
+          await writeResponse(output, {
+            requestId: request.requestId,
+            ok: true,
+            kind: "windowMaximizeRequest",
+            ...result,
+            displayConfig: pendingDisplayConfigPayload(),
+            keyBindingConfig,
+            pointerConfig,
+            eventConfig,
+            processConfig,
+            processActions,
+          });
+        } else if (request.kind === "windowMinimizeRequest") {
+          const result = invokeWindowMinimizeRequest(
+            composition,
+            events,
+            request.windowId,
+            request.snapshot,
+            request.event,
+          );
+          const keyBindingConfig = pendingKeyBindingConfigPayload();
+          const pointerConfig = pendingPointerConfigPayload();
+          const eventConfig = pendingEventConfigPayload(events);
+          const processConfig = pendingProcessConfigPayload();
+          const processActions = pendingProcessActionsPayload();
+          await writeResponse(output, {
+            requestId: request.requestId,
+            ok: true,
+            kind: "windowMinimizeRequest",
+            ...result,
+            displayConfig: pendingDisplayConfigPayload(),
+            keyBindingConfig,
+            pointerConfig,
+            eventConfig,
+            processConfig,
+            processActions,
+          });
+        } else if (request.kind === "windowActivateRequest") {
+          const result = invokeWindowActivateRequest(
+            composition,
+            events,
+            request.windowId,
+            request.snapshot,
+            request.event,
+          );
+          const keyBindingConfig = pendingKeyBindingConfigPayload();
+          const pointerConfig = pendingPointerConfigPayload();
+          const eventConfig = pendingEventConfigPayload(events);
+          const processConfig = pendingProcessConfigPayload();
+          const processActions = pendingProcessActionsPayload();
+          await writeResponse(output, {
+            requestId: request.requestId,
+            ok: true,
+            kind: "windowActivateRequest",
             ...result,
             displayConfig: pendingDisplayConfigPayload(),
             keyBindingConfig,
@@ -1160,6 +1302,38 @@ function createRuntimeCacheEntry(
     closeStarted: false,
     preconfigured: false,
   };
+  return entry;
+}
+
+function ensureRuntimeCacheEntry(
+  composition: WindowCompositionFunction,
+  events: WindowManagerEventController,
+  snapshot: WaylandWindowSnapshot,
+): RuntimeCacheEntry {
+  let entry = cacheByWindowId.get(snapshot.id);
+  if (!entry) {
+    entry = createRuntimeCacheEntry(snapshot, composition, RENDER_COMPOSITION_CONTEXT);
+    cacheByWindowId.set(snapshot.id, entry);
+    if (!openedWindowIds.has(snapshot.id)) {
+      openedWindowIds.add(snapshot.id);
+      events.emitOpen(entry.cache.window);
+    }
+    events.emitFocus(entry.cache.window, snapshot.isFocused);
+    dirtyWindowIds.delete(snapshot.id);
+    return entry;
+  }
+
+  // Window state requests can arrive before the first real client commit. For example Discord
+  // sends unmaximize / activation requests while restoring from the tray. These requests must not
+  // consume the first-commit lifecycle or switch a preconfigure cache into render mode; otherwise
+  // config code that initializes rects in onFirstCommit observes the tiny pre-commit geometry and
+  // never gets a chance to replace it with the natural first-buffer size.
+  const focusChanged = entry.latestSnapshot.isFocused !== snapshot.isFocused;
+  entry.latestSnapshot = snapshot;
+  entry.cache.update(snapshot);
+  if (focusChanged) {
+    events.emitFocus(entry.cache.window, snapshot.isFocused);
+  }
   return entry;
 }
 
@@ -1522,6 +1696,104 @@ function invokeWindowMove(
   };
 }
 
+function invokeWindowMaximizeRequest(
+  composition: WindowCompositionFunction,
+  events: WindowManagerEventController,
+  windowId: string,
+  snapshot: WaylandWindowSnapshot,
+  event: RuntimeWindowMaximizeRequestEvent,
+): Omit<WindowStateRequestSuccess, "requestId" | "ok" | "kind"> {
+  if (snapshot.id !== windowId) {
+    return emptyWindowStateRequestResult();
+  }
+  const entry = ensureRuntimeCacheEntry(composition, events, snapshot);
+
+  const invoked = events.emitWindowMaximizeRequest(entry.cache.window, event);
+  if (!invoked) {
+    return emptyWindowStateRequestResult();
+  }
+
+  const result = collectRuntimeMutationState();
+  return {
+    invoked: true,
+    dirty: result.dirty,
+    dirtyWindowIds: result.dirtyWindowIds,
+    dirtyWindowNodeIds: result.dirtyWindowNodeIds,
+    dirtyLayerNodeIds: result.dirtyLayerNodeIds,
+    actions: result.actions,
+    nextPollInMs: hasActiveAnimations() ? 0 : result.nextPollInMs,
+  };
+}
+
+function invokeWindowMinimizeRequest(
+  composition: WindowCompositionFunction,
+  events: WindowManagerEventController,
+  windowId: string,
+  snapshot: WaylandWindowSnapshot,
+  event: RuntimeWindowMinimizeRequestEvent,
+): Omit<WindowStateRequestSuccess, "requestId" | "ok" | "kind"> {
+  if (snapshot.id !== windowId) {
+    return emptyWindowStateRequestResult();
+  }
+  const entry = ensureRuntimeCacheEntry(composition, events, snapshot);
+
+  const invoked = events.emitWindowMinimizeRequest(entry.cache.window, event);
+  if (!invoked) {
+    return emptyWindowStateRequestResult();
+  }
+
+  const result = collectRuntimeMutationState();
+  return {
+    invoked: true,
+    dirty: result.dirty,
+    dirtyWindowIds: result.dirtyWindowIds,
+    dirtyWindowNodeIds: result.dirtyWindowNodeIds,
+    dirtyLayerNodeIds: result.dirtyLayerNodeIds,
+    actions: result.actions,
+    nextPollInMs: hasActiveAnimations() ? 0 : result.nextPollInMs,
+  };
+}
+
+function invokeWindowActivateRequest(
+  composition: WindowCompositionFunction,
+  events: WindowManagerEventController,
+  windowId: string,
+  snapshot: WaylandWindowSnapshot,
+  event: RuntimeWindowActivateRequestEvent,
+): Omit<WindowStateRequestSuccess, "requestId" | "ok" | "kind"> {
+  if (snapshot.id !== windowId) {
+    return emptyWindowStateRequestResult();
+  }
+  const entry = ensureRuntimeCacheEntry(composition, events, snapshot);
+
+  const invoked = events.emitWindowActivateRequest(entry.cache.window, event);
+  if (!invoked) {
+    return emptyWindowStateRequestResult();
+  }
+
+  const result = collectRuntimeMutationState();
+  return {
+    invoked: true,
+    dirty: result.dirty,
+    dirtyWindowIds: result.dirtyWindowIds,
+    dirtyWindowNodeIds: result.dirtyWindowNodeIds,
+    dirtyLayerNodeIds: result.dirtyLayerNodeIds,
+    actions: result.actions,
+    nextPollInMs: hasActiveAnimations() ? 0 : result.nextPollInMs,
+  };
+}
+
+function emptyWindowStateRequestResult():
+  Omit<WindowStateRequestSuccess, "requestId" | "ok" | "kind"> {
+  return {
+    invoked: false,
+    dirty: false,
+    dirtyWindowIds: [],
+    actions: [],
+    nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
+  };
+}
+
 async function invokePointerMoveAsync(
   events: WindowManagerEventController,
   event: PointerMoveEvent,
@@ -1809,6 +2081,7 @@ function writeResponse(
     | InvokeKeyBindingSuccess
     | WindowResizeSuccess
     | WindowMoveSuccess
+    | WindowStateRequestSuccess
     | PointerMoveAsyncSuccess
     | GetEffectConfigSuccess
     | EvaluateLayerEffectsSuccess

@@ -419,6 +419,9 @@ impl ShojiWM {
             };
 
         self.space.elements().for_each(|window| {
+            if !self.window_allows_render(window) {
+                return;
+            }
             if self.space.outputs_for_element(window).contains(output) {
                 window.send_frame(output, time, throttle, &should_send);
             }
@@ -504,6 +507,9 @@ impl ShojiWM {
             };
 
         self.space.elements().for_each(|window| {
+            if !self.window_allows_render(window) {
+                return;
+            }
             if self.space.outputs_for_element(window).contains(output) {
                 window.send_frame(output, time, throttle, &should_send);
             }
@@ -544,6 +550,9 @@ impl ShojiWM {
         let debug_fifo = fifo_debug_enabled();
         let debug_mpv = mpv_frame_debug_enabled();
         self.space.elements().for_each(|window| {
+            if !self.window_allows_render(window) {
+                return;
+            }
             if !self.space.outputs_for_element(window).contains(output) {
                 return;
             }
@@ -626,6 +635,9 @@ impl ShojiWM {
         let mut next_deadline: Option<Duration> = None;
 
         self.space.elements().for_each(|window| {
+            if !self.window_allows_render(window) {
+                return;
+            }
             if !self.space.outputs_for_element(window).contains(output) {
                 return;
             }
@@ -686,6 +698,9 @@ impl ShojiWM {
         let debug_fifo = fifo_debug_enabled();
         let debug_mpv = mpv_frame_debug_enabled();
         self.space.elements().for_each(|window| {
+            if !self.window_allows_render(window) {
+                return;
+            }
             if self.space.outputs_for_element(window).contains(output) {
                 let app_id = window
                     .toplevel()

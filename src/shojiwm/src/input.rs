@@ -8,7 +8,7 @@ use smithay::{
         keyboard::{FilterResult, keysyms},
         pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent},
     },
-    reexports::wayland_server::Resource,
+    reexports::{wayland_protocols::xdg::shell::server::xdg_toplevel, wayland_server::Resource},
     utils::{SERIAL_COUNTER, Serial},
 };
 use std::time::Instant;
@@ -832,6 +832,8 @@ impl ShojiWM {
                     .remove(&runtime_action.window_id);
                 self.windows_ready_for_decoration
                     .remove(&runtime_action.window_id);
+                self.pending_xdg_state_configure_window_ids
+                    .remove(&runtime_action.window_id);
                 self.snapshot_dirty_window_ids
                     .remove(&runtime_action.window_id);
                 let _ = self
@@ -860,27 +862,157 @@ impl ShojiWM {
                     }
                 }
                 crate::ssd::WaylandWindowAction::Maximize => {
-                    if let Some(toplevel) = window.toplevel() {
-                        toplevel.with_pending_state(|state| {
-                            state.states.set(
-                                smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized,
-                            );
-                        });
-                        toplevel.send_pending_configure();
-                    }
+                    self.request_window_maximize(
+                        &window,
+                        true,
+                        crate::ssd::WindowStateRequestSourceSnapshot::Api,
+                    );
                 }
                 crate::ssd::WaylandWindowAction::Focus => {
                     let serial = SERIAL_COUNTER.next_serial();
                     self.focus_window(&window, serial);
                 }
                 crate::ssd::WaylandWindowAction::FinalizeClose => {}
-                crate::ssd::WaylandWindowAction::Minimize => {}
+                crate::ssd::WaylandWindowAction::Minimize => {
+                    self.request_window_minimize(
+                        &window,
+                        true,
+                        crate::ssd::WindowStateRequestSourceSnapshot::Api,
+                    );
+                }
             }
         }
     }
 }
 
 impl ShojiWM {
+    pub(crate) fn request_window_maximize(
+        &mut self,
+        window: &smithay::desktop::Window,
+        maximized: bool,
+        source: crate::ssd::WindowStateRequestSourceSnapshot,
+    ) -> bool {
+        let snapshot = self.snapshot_window(window);
+        let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
+        let event = crate::ssd::WindowMaximizeRequestEventSnapshot {
+            maximized,
+            source,
+            timestamp: now_ms,
+        };
+        tracing::info!(
+            window_id = %snapshot.id,
+            title = %snapshot.title,
+            app_id = ?snapshot.app_id,
+            maximized,
+            source = ?source,
+            "runtime window maximize request dispatch"
+        );
+        let invoked = self.invoke_window_maximize_request_event(&snapshot, &event, now_ms);
+        if invoked {
+            self.set_xdg_maximized_hint(window, &snapshot.id, maximized);
+        }
+        tracing::info!(
+            window_id = %snapshot.id,
+            invoked,
+            "runtime window maximize request result"
+        );
+        invoked
+    }
+
+    fn set_xdg_maximized_hint(
+        &mut self,
+        window: &smithay::desktop::Window,
+        window_id: &str,
+        maximized: bool,
+    ) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+
+        let changed = toplevel.with_pending_state(|state| {
+            let was_maximized = state.states.contains(xdg_toplevel::State::Maximized);
+            if maximized {
+                state.states.set(xdg_toplevel::State::Maximized);
+            } else {
+                state.states.unset(xdg_toplevel::State::Maximized);
+            }
+            was_maximized != maximized
+        });
+
+        if changed {
+            self.pending_xdg_state_configure_window_ids
+                .insert(window_id.to_string());
+            // Only update the xdg state here. ManagedWindow remains the geometry source of truth;
+            // when the TS listener changes <ManagedWindow rect>, apply_managed_window_rects sends
+            // the configure containing both the TS-selected size and this Maximized state. Sending
+            // an immediate state-only configure would let clients observe "maximized at old size",
+            // which can make Chromium/Electron stretch an old buffer for one configure cycle.
+            if !self.runtime_poll_dirty {
+                self.pending_xdg_state_configure_window_ids
+                    .remove(window_id);
+                toplevel.send_pending_configure();
+            }
+            self.schedule_redraw();
+        }
+    }
+
+    pub(crate) fn request_window_minimize(
+        &mut self,
+        window: &smithay::desktop::Window,
+        minimized: bool,
+        source: crate::ssd::WindowStateRequestSourceSnapshot,
+    ) -> bool {
+        let snapshot = self.snapshot_window(window);
+        let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
+        let event = crate::ssd::WindowMinimizeRequestEventSnapshot {
+            minimized,
+            source,
+            timestamp: now_ms,
+        };
+        tracing::info!(
+            window_id = %snapshot.id,
+            title = %snapshot.title,
+            app_id = ?snapshot.app_id,
+            minimized,
+            source = ?source,
+            "runtime window minimize request dispatch"
+        );
+        let invoked = self.invoke_window_minimize_request_event(&snapshot, &event, now_ms);
+        tracing::info!(
+            window_id = %snapshot.id,
+            invoked,
+            "runtime window minimize request result"
+        );
+        invoked
+    }
+
+    pub(crate) fn request_window_activate(
+        &mut self,
+        window: &smithay::desktop::Window,
+        source: crate::ssd::WindowActivateRequestSourceSnapshot,
+    ) -> bool {
+        let snapshot = self.snapshot_window(window);
+        let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
+        let event = crate::ssd::WindowActivateRequestEventSnapshot {
+            source,
+            timestamp: now_ms,
+        };
+        tracing::info!(
+            window_id = %snapshot.id,
+            title = %snapshot.title,
+            app_id = ?snapshot.app_id,
+            source = ?source,
+            "runtime window activate request dispatch"
+        );
+        let invoked = self.invoke_window_activate_request_event(&snapshot, &event, now_ms);
+        tracing::info!(
+            window_id = %snapshot.id,
+            invoked,
+            "runtime window activate request result"
+        );
+        invoked
+    }
+
     fn surface_has_popup_ancestor(
         &self,
         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -1417,7 +1549,7 @@ impl ShojiWM {
         }
     }
 
-    fn focus_window(&mut self, window: &smithay::desktop::Window, serial: Serial) {
+    pub(crate) fn focus_window(&mut self, window: &smithay::desktop::Window, serial: Serial) {
         let started_at = Instant::now();
         let window_id = window
             .toplevel()

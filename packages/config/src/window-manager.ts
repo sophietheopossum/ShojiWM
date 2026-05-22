@@ -1,8 +1,17 @@
-import { animationVariable, createWindowStack, createWindowState, cubicBezier, read, seconds, WINDOW_MANAGER, type PointerMoveEvent, type ReadonlySignal, type WaylandWindow, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect } from "shoji_wm";
+import { animationVariable, createWindowStack, createWindowState, cubicBezier, read, seconds, WINDOW_MANAGER, type PointerMoveEvent, type ReadonlySignal, type WaylandWindow, type WindowActivateRequestEvent, type WindowMaximizeRequestEvent, type WindowMinimizeRequestEvent, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect } from "shoji_wm";
 import type { ManagedWindowRect, WindowSizeConstraints } from "shoji_wm/types";
 
 export const WINDOW_STATE_RECT = createWindowState<ManagedWindowRect>("rect", {
     default: (window) => window.rect,
+});
+export const WINDOW_STATE_RESTORE_RECT = createWindowState<ManagedWindowRect | null>("restoreRect", {
+    default: null,
+});
+export const WINDOW_STATE_MINIMIZED = createWindowState<boolean>("minimized", {
+    default: false,
+});
+export const WINDOW_STATE_MAXIMIZED = createWindowState<boolean>("maximized", {
+    default: false,
 });
 
 const OPEN_CLOSE_ANIMATION_DURATION = seconds(1.0);
@@ -75,6 +84,36 @@ export class HybridWindowManager {
         event.window.state[WINDOW_STATE_RECT].set(event.currentRect);
     }
 
+    public onWindowMaximizeRequest(event: WindowMaximizeRequestEvent) {
+        const window = event.window;
+        window.state[WINDOW_STATE_MINIMIZED].set(false);
+
+        if (!event.maximized) {
+            const restoreRect = window.state[WINDOW_STATE_RESTORE_RECT]();
+            if (restoreRect) {
+                window.state[WINDOW_STATE_RECT].set(restoreRect);
+            }
+            window.state[WINDOW_STATE_RESTORE_RECT].set(null);
+            window.state[WINDOW_STATE_MAXIMIZED].set(false);
+            return;
+        }
+
+        if (!window.state[WINDOW_STATE_MAXIMIZED]()) {
+            window.state[WINDOW_STATE_RESTORE_RECT].set(window.state[WINDOW_STATE_RECT]());
+        }
+        window.state[WINDOW_STATE_RECT].set(this.maximizedRectForWindow(window));
+        window.state[WINDOW_STATE_MAXIMIZED].set(true);
+    }
+
+    public onWindowMinimizeRequest(event: WindowMinimizeRequestEvent) {
+        event.window.state[WINDOW_STATE_MINIMIZED].set(event.minimized);
+    }
+
+    public onWindowActivateRequest(event: WindowActivateRequestEvent) {
+        event.window.state[WINDOW_STATE_MINIMIZED].set(false);
+        event.window.focus();
+    }
+
     public getCurrentWorkspace(): Workspace | undefined {
         this.syncWorkspaces();
         var currentWorkspace = undefined;
@@ -132,6 +171,53 @@ export class HybridWindowManager {
             width: Math.max(0, read(natural.width) - window.position.width),
             height: Math.max(0, read(natural.height) - window.position.height),
         };
+    }
+
+    private maximizedRectForWindow(window: WaylandWindow): ManagedWindowRect {
+        const rect = window.state[WINDOW_STATE_RECT]();
+        const centerX = read(rect.x) + read(rect.width) / 2;
+        const centerY = read(rect.y) + read(rect.height) / 2;
+        const outputName = this.outputNameAt(centerX, centerY) ?? this.currentMonitor;
+        const output = outputName ? WINDOW_MANAGER.output.current[outputName] : undefined;
+        const usable = outputName ? WINDOW_MANAGER.layer.usableArea(outputName) : undefined;
+
+        if (usable) {
+            return {
+                x: usable.x,
+                y: usable.y,
+                width: usable.width,
+                height: usable.height,
+            };
+        }
+        if (output?.resolution) {
+            return {
+                x: output.position.x,
+                y: output.position.y,
+                width: output.resolution.width / output.scale,
+                height: output.resolution.height / output.scale,
+            };
+        }
+        return rect;
+    }
+
+    private outputNameAt(x: number, y: number): string | undefined {
+        for (const name of WINDOW_MANAGER.output.list) {
+            const output = WINDOW_MANAGER.output.current[name];
+            if (!output?.resolution) {
+                continue;
+            }
+            const width = output.resolution.width / output.scale;
+            const height = output.resolution.height / output.scale;
+            if (
+                x >= output.position.x &&
+                y >= output.position.y &&
+                x < output.position.x + width &&
+                y < output.position.y + height
+            ) {
+                return name;
+            }
+        }
+        return undefined;
     }
 }
 

@@ -360,29 +360,36 @@ impl CompositorHandler for ShojiWM {
                 );
             }
             self.window_commit_times.insert(window.clone(), commit_time);
-            self.snapshot_dirty_window_ids.insert(snapshot.id.clone());
-            self.window_source_damage
-                .extend(
-                    source_damage
-                        .into_iter()
-                        .map(|rect| crate::state::OwnedDamageRect {
-                            owner: snapshot.id.clone(),
-                            rect,
-                        }),
+            if self.window_allows_render(&window) {
+                self.snapshot_dirty_window_ids.insert(snapshot.id.clone());
+                self.window_source_damage
+                    .extend(
+                        source_damage
+                            .into_iter()
+                            .map(|rect| crate::state::OwnedDamageRect {
+                                owner: snapshot.id.clone(),
+                                rect,
+                            }),
+                    );
+                if let Some(decoration) = self.window_decorations.get(&window) {
+                    self.pending_decoration_damage
+                        .push(decoration.layout.root.rect);
+                }
+                if let Some(top) = window.toplevel() {
+                    debug!(surface = ?top.wl_surface().id(), "toplevel commit matched mapped window");
+                }
+                // This commit touched a rendered mapped toplevel / X11 window. Queue a redraw.
+                // Idle ManagedWindows still accept commits so their latest buffer is ready on
+                // restore, but they intentionally don't wake rendering or source-damage effects.
+                self.schedule_redraw();
+            } else if frame_liveness_debug_enabled() {
+                info!(
+                    window_id = %snapshot.id,
+                    title = %snapshot.title,
+                    app_id = ?snapshot.app_id,
+                    "frame liveness: idle window commit ignored for redraw",
                 );
-            if let Some(decoration) = self.window_decorations.get(&window) {
-                self.pending_decoration_damage
-                    .push(decoration.layout.root.rect);
             }
-            if let Some(top) = window.toplevel() {
-                debug!(surface = ?top.wl_surface().id(), "toplevel commit matched mapped window");
-            }
-            // This commit touched a mapped toplevel / X11 window. Queue a redraw — this is the
-            // per-commit scheduling equivalent of niri's `queue_redraw(&output)`. Commits that
-            // do *not* correspond to a mapped rendered surface intentionally fall through
-            // without waking the renderer, which breaks the Firefox "non-presented root
-            // surface wakes the compositor" loop.
-            self.schedule_redraw();
         }
 
         // `xdg_shell::handle_commit` schedules its own redraw for popup commits (both the

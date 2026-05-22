@@ -334,6 +334,42 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         }
     }
 
+    fn window_maximize_request(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &super::WindowMaximizeRequestEventSnapshot,
+        now_ms: u64,
+    ) -> Result<super::DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        match self {
+            Self::Static(_) => Ok(super::DecorationWindowStateRequestInvocation::default()),
+            Self::Node(evaluator) => evaluator.window_maximize_request(snapshot, event, now_ms),
+        }
+    }
+
+    fn window_minimize_request(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &super::WindowMinimizeRequestEventSnapshot,
+        now_ms: u64,
+    ) -> Result<super::DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        match self {
+            Self::Static(_) => Ok(super::DecorationWindowStateRequestInvocation::default()),
+            Self::Node(evaluator) => evaluator.window_minimize_request(snapshot, event, now_ms),
+        }
+    }
+
+    fn window_activate_request(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &super::WindowActivateRequestEventSnapshot,
+        now_ms: u64,
+    ) -> Result<super::DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        match self {
+            Self::Static(_) => Ok(super::DecorationWindowStateRequestInvocation::default()),
+            Self::Node(evaluator) => evaluator.window_activate_request(snapshot, event, now_ms),
+        }
+    }
+
     fn pointer_move_async(&self, event: super::PointerMoveEventSnapshot, now_ms: u64) {
         if let Self::Node(evaluator) = self {
             evaluator.pointer_move_async(event, now_ms);
@@ -610,6 +646,113 @@ impl ShojiWM {
         self.runtime_scheduler_enabled = invocation.next_poll_in_ms.is_some();
         if invocation.next_poll_in_ms == Some(0) {
             self.request_tty_maintenance("runtime-window-move-animation");
+            self.schedule_redraw();
+        }
+
+        invocation.invoked
+    }
+
+    pub fn invoke_window_maximize_request_event(
+        &mut self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &super::WindowMaximizeRequestEventSnapshot,
+        now_ms: u64,
+    ) -> bool {
+        self.sync_runtime_display_state();
+        let invocation = match self
+            .decoration_evaluator
+            .window_maximize_request(snapshot, event, now_ms)
+        {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                warn!(
+                    window_id = %snapshot.id,
+                    ?error,
+                    "runtime window maximize request event failed"
+                );
+                return false;
+            }
+        };
+        self.handle_window_state_request_invocation("runtime-window-maximize-request", invocation)
+    }
+
+    pub fn invoke_window_minimize_request_event(
+        &mut self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &super::WindowMinimizeRequestEventSnapshot,
+        now_ms: u64,
+    ) -> bool {
+        self.sync_runtime_display_state();
+        let invocation = match self
+            .decoration_evaluator
+            .window_minimize_request(snapshot, event, now_ms)
+        {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                warn!(
+                    window_id = %snapshot.id,
+                    ?error,
+                    "runtime window minimize request event failed"
+                );
+                return false;
+            }
+        };
+        self.handle_window_state_request_invocation("runtime-window-minimize-request", invocation)
+    }
+
+    pub fn invoke_window_activate_request_event(
+        &mut self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &super::WindowActivateRequestEventSnapshot,
+        now_ms: u64,
+    ) -> bool {
+        self.sync_runtime_display_state();
+        let invocation = match self
+            .decoration_evaluator
+            .window_activate_request(snapshot, event, now_ms)
+        {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                warn!(
+                    window_id = %snapshot.id,
+                    ?error,
+                    "runtime window activate request event failed"
+                );
+                return false;
+            }
+        };
+        self.handle_window_state_request_invocation("runtime-window-activate-request", invocation)
+    }
+
+    fn handle_window_state_request_invocation(
+        &mut self,
+        reason: &'static str,
+        invocation: super::evaluator::DecorationWindowStateRequestInvocation,
+    ) -> bool {
+        self.consume_runtime_display_config(invocation.display_config);
+        self.consume_runtime_key_binding_config(invocation.key_binding_config);
+        self.consume_runtime_pointer_config(invocation.pointer_config);
+        self.consume_runtime_event_config(invocation.event_config);
+        self.consume_runtime_process_config(invocation.process_config);
+        if !invocation.process_actions.is_empty() {
+            self.apply_runtime_process_actions(invocation.process_actions);
+        }
+
+        if invocation.dirty {
+            self.runtime_poll_dirty = true;
+            self.runtime_dirty_window_ids
+                .extend(invocation.dirty_window_ids.into_iter());
+            self.request_tty_maintenance(reason);
+            self.schedule_redraw();
+        }
+        if !invocation.actions.is_empty() {
+            self.request_tty_maintenance(reason);
+            self.apply_runtime_window_actions(invocation.actions);
+            self.schedule_redraw();
+        }
+        self.runtime_scheduler_enabled = invocation.next_poll_in_ms.is_some();
+        if invocation.next_poll_in_ms == Some(0) {
+            self.request_tty_maintenance(reason);
             self.schedule_redraw();
         }
 
@@ -2134,6 +2277,8 @@ impl ShojiWM {
             live_window_ids.contains(window_id)
                 || self.closing_window_snapshots.contains_key(window_id)
         });
+        self.pending_xdg_state_configure_window_ids
+            .retain(|window_id| live_window_ids.contains(window_id));
         self.runtime_poll_dirty = !self.runtime_dirty_window_ids.is_empty();
         self.async_asset_dirty = false;
 
@@ -2217,6 +2362,8 @@ impl ShojiWM {
                 managed.managed.then_some((
                     window.clone(),
                     managed.force_rect_size,
+                    self.pending_xdg_state_configure_window_ids
+                        .contains(&decoration.snapshot.id),
                     desired_root_raw,
                     desired_root,
                     decoration.tree.clone(),
@@ -2231,6 +2378,7 @@ impl ShojiWM {
         for (
             window,
             force_rect_size,
+            needs_xdg_state_configure,
             desired_root_raw,
             desired_root,
             tree,
@@ -2256,7 +2404,7 @@ impl ShojiWM {
                     }
                 };
 
-            if desired_client == current_client {
+            if desired_client == current_client && !needs_xdg_state_configure {
                 continue;
             }
 
@@ -2305,25 +2453,33 @@ impl ShojiWM {
                 self.space.relocate_element(&window, next_location);
             }
 
-            if size_changed {
+            if size_changed || needs_xdg_state_configure {
                 if let Some(toplevel) = window.toplevel() {
                     toplevel.with_pending_state(|state| {
                         state.size =
                             Some(Size::from((desired_client.width, desired_client.height)));
                     });
                     toplevel.send_pending_configure();
+                    self.pending_xdg_state_configure_window_ids
+                        .remove(&window_id);
                 } else if let Some(x11) = window.x11_surface() {
-                    let placed = Rectangle::<i32, Logical>::new(
-                        Point::from((desired_client.x, desired_client.y)),
-                        Size::from((desired_client.width, desired_client.height)),
-                    );
-                    if let Err(error) = x11.configure(Some(placed)) {
-                        warn!(
-                            ?error,
-                            window_id, "failed to configure managed X11 window rect"
+                    if size_changed {
+                        let placed = Rectangle::<i32, Logical>::new(
+                            Point::from((desired_client.x, desired_client.y)),
+                            Size::from((desired_client.width, desired_client.height)),
                         );
+                        if let Err(error) = x11.configure(Some(placed)) {
+                            warn!(
+                                ?error,
+                                window_id, "failed to configure managed X11 window rect"
+                            );
+                        }
                     }
+                    self.pending_xdg_state_configure_window_ids
+                        .remove(&window_id);
                 }
+            }
+            if size_changed {
                 let raster_scale = self.decoration_raster_scale_for_rect(desired_root);
                 if force_rect_size
                     && let Some(decoration) = self.window_decorations.get_mut(&window)

@@ -279,15 +279,37 @@ impl XdgActivationHandler for ShojiWM {
             return false;
         };
 
-        let Some(keyboard) = self.seat.get_keyboard() else {
+        let Some(seat) = Seat::from_resource(&seat) else {
             return false;
         };
+        if seat != self.seat {
+            return false;
+        }
 
-        Seat::from_resource(&seat) == Some(self.seat.clone())
-            && keyboard
-                .last_enter()
-                .map(|last_enter| serial.is_no_older_than(&last_enter))
-                .unwrap_or(false)
+        let keyboard_valid = seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.last_enter())
+            .is_some_and(|last_enter| serial.is_no_older_than(&last_enter));
+        if keyboard_valid {
+            return true;
+        }
+
+        let pointer_valid = seat
+            .get_pointer()
+            .and_then(|pointer| pointer.last_enter())
+            .is_some_and(|last_enter| serial.is_no_older_than(&last_enter));
+        if pointer_valid {
+            return true;
+        }
+
+        // Discord and Telegram commonly create activation tokens with a stale
+        // serial when restoring from their tray menu. Treat tokens from our
+        // own seat as user-driven so minimized windows can be shown again.
+        tracing::debug!(
+            ?serial,
+            "accepting xdg activation token with stale serial from known seat"
+        );
+        true
     }
 
     fn request_activation(
@@ -311,6 +333,10 @@ impl XdgActivationHandler for ShojiWM {
             .cloned();
 
         if let Some(window) = window {
+            self.request_window_activate(
+                &window,
+                crate::ssd::WindowActivateRequestSourceSnapshot::XdgActivation,
+            );
             if !self
                 .window_decorations
                 .get(&window)

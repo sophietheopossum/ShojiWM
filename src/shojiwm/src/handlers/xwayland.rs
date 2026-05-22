@@ -192,9 +192,56 @@ impl XwmHandler for ShojiWM {
         }
     }
 
-    fn maximize_request(&mut self, _xwm: XwmId, _window: X11Surface) {}
+    fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(window) = self.find_x11_window(&window) else {
+            return;
+        };
+        self.request_window_maximize(
+            &window,
+            true,
+            crate::ssd::WindowStateRequestSourceSnapshot::Xwayland,
+        );
+    }
 
-    fn unmaximize_request(&mut self, _xwm: XwmId, _window: X11Surface) {}
+    fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(window) = self.find_x11_window(&window) else {
+            return;
+        };
+        self.request_window_maximize(
+            &window,
+            false,
+            crate::ssd::WindowStateRequestSourceSnapshot::Xwayland,
+        );
+    }
+
+    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(window) = self.find_x11_window(&window) else {
+            return;
+        };
+        self.request_window_minimize(
+            &window,
+            true,
+            crate::ssd::WindowStateRequestSourceSnapshot::Xwayland,
+        );
+    }
+
+    fn active_window_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        _timestamp: u32,
+        _currently_active_window: Option<X11Surface>,
+    ) {
+        let Some(window) = self.find_x11_window(&window) else {
+            return;
+        };
+        self.request_window_activate(
+            &window,
+            crate::ssd::WindowActivateRequestSourceSnapshot::Xwayland,
+        );
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        self.focus_window(&window, serial);
+    }
 
     fn fullscreen_request(&mut self, _xwm: XwmId, _window: X11Surface) {}
 

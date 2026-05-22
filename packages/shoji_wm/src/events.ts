@@ -81,6 +81,41 @@ export type WindowMoveListener = (event: WindowMoveEvent) => void;
 
 export type RuntimeWindowMoveEvent = Omit<WindowMoveEvent, "window">;
 
+export type WindowStateRequestSource = "api" | "client-csd" | "xwayland" | "keybind";
+export type WindowActivateRequestSource = "api" | "xdg-activation" | "xwayland" | "keybind";
+
+export interface WindowMaximizeRequestEvent {
+  window: WaylandWindow;
+  maximized: boolean;
+  source: WindowStateRequestSource;
+  timestamp: number;
+}
+
+export type WindowMaximizeRequestListener = (event: WindowMaximizeRequestEvent) => void;
+
+export type RuntimeWindowMaximizeRequestEvent = Omit<WindowMaximizeRequestEvent, "window">;
+
+export interface WindowMinimizeRequestEvent {
+  window: WaylandWindow;
+  minimized: boolean;
+  source: WindowStateRequestSource;
+  timestamp: number;
+}
+
+export type WindowMinimizeRequestListener = (event: WindowMinimizeRequestEvent) => void;
+
+export type RuntimeWindowMinimizeRequestEvent = Omit<WindowMinimizeRequestEvent, "window">;
+
+export interface WindowActivateRequestEvent {
+  window: WaylandWindow;
+  source: WindowActivateRequestSource;
+  timestamp: number;
+}
+
+export type WindowActivateRequestListener = (event: WindowActivateRequestEvent) => void;
+
+export type RuntimeWindowActivateRequestEvent = Omit<WindowActivateRequestEvent, "window">;
+
 export interface PointerMovePoint {
   x: number;
   y: number;
@@ -117,6 +152,9 @@ export interface WindowManagerEventController {
   onStartClose(listener: WindowStartCloseListener): () => void;
   onWindowResize(listener: WindowResizeListener): () => void;
   onWindowMove(listener: WindowMoveListener): () => void;
+  onWindowMaximizeRequest(listener: WindowMaximizeRequestListener): () => void;
+  onWindowMinimizeRequest(listener: WindowMinimizeRequestListener): () => void;
+  onWindowActivateRequest(listener: WindowActivateRequestListener): () => void;
   onPointerMoveAsync(listener: PointerMoveAsyncListener): () => void;
   onCreateLayer(listener: LayerCreateListener): () => void;
   onDestroyLayer(listener: LayerDestroyListener): () => void;
@@ -128,6 +166,9 @@ export interface WindowManagerEventController {
   emitStartClose(window: WaylandWindow): void;
   emitWindowResize(window: WaylandWindow, event: RuntimeWindowResizeEvent): boolean;
   emitWindowMove(window: WaylandWindow, event: RuntimeWindowMoveEvent): boolean;
+  emitWindowMaximizeRequest(window: WaylandWindow, event: RuntimeWindowMaximizeRequestEvent): boolean;
+  emitWindowMinimizeRequest(window: WaylandWindow, event: RuntimeWindowMinimizeRequestEvent): boolean;
+  emitWindowActivateRequest(window: WaylandWindow, event: RuntimeWindowActivateRequestEvent): boolean;
   emitPointerMoveAsync(event: PointerMoveEvent): Promise<boolean>;
   emitCreateLayer(layer: WaylandLayer): void;
   emitDestroyLayer(layer: WaylandLayer): void;
@@ -143,6 +184,9 @@ export function createWindowManagerEventController(): WindowManagerEventControll
   const startCloseListeners = new Set<WindowStartCloseListener>();
   const resizeListeners = new Set<WindowResizeListener>();
   const moveListeners = new Set<WindowMoveListener>();
+  const maximizeRequestListeners = new Set<WindowMaximizeRequestListener>();
+  const minimizeRequestListeners = new Set<WindowMinimizeRequestListener>();
+  const activateRequestListeners = new Set<WindowActivateRequestListener>();
   const pointerMoveAsyncListeners = new Set<PointerMoveAsyncListener>();
   const createLayerListeners = new Set<LayerCreateListener>();
   const destroyLayerListeners = new Set<LayerDestroyListener>();
@@ -184,6 +228,18 @@ export function createWindowManagerEventController(): WindowManagerEventControll
     onWindowMove(listener) {
       moveListeners.add(listener);
       return () => moveListeners.delete(listener);
+    },
+    onWindowMaximizeRequest(listener) {
+      maximizeRequestListeners.add(listener);
+      return () => maximizeRequestListeners.delete(listener);
+    },
+    onWindowMinimizeRequest(listener) {
+      minimizeRequestListeners.add(listener);
+      return () => minimizeRequestListeners.delete(listener);
+    },
+    onWindowActivateRequest(listener) {
+      activateRequestListeners.add(listener);
+      return () => activateRequestListeners.delete(listener);
     },
     onPointerMoveAsync(listener) {
       pointerMoveAsyncListeners.add(listener);
@@ -245,6 +301,33 @@ export function createWindowManagerEventController(): WindowManagerEventControll
         return false;
       }
       for (const listener of moveListeners) {
+        listener({ ...event, window });
+      }
+      return true;
+    },
+    emitWindowMaximizeRequest(window, event) {
+      if (maximizeRequestListeners.size === 0) {
+        return false;
+      }
+      for (const listener of maximizeRequestListeners) {
+        listener({ ...event, window });
+      }
+      return true;
+    },
+    emitWindowMinimizeRequest(window, event) {
+      if (minimizeRequestListeners.size === 0) {
+        return false;
+      }
+      for (const listener of minimizeRequestListeners) {
+        listener({ ...event, window });
+      }
+      return true;
+    },
+    emitWindowActivateRequest(window, event) {
+      if (activateRequestListeners.size === 0) {
+        return false;
+      }
+      for (const listener of activateRequestListeners) {
         listener({ ...event, window });
       }
       return true;

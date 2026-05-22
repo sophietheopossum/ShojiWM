@@ -38,7 +38,6 @@ use crate::{
     activation_environment::publish_activation_environment,
     backend::tty::{device_added, render_if_needed},
     config::tty_output_names_match,
-    spawn_client,
     state::ShojiWM,
 };
 
@@ -74,8 +73,6 @@ fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
     state.warmup_decoration_runtime();
     state.start_xwayland(&event_loop);
-
-    spawn_client();
 
     event_loop.run(None, &mut state, |_| {})?;
     Ok(())
@@ -200,8 +197,6 @@ pub fn run_tty_udev() -> Result<(), Box<dyn std::error::Error>> {
     state.warmup_decoration_runtime();
     std::process::Command::new("weston-terminal").spawn().ok();
     info!("spawned weston-terminal");
-
-    spawn_client();
 
     let maintenance_debug = tty_maintenance_debug_enabled();
     let mut last_idle_maintenance_at = Instant::now();

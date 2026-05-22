@@ -27,9 +27,10 @@ pub use evaluator::{
     DecorationEvaluationError, DecorationEvaluationResult, DecorationEvaluator,
     DecorationHandlerInvocation, DecorationKeyBindingInvocation,
     DecorationPointerMoveAsyncInvocation, DecorationSchedulerTick, DecorationWindowMoveInvocation,
-    DecorationWindowResizeInvocation, LayerEffectEvaluationResult, NodeDecorationEvaluator,
-    RuntimeEventConfigUpdate, RuntimeLayerEffectAssignment, RuntimeWindowAction,
-    StaticDecorationEvaluator, evaluate_dynamic_decoration,
+    DecorationWindowResizeInvocation, DecorationWindowStateRequestInvocation,
+    LayerEffectEvaluationResult, NodeDecorationEvaluator, RuntimeEventConfigUpdate,
+    RuntimeLayerEffectAssignment, RuntimeWindowAction, StaticDecorationEvaluator,
+    evaluate_dynamic_decoration,
 };
 pub use integration::{
     CachedDecorationBuffer, ContentClip, DecorationRuntimeEvaluator, WindowDecorationState,
@@ -39,10 +40,13 @@ pub use window_model::{
     LayerKindSnapshot, LayerPositionSnapshot, ManagedWindowState, OutputModeSnapshot,
     OutputPositionSnapshot, PointerModifierStateSnapshot, PointerMoveEventSnapshot,
     PointerMovePointSnapshot, TransformOrigin, WaylandLayerSnapshot, WaylandOutputSnapshot,
-    WaylandWindowAction, WaylandWindowSnapshot, WindowIconSnapshot, WindowMoveEventSnapshot,
-    WindowMovePhaseSnapshot, WindowMoveSourceSnapshot, WindowPositionSnapshot,
-    WindowResizeEdgesSnapshot, WindowResizeEventSnapshot, WindowResizePhaseSnapshot,
-    WindowResizePointSnapshot, WindowResizeSourceSnapshot, WindowTransform, layer_runtime_id,
+    WaylandWindowAction, WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
+    WindowActivateRequestSourceSnapshot, WindowIconSnapshot, WindowMaximizeRequestEventSnapshot,
+    WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowMovePhaseSnapshot,
+    WindowMoveSourceSnapshot, WindowPositionSnapshot, WindowResizeEdgesSnapshot,
+    WindowResizeEventSnapshot, WindowResizePhaseSnapshot, WindowResizePointSnapshot,
+    WindowResizeSourceSnapshot, WindowStateRequestSourceSnapshot, WindowTransform,
+    layer_runtime_id,
 };
 
 /// Top-level decoration tree.

@@ -177,6 +177,47 @@ pub struct WindowMoveEventSnapshot {
     pub timestamp: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowStateRequestSourceSnapshot {
+    Api,
+    ClientCsd,
+    Xwayland,
+    Keybind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowActivateRequestSourceSnapshot {
+    Api,
+    XdgActivation,
+    Xwayland,
+    Keybind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowMaximizeRequestEventSnapshot {
+    pub maximized: bool,
+    pub source: WindowStateRequestSourceSnapshot,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowMinimizeRequestEventSnapshot {
+    pub minimized: bool,
+    pub source: WindowStateRequestSourceSnapshot,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowActivateRequestEventSnapshot {
+    pub source: WindowActivateRequestSourceSnapshot,
+    pub timestamp: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedWindowRectSnapshot {

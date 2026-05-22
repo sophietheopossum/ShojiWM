@@ -230,6 +230,7 @@ pub struct ShojiWM {
     pub window_decorations: HashMap<Window, WindowDecorationState>,
     pub window_primary_output_names: HashMap<Window, String>,
     pub windows_ready_for_decoration: HashSet<String>,
+    pub pending_xdg_state_configure_window_ids: HashSet<String>,
     pub live_window_snapshots: HashMap<String, LiveWindowSnapshot>,
     pub complete_window_snapshots: HashMap<String, LiveWindowSnapshot>,
     pub complete_window_snapshot_trackers:
@@ -703,6 +704,7 @@ impl ShojiWM {
             window_decorations: HashMap::new(),
             window_primary_output_names: HashMap::new(),
             windows_ready_for_decoration: HashSet::new(),
+            pending_xdg_state_configure_window_ids: HashSet::new(),
             live_window_snapshots: HashMap::new(),
             complete_window_snapshots: HashMap::new(),
             complete_window_snapshot_trackers: HashMap::new(),
@@ -2503,6 +2505,10 @@ impl ShojiWM {
     }
 
     pub fn logical_damage_rect_for_window(&self, window: &Window) -> Option<LogicalRect> {
+        if !self.window_allows_render(window) {
+            return None;
+        }
+
         if let Some(decoration) = self.window_decorations.get(window) {
             return Some(transformed_root_rect(
                 decoration.layout.root.rect,
@@ -2518,6 +2524,12 @@ impl ShojiWM {
             bbox.size.w,
             bbox.size.h,
         ))
+    }
+
+    pub fn window_allows_render(&self, window: &Window) -> bool {
+        self.window_decorations
+            .get(window)
+            .is_none_or(|decoration| decoration.managed_window_allows_render())
     }
 
     pub fn logical_source_damage_rects_for_surface(

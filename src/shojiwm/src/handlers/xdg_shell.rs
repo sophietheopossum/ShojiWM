@@ -306,6 +306,105 @@ impl XdgShellHandler for ShojiWM {
         }
     }
 
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        info!(
+            surface = ?wl_surface.id(),
+            "xdg toplevel maximize request received"
+        );
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface))
+            .cloned()
+        else {
+            warn!(
+                surface = ?wl_surface.id(),
+                "xdg toplevel maximize request did not match a mapped window"
+            );
+            return;
+        };
+        let snapshot = self.snapshot_window(&window);
+        info!(
+            window_id = %snapshot.id,
+            title = %snapshot.title,
+            app_id = ?snapshot.app_id,
+            "xdg toplevel maximize request matched window"
+        );
+
+        self.request_window_maximize(
+            &window,
+            true,
+            crate::ssd::WindowStateRequestSourceSnapshot::ClientCsd,
+        );
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        info!(
+            surface = ?wl_surface.id(),
+            "xdg toplevel unmaximize request received"
+        );
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface))
+            .cloned()
+        else {
+            warn!(
+                surface = ?wl_surface.id(),
+                "xdg toplevel unmaximize request did not match a mapped window"
+            );
+            return;
+        };
+        let snapshot = self.snapshot_window(&window);
+        info!(
+            window_id = %snapshot.id,
+            title = %snapshot.title,
+            app_id = ?snapshot.app_id,
+            "xdg toplevel unmaximize request matched window"
+        );
+
+        self.request_window_maximize(
+            &window,
+            false,
+            crate::ssd::WindowStateRequestSourceSnapshot::ClientCsd,
+        );
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        info!(
+            surface = ?wl_surface.id(),
+            "xdg toplevel minimize request received"
+        );
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface))
+            .cloned()
+        else {
+            warn!(
+                surface = ?wl_surface.id(),
+                "xdg toplevel minimize request did not match a mapped window"
+            );
+            return;
+        };
+        let snapshot = self.snapshot_window(&window);
+        info!(
+            window_id = %snapshot.id,
+            title = %snapshot.title,
+            app_id = ?snapshot.app_id,
+            "xdg toplevel minimize request matched window"
+        );
+
+        self.request_window_minimize(
+            &window,
+            true,
+            crate::ssd::WindowStateRequestSourceSnapshot::ClientCsd,
+        );
+    }
+
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
         let seat = Seat::from_resource(&seat).unwrap();
         let popup = PopupKind::Xdg(surface);

@@ -264,7 +264,3 @@ fn startup_timestamp_millis() -> u128 {
         .unwrap_or_default()
         .as_millis()
 }
-
-fn spawn_client() {
-    std::process::Command::new("kitty").spawn().ok();
-}

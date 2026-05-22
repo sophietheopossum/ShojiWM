@@ -14,7 +14,9 @@ use tracing::{debug, error, info, warn};
 
 use super::window_model::{
     ManagedWindowState, PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandOutputSnapshot,
-    WaylandWindowAction, WaylandWindowSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
+    WaylandWindowAction, WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
+    WindowMaximizeRequestEventSnapshot, WindowMinimizeRequestEventSnapshot,
+    WindowMoveEventSnapshot, WindowResizeEventSnapshot,
 };
 use super::{
     BackgroundEffectConfig, DecorationBridgeError, DecorationLayoutError, DecorationNode,
@@ -118,6 +120,33 @@ pub trait DecorationEvaluator {
         Ok(DecorationWindowMoveInvocation::default())
     }
 
+    fn window_maximize_request(
+        &self,
+        _snapshot: &WaylandWindowSnapshot,
+        _event: &WindowMaximizeRequestEventSnapshot,
+        _now_ms: u64,
+    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        Ok(DecorationWindowStateRequestInvocation::default())
+    }
+
+    fn window_minimize_request(
+        &self,
+        _snapshot: &WaylandWindowSnapshot,
+        _event: &WindowMinimizeRequestEventSnapshot,
+        _now_ms: u64,
+    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        Ok(DecorationWindowStateRequestInvocation::default())
+    }
+
+    fn window_activate_request(
+        &self,
+        _snapshot: &WaylandWindowSnapshot,
+        _event: &WindowActivateRequestEventSnapshot,
+        _now_ms: u64,
+    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        Ok(DecorationWindowStateRequestInvocation::default())
+    }
+
     fn pointer_move_async(&self, _event: PointerMoveEventSnapshot, _now_ms: u64) {}
 
     fn evaluate_layer_effects(
@@ -217,6 +246,23 @@ pub struct DecorationWindowResizeInvocation {
 
 #[derive(Debug, Clone, Default)]
 pub struct DecorationWindowMoveInvocation {
+    pub invoked: bool,
+    pub dirty: bool,
+    pub dirty_window_ids: Vec<String>,
+    pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
+    pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
+    pub actions: Vec<RuntimeWindowAction>,
+    pub next_poll_in_ms: Option<u64>,
+    pub display_config: Option<RuntimeDisplayConfigUpdate>,
+    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
+    pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
+    pub process_config: Option<RuntimeProcessConfigUpdate>,
+    pub process_actions: Vec<RuntimeProcessAction>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DecorationWindowStateRequestInvocation {
     pub invoked: bool,
     pub dirty: bool,
     pub dirty_window_ids: Vec<String>,
@@ -537,6 +583,42 @@ enum RuntimeRequest<'a> {
         #[serde(rename = "windowId")]
         window_id: &'a str,
         event: &'a WindowMoveEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState")]
+        display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+    },
+    WindowMaximizeRequest {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        #[serde(rename = "windowId")]
+        window_id: &'a str,
+        snapshot: &'a WaylandWindowSnapshot,
+        event: &'a WindowMaximizeRequestEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState")]
+        display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+    },
+    WindowMinimizeRequest {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        #[serde(rename = "windowId")]
+        window_id: &'a str,
+        snapshot: &'a WaylandWindowSnapshot,
+        event: &'a WindowMinimizeRequestEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState")]
+        display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+    },
+    WindowActivateRequest {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        #[serde(rename = "windowId")]
+        window_id: &'a str,
+        snapshot: &'a WaylandWindowSnapshot,
+        event: &'a WindowActivateRequestEventSnapshot,
         #[serde(rename = "nowMs")]
         now_ms: u64,
         #[serde(rename = "displayState")]
@@ -890,6 +972,8 @@ struct RuntimeWindowMoveResponse {
     process_actions: Option<Vec<RuntimeProcessAction>>,
     error: Option<String>,
 }
+
+type RuntimeWindowStateRequestResponse = RuntimeWindowMoveResponse;
 
 #[derive(serde::Deserialize)]
 struct RuntimePointerMoveAsyncResponse {
@@ -2307,6 +2391,267 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         }
 
         Ok(DecorationWindowMoveInvocation {
+            invoked: response.invoked.unwrap_or(false),
+            dirty: response.dirty.unwrap_or(false),
+            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
+            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
+            actions: response.actions.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
+            display_config: response.display_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+        })
+    }
+
+    fn window_maximize_request(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &WindowMaximizeRequestEventSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        let mut runtime_guard = self.runtime.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+        })?;
+
+        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        let request_id = runtime.next_request_id;
+        runtime.next_request_id += 1;
+        let display_state = self
+            .display_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        let request = serde_json::to_string(&RuntimeRequest::WindowMaximizeRequest {
+            request_id,
+            window_id: &snapshot.id,
+            snapshot,
+            event,
+            now_ms,
+            display_state: &display_state,
+        })
+        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
+        runtime.write_request(&request)?;
+
+        let response: RuntimeWindowStateRequestResponse =
+            if let Some(response) = runtime.read_response()? {
+                response
+            } else {
+                let status = runtime
+                    .child
+                    .try_wait()?
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let stderr = runtime
+                    .stderr_log
+                    .lock()
+                    .map(|stderr| stderr.clone())
+                    .unwrap_or_default();
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            };
+        if response.request_id != request_id {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response id: expected {request_id}, got {}",
+                response.request_id
+            )));
+        }
+        if response.kind != "windowMaximizeRequest" {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response kind for windowMaximizeRequest: {}",
+                response.kind
+            )));
+        }
+        if !response.ok {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                response
+                    .error
+                    .unwrap_or_else(|| "runtime returned failure".into()),
+            ));
+        }
+
+        Ok(DecorationWindowStateRequestInvocation {
+            invoked: response.invoked.unwrap_or(false),
+            dirty: response.dirty.unwrap_or(false),
+            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
+            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
+            actions: response.actions.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
+            display_config: response.display_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+        })
+    }
+
+    fn window_minimize_request(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &WindowMinimizeRequestEventSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        let mut runtime_guard = self.runtime.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+        })?;
+
+        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        let request_id = runtime.next_request_id;
+        runtime.next_request_id += 1;
+        let display_state = self
+            .display_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        let request = serde_json::to_string(&RuntimeRequest::WindowMinimizeRequest {
+            request_id,
+            window_id: &snapshot.id,
+            snapshot,
+            event,
+            now_ms,
+            display_state: &display_state,
+        })
+        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
+        runtime.write_request(&request)?;
+
+        let response: RuntimeWindowStateRequestResponse =
+            if let Some(response) = runtime.read_response()? {
+                response
+            } else {
+                let status = runtime
+                    .child
+                    .try_wait()?
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let stderr = runtime
+                    .stderr_log
+                    .lock()
+                    .map(|stderr| stderr.clone())
+                    .unwrap_or_default();
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            };
+        if response.request_id != request_id {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response id: expected {request_id}, got {}",
+                response.request_id
+            )));
+        }
+        if response.kind != "windowMinimizeRequest" {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response kind for windowMinimizeRequest: {}",
+                response.kind
+            )));
+        }
+        if !response.ok {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                response
+                    .error
+                    .unwrap_or_else(|| "runtime returned failure".into()),
+            ));
+        }
+
+        Ok(DecorationWindowStateRequestInvocation {
+            invoked: response.invoked.unwrap_or(false),
+            dirty: response.dirty.unwrap_or(false),
+            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
+            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
+            actions: response.actions.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
+            display_config: response.display_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+        })
+    }
+
+    fn window_activate_request(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &WindowActivateRequestEventSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        let mut runtime_guard = self.runtime.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+        })?;
+
+        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        let request_id = runtime.next_request_id;
+        runtime.next_request_id += 1;
+        let display_state = self
+            .display_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        let request = serde_json::to_string(&RuntimeRequest::WindowActivateRequest {
+            request_id,
+            window_id: &snapshot.id,
+            snapshot,
+            event,
+            now_ms,
+            display_state: &display_state,
+        })
+        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
+        runtime.write_request(&request)?;
+
+        let response: RuntimeWindowStateRequestResponse =
+            if let Some(response) = runtime.read_response()? {
+                response
+            } else {
+                let status = runtime
+                    .child
+                    .try_wait()?
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let stderr = runtime
+                    .stderr_log
+                    .lock()
+                    .map(|stderr| stderr.clone())
+                    .unwrap_or_default();
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            };
+        if response.request_id != request_id {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response id: expected {request_id}, got {}",
+                response.request_id
+            )));
+        }
+        if response.kind != "windowActivateRequest" {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response kind for windowActivateRequest: {}",
+                response.kind
+            )));
+        }
+        if !response.ok {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                response
+                    .error
+                    .unwrap_or_else(|| "runtime returned failure".into()),
+            ));
+        }
+
+        Ok(DecorationWindowStateRequestInvocation {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
