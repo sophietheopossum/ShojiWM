@@ -182,8 +182,10 @@ impl ShojiWM {
                                 }
                                 if invocation.dirty {
                                     self.runtime_poll_dirty = true;
-                                    self.runtime_dirty_window_ids
-                                        .extend(invocation.dirty_window_ids.into_iter());
+                                    self.mark_runtime_dirty_windows(
+                                        invocation.dirty_window_ids,
+                                        invocation.dirty_managed_window_ids,
+                                    );
                                     self.request_tty_maintenance("runtime-key-binding-dirty");
                                     self.schedule_redraw();
                                 }
@@ -621,8 +623,10 @@ impl ShojiWM {
                                     self.apply_runtime_handler_invocation(&window, &invocation);
 
                                     if invocation.invoked {
-                                        self.runtime_dirty_window_ids
-                                            .extend(invocation.dirty_window_ids.into_iter());
+                                        self.mark_runtime_dirty_windows(
+                                            invocation.dirty_window_ids,
+                                            invocation.dirty_managed_window_ids,
+                                        );
                                         self.runtime_scheduler_enabled =
                                             invocation.next_poll_in_ms.is_some();
                                         self.apply_runtime_window_actions(invocation.actions);
@@ -1555,8 +1559,10 @@ impl ShojiWM {
 
         let invoked = invocation.invoked;
         if invoked {
-            self.runtime_dirty_window_ids
-                .extend(invocation.dirty_window_ids.into_iter());
+            self.mark_runtime_dirty_windows(
+                invocation.dirty_window_ids,
+                invocation.dirty_managed_window_ids,
+            );
             self.runtime_scheduler_enabled = invocation.next_poll_in_ms.is_some();
             self.apply_runtime_window_actions(invocation.actions);
             self.schedule_redraw();

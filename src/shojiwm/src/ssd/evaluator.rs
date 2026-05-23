@@ -60,7 +60,7 @@ pub trait DecorationEvaluator {
         &self,
         _window_id: &str,
         _now_ms: u64,
-    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
+    ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
         Err(DecorationEvaluationError::RuntimeProtocol(
             "cached window evaluation unsupported".into(),
         ))
@@ -175,10 +175,48 @@ pub struct DecorationEvaluationResult {
     pub process_actions: Vec<RuntimeProcessAction>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DecorationCachedEvaluationResult {
+    pub node: Option<DecorationNode>,
+    pub transform: WindowTransform,
+    pub managed_window: ManagedWindowState,
+    pub window_effects: Option<WindowEffectConfig>,
+    pub dirty_node_ids: Vec<String>,
+    pub managed_window_only: bool,
+    pub next_poll_in_ms: Option<u64>,
+    pub display_config: Option<RuntimeDisplayConfigUpdate>,
+    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
+    pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
+    pub process_config: Option<RuntimeProcessConfigUpdate>,
+    pub process_actions: Vec<RuntimeProcessAction>,
+}
+
+impl From<DecorationEvaluationResult> for DecorationCachedEvaluationResult {
+    fn from(result: DecorationEvaluationResult) -> Self {
+        Self {
+            node: Some(result.node),
+            transform: result.transform,
+            managed_window: result.managed_window,
+            window_effects: result.window_effects,
+            dirty_node_ids: result.dirty_node_ids,
+            managed_window_only: false,
+            next_poll_in_ms: result.next_poll_in_ms,
+            display_config: result.display_config,
+            key_binding_config: result.key_binding_config,
+            pointer_config: result.pointer_config,
+            event_config: result.event_config,
+            process_config: result.process_config,
+            process_actions: result.process_actions,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DecorationSchedulerTick {
     pub dirty: bool,
     pub dirty_window_ids: Vec<String>,
+    pub dirty_managed_window_ids: Vec<String>,
     pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub actions: Vec<RuntimeWindowAction>,
@@ -199,6 +237,7 @@ pub struct DecorationHandlerInvocation {
     pub managed_window: Option<ManagedWindowState>,
     pub window_effects: Option<WindowEffectConfig>,
     pub dirty_window_ids: Vec<String>,
+    pub dirty_managed_window_ids: Vec<String>,
     pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub actions: Vec<RuntimeWindowAction>,
     pub next_poll_in_ms: Option<u64>,
@@ -215,6 +254,7 @@ pub struct DecorationKeyBindingInvocation {
     pub invoked: bool,
     pub dirty: bool,
     pub dirty_window_ids: Vec<String>,
+    pub dirty_managed_window_ids: Vec<String>,
     pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub actions: Vec<RuntimeWindowAction>,
@@ -232,6 +272,7 @@ pub struct DecorationWindowResizeInvocation {
     pub invoked: bool,
     pub dirty: bool,
     pub dirty_window_ids: Vec<String>,
+    pub dirty_managed_window_ids: Vec<String>,
     pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub actions: Vec<RuntimeWindowAction>,
@@ -249,6 +290,7 @@ pub struct DecorationWindowMoveInvocation {
     pub invoked: bool,
     pub dirty: bool,
     pub dirty_window_ids: Vec<String>,
+    pub dirty_managed_window_ids: Vec<String>,
     pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub actions: Vec<RuntimeWindowAction>,
@@ -266,6 +308,7 @@ pub struct DecorationWindowStateRequestInvocation {
     pub invoked: bool,
     pub dirty: bool,
     pub dirty_window_ids: Vec<String>,
+    pub dirty_managed_window_ids: Vec<String>,
     pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub actions: Vec<RuntimeWindowAction>,
@@ -283,6 +326,7 @@ pub struct DecorationPointerMoveAsyncInvocation {
     pub invoked: bool,
     pub dirty: bool,
     pub dirty_window_ids: Vec<String>,
+    pub dirty_managed_window_ids: Vec<String>,
     pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub actions: Vec<RuntimeWindowAction>,
@@ -686,6 +730,8 @@ struct RuntimeEvaluateResponse {
     window_effects: Option<WireWindowEffectConfig>,
     #[serde(rename = "dirtyNodeIds")]
     dirty_node_ids: Option<Vec<String>>,
+    #[serde(rename = "managedWindowOnly")]
+    managed_window_only: Option<bool>,
     #[serde(rename = "nextPollInMs")]
     next_poll_in_ms: Option<u64>,
     #[serde(rename = "displayConfig")]
@@ -712,6 +758,8 @@ struct RuntimeSchedulerResponse {
     dirty: Option<bool>,
     #[serde(rename = "dirtyWindowIds")]
     dirty_window_ids: Option<Vec<String>>,
+    #[serde(rename = "dirtyManagedWindowIds")]
+    dirty_managed_window_ids: Option<Vec<String>>,
     #[serde(rename = "dirtyWindowNodeIds")]
     dirty_window_node_ids: Option<std::collections::HashMap<String, Vec<String>>>,
     #[serde(rename = "dirtyLayerNodeIds")]
@@ -770,6 +818,8 @@ struct RuntimeInvokeHandlerResponse {
     window_effects: Option<WireWindowEffectConfig>,
     #[serde(rename = "dirtyWindowIds")]
     dirty_window_ids: Option<Vec<String>>,
+    #[serde(rename = "dirtyManagedWindowIds")]
+    dirty_managed_window_ids: Option<Vec<String>>,
     #[serde(rename = "dirtyWindowNodeIds")]
     dirty_window_node_ids: Option<std::collections::HashMap<String, Vec<String>>>,
     actions: Option<Vec<RuntimeWindowAction>>,
@@ -805,6 +855,8 @@ struct RuntimeStartCloseResponse {
     window_effects: Option<WireWindowEffectConfig>,
     #[serde(rename = "dirtyWindowIds")]
     dirty_window_ids: Option<Vec<String>>,
+    #[serde(rename = "dirtyManagedWindowIds")]
+    dirty_managed_window_ids: Option<Vec<String>>,
     #[serde(rename = "dirtyWindowNodeIds")]
     dirty_window_node_ids: Option<std::collections::HashMap<String, Vec<String>>>,
     actions: Option<Vec<RuntimeWindowAction>>,
@@ -887,6 +939,8 @@ struct RuntimeInvokeKeyBindingResponse {
     dirty: Option<bool>,
     #[serde(rename = "dirtyWindowIds")]
     dirty_window_ids: Option<Vec<String>>,
+    #[serde(rename = "dirtyManagedWindowIds")]
+    dirty_managed_window_ids: Option<Vec<String>>,
     #[serde(rename = "dirtyWindowNodeIds")]
     dirty_window_node_ids: Option<std::collections::HashMap<String, Vec<String>>>,
     #[serde(rename = "dirtyLayerNodeIds")]
@@ -919,6 +973,8 @@ struct RuntimeWindowResizeResponse {
     dirty: Option<bool>,
     #[serde(rename = "dirtyWindowIds")]
     dirty_window_ids: Option<Vec<String>>,
+    #[serde(rename = "dirtyManagedWindowIds")]
+    dirty_managed_window_ids: Option<Vec<String>>,
     #[serde(rename = "dirtyWindowNodeIds")]
     dirty_window_node_ids: Option<std::collections::HashMap<String, Vec<String>>>,
     #[serde(rename = "dirtyLayerNodeIds")]
@@ -951,6 +1007,8 @@ struct RuntimeWindowMoveResponse {
     dirty: Option<bool>,
     #[serde(rename = "dirtyWindowIds")]
     dirty_window_ids: Option<Vec<String>>,
+    #[serde(rename = "dirtyManagedWindowIds")]
+    dirty_managed_window_ids: Option<Vec<String>>,
     #[serde(rename = "dirtyWindowNodeIds")]
     dirty_window_node_ids: Option<std::collections::HashMap<String, Vec<String>>>,
     #[serde(rename = "dirtyLayerNodeIds")]
@@ -985,6 +1043,8 @@ struct RuntimePointerMoveAsyncResponse {
     dirty: Option<bool>,
     #[serde(rename = "dirtyWindowIds")]
     dirty_window_ids: Option<Vec<String>>,
+    #[serde(rename = "dirtyManagedWindowIds")]
+    dirty_managed_window_ids: Option<Vec<String>>,
     #[serde(rename = "dirtyWindowNodeIds")]
     dirty_window_node_ids: Option<std::collections::HashMap<String, Vec<String>>>,
     #[serde(rename = "dirtyLayerNodeIds")]
@@ -1418,6 +1478,7 @@ impl NodeDecorationEvaluator {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
@@ -1802,7 +1863,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         &self,
         window_id: &str,
         now_ms: u64,
-    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
+    ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
         let mut runtime_guard = self.runtime.lock().map_err(|_| {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
@@ -1863,16 +1924,22 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             ));
         }
 
-        let Some(serialized) = response.serialized else {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                "missing serialized tree".into(),
-            ));
+        let managed_window_only = response.managed_window_only.unwrap_or(false);
+        let node = if managed_window_only {
+            None
+        } else {
+            let Some(serialized) = response.serialized else {
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeProtocol(
+                    "missing serialized tree".into(),
+                ));
+            };
+            let stdout = serde_json::to_string(&serialized)
+                .map_err(|err| DecorationEvaluationError::InvalidResponse(err.to_string()))?;
+            Some(decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?)
         };
-        let stdout = serde_json::to_string(&serialized)
-            .map_err(|err| DecorationEvaluationError::InvalidResponse(err.to_string()))?;
-        Ok(DecorationEvaluationResult {
-            node: decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?,
+        Ok(DecorationCachedEvaluationResult {
+            node,
             transform: response.transform.unwrap_or_default(),
             managed_window: response.managed_window.unwrap_or_default(),
             window_effects: response
@@ -1881,6 +1948,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
                 .transpose()
                 .map_err(DecorationEvaluationError::Bridge)?,
             dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
+            managed_window_only,
             next_poll_in_ms: response.next_poll_in_ms,
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
@@ -1973,6 +2041,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         Ok(DecorationSchedulerTick {
             dirty: response.dirty.unwrap_or(false),
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
@@ -2146,6 +2215,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
                 .transpose()
                 .map_err(DecorationEvaluationError::Bridge)?,
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
@@ -2233,6 +2303,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
@@ -2323,6 +2394,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
@@ -2412,6 +2484,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
@@ -2499,6 +2572,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
@@ -2586,6 +2660,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
@@ -2673,6 +2748,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
@@ -2779,6 +2855,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
                 .transpose()
                 .map_err(DecorationEvaluationError::Bridge)?,
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,

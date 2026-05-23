@@ -256,6 +256,7 @@ pub struct ShojiWM {
     pub damage_blink_pending: HashMap<String, Vec<LogicalRect>>,
     pub runtime_poll_dirty: bool,
     pub runtime_dirty_window_ids: std::collections::HashSet<String>,
+    pub runtime_managed_only_window_ids: std::collections::HashSet<String>,
     pub runtime_scheduler_enabled: bool,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
     pub runtime_output_configs: std::collections::BTreeMap<String, RuntimeOutputConfig>,
@@ -737,6 +738,7 @@ impl ShojiWM {
             damage_blink_pending: HashMap::new(),
             runtime_poll_dirty: false,
             runtime_dirty_window_ids: Default::default(),
+            runtime_managed_only_window_ids: Default::default(),
             runtime_scheduler_enabled: false,
             runtime_animation_outputs: Default::default(),
             runtime_output_configs: Default::default(),
@@ -1169,9 +1171,10 @@ impl ShojiWM {
                 };
                 if tick.dirty {
                     state.runtime_poll_dirty = true;
-                    state
-                        .runtime_dirty_window_ids
-                        .extend(tick.dirty_window_ids.into_iter());
+                    state.mark_runtime_dirty_windows(
+                        tick.dirty_window_ids,
+                        tick.dirty_managed_window_ids,
+                    );
                     state.request_tty_maintenance("runtime-scheduler-dirty");
                     state.schedule_redraw();
                 }
@@ -1499,14 +1502,35 @@ impl ShojiWM {
         }
     }
 
+    pub fn mark_runtime_dirty_windows(
+        &mut self,
+        dirty_window_ids: impl IntoIterator<Item = String>,
+        dirty_managed_window_ids: impl IntoIterator<Item = String>,
+    ) {
+        let managed_only = dirty_managed_window_ids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        for window_id in dirty_window_ids {
+            if managed_only.contains(&window_id) {
+                self.runtime_managed_only_window_ids
+                    .insert(window_id.clone());
+            } else {
+                self.runtime_managed_only_window_ids.remove(&window_id);
+            }
+            self.runtime_dirty_window_ids.insert(window_id);
+        }
+    }
+
     pub fn handle_runtime_pointer_move_async_invocation(
         &mut self,
         invocation: DecorationPointerMoveAsyncInvocation,
     ) {
         if invocation.dirty {
             self.runtime_poll_dirty = true;
-            self.runtime_dirty_window_ids
-                .extend(invocation.dirty_window_ids.into_iter());
+            self.mark_runtime_dirty_windows(
+                invocation.dirty_window_ids,
+                invocation.dirty_managed_window_ids,
+            );
             self.request_tty_maintenance("runtime-pointer-move-async-dirty");
             self.schedule_redraw();
         }

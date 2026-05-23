@@ -18,11 +18,11 @@ use crate::backend::{
 use crate::state::ShojiWM;
 
 use super::{
-    ComputedDecorationTree, DecorationEvaluationError, DecorationEvaluationResult,
-    DecorationEvaluator, DecorationHandlerInvocation, DecorationHitTestResult,
-    DecorationSchedulerTick, DecorationTree, LayerEffectEvaluationResult, LogicalPoint,
-    LogicalRect, StaticDecorationEvaluator, WaylandLayerSnapshot, WaylandWindowSnapshot,
-    WindowPositionSnapshot, WindowTransform, reapply_tree_preserving_layout,
+    ComputedDecorationTree, DecorationCachedEvaluationResult, DecorationEvaluationError,
+    DecorationEvaluationResult, DecorationEvaluator, DecorationHandlerInvocation,
+    DecorationHitTestResult, DecorationSchedulerTick, DecorationTree, LayerEffectEvaluationResult,
+    LogicalPoint, LogicalRect, StaticDecorationEvaluator, WaylandLayerSnapshot,
+    WaylandWindowSnapshot, WindowPositionSnapshot, WindowTransform, reapply_tree_preserving_layout,
     window_model::ManagedWindowRectSnapshot,
 };
 
@@ -284,7 +284,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         &self,
         window_id: &str,
         now_ms: u64,
-    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
+    ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
         match self {
             Self::Static(_) => Err(DecorationEvaluationError::RuntimeProtocol(
                 "cached window evaluation unsupported for static evaluator".into(),
@@ -598,8 +598,10 @@ impl ShojiWM {
 
         if invocation.dirty {
             self.runtime_poll_dirty = true;
-            self.runtime_dirty_window_ids
-                .extend(invocation.dirty_window_ids.into_iter());
+            self.mark_runtime_dirty_windows(
+                invocation.dirty_window_ids,
+                invocation.dirty_managed_window_ids,
+            );
             self.request_tty_maintenance("runtime-window-resize-dirty");
             self.schedule_redraw();
         }
@@ -646,8 +648,10 @@ impl ShojiWM {
 
         if invocation.dirty {
             self.runtime_poll_dirty = true;
-            self.runtime_dirty_window_ids
-                .extend(invocation.dirty_window_ids.into_iter());
+            self.mark_runtime_dirty_windows(
+                invocation.dirty_window_ids,
+                invocation.dirty_managed_window_ids,
+            );
             self.request_tty_maintenance("runtime-window-move-dirty");
             self.schedule_redraw();
         }
@@ -753,8 +757,10 @@ impl ShojiWM {
 
         if invocation.dirty {
             self.runtime_poll_dirty = true;
-            self.runtime_dirty_window_ids
-                .extend(invocation.dirty_window_ids.into_iter());
+            self.mark_runtime_dirty_windows(
+                invocation.dirty_window_ids,
+                invocation.dirty_managed_window_ids,
+            );
             self.request_tty_maintenance(reason);
             self.schedule_redraw();
         }
@@ -835,8 +841,10 @@ impl ShojiWM {
                 transform: invocation.transform.unwrap_or(decoration.visual_transform),
             },
         );
-        self.runtime_dirty_window_ids
-            .extend(invocation.dirty_window_ids.into_iter());
+        self.mark_runtime_dirty_windows(
+            invocation.dirty_window_ids,
+            invocation.dirty_managed_window_ids,
+        );
         self.runtime_scheduler_enabled = invocation.next_poll_in_ms.is_some();
         self.apply_runtime_window_actions(invocation.actions);
         self.schedule_redraw();
@@ -1091,7 +1099,8 @@ impl ShojiWM {
     ) -> Result<(), DecorationEvaluationError> {
         let refresh_started_at = Instant::now();
         let spike_threshold_ms = animation_spike_threshold_ms();
-        let force_runtime_reevaluate = self.runtime_poll_dirty;
+        let force_runtime_reevaluate =
+            self.runtime_poll_dirty && self.runtime_dirty_window_ids.is_empty();
         let force_output_animation_reevaluate = target_output_name
             .is_some_and(|output_name| self.runtime_animation_outputs.contains(output_name));
         let force_async_asset_refresh = self.async_asset_dirty;
@@ -1142,6 +1151,7 @@ impl ShojiWM {
                 self.decoration_evaluator.window_closed(window_id)?;
                 self.windows_ready_for_decoration.remove(window_id);
                 self.runtime_dirty_window_ids.remove(window_id);
+                self.runtime_managed_only_window_ids.remove(window_id);
                 self.snapshot_dirty_window_ids.remove(window_id);
                 self.pending_decoration_damage.push(*root_rect);
             } else {
@@ -1518,7 +1528,7 @@ impl ShojiWM {
                     let evaluate_started_at = Instant::now();
                     let evaluation = if runtime_state_changed {
                         match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
-                            Ok(evaluation) => evaluation,
+                            Ok(evaluation) => evaluation.into(),
                             Err(error) => {
                                 warn!(
                                     window_id = snapshot.id,
@@ -1527,7 +1537,9 @@ impl ShojiWM {
                                     ?error,
                                     "decoration runtime evaluation failed during runtime state update, falling back to static decoration"
                                 );
-                                StaticDecorationEvaluator.evaluate_window(&snapshot, now_ms)?
+                                StaticDecorationEvaluator
+                                    .evaluate_window(&snapshot, now_ms)?
+                                    .into()
                             }
                         }
                     } else {
@@ -1545,7 +1557,7 @@ impl ShojiWM {
                                     "cached decoration runtime evaluation failed during transform update, falling back to full evaluation"
                                 );
                                 match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
-                                    Ok(evaluation) => evaluation,
+                                    Ok(evaluation) => evaluation.into(),
                                     Err(error) => {
                                         warn!(
                                             window_id = snapshot.id,
@@ -1556,6 +1568,7 @@ impl ShojiWM {
                                         );
                                         StaticDecorationEvaluator
                                             .evaluate_window(&snapshot, now_ms)?
+                                            .into()
                                     }
                                 }
                             }
@@ -1568,8 +1581,51 @@ impl ShojiWM {
                     pending_event_config_updates.push(evaluation.event_config.clone());
                     pending_process_config_updates.push(evaluation.process_config.clone());
                     pending_process_actions.extend(evaluation.process_actions.clone());
+                    if evaluation.managed_window_only {
+                        cached.snapshot = snapshot;
+                        cached.managed_window = evaluation.managed_window;
+                        cached.window_effects = evaluation.window_effects;
+                        cached.visual_transform = evaluation.transform;
+                        let next_root =
+                            transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
+                        push_damage_pair(
+                            &mut self.pending_decoration_damage,
+                            Some(previous_root),
+                            next_root,
+                        );
+                        let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+                        log_animation_window_refresh_timing(
+                            "managed-window-only",
+                            &cached.snapshot,
+                            elapsed_ms,
+                            evaluate_ms,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0,
+                            Some(false),
+                            Some(true),
+                        );
+                        runtime_dirty_updates = runtime_dirty_updates.saturating_add(1);
+                        cached.client_rect_potentially_stale = false;
+                        self.schedule_redraw();
+                        self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
+                        animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
+                        processed_runtime_dirty_window_ids.insert(snapshot_id);
+                        continue;
+                    }
                     let rebuild_started_at = Instant::now();
-                    let next_tree = DecorationTree::new(evaluation.node);
+                    let Some(evaluation_node) = evaluation.node else {
+                        return Err(DecorationEvaluationError::RuntimeProtocol(
+                            "cached evaluation returned no tree without managedWindowOnly".into(),
+                        ));
+                    };
+                    let next_tree = DecorationTree::new(evaluation_node);
                     let next_transform = evaluation.transform;
                     let next_managed_window = evaluation.managed_window;
                     let next_window_effects = evaluation.window_effects;
@@ -1858,7 +1914,118 @@ impl ShojiWM {
                 pending_display_config_updates.push(evaluation.display_config.clone());
                 pending_process_config_updates.push(evaluation.process_config.clone());
                 pending_process_actions.extend(evaluation.process_actions.clone());
-                let next_tree = DecorationTree::new(evaluation.node);
+                if evaluation.managed_window_only {
+                    closing.decoration.managed_window = evaluation.managed_window;
+                    closing.decoration.window_effects = evaluation.window_effects;
+                    closing.decoration.visual_transform = evaluation.transform;
+                    if closing.decoration.managed_window.managed
+                        && let Some(desired_root) = closing.decoration.managed_window.rect
+                    {
+                        let desired_root = managed_rect_snapshot_to_logical_rect(desired_root);
+                        if desired_root.width > 0 && desired_root.height > 0 {
+                            let desired_client = managed_client_rect_for_root(
+                                &closing.decoration.tree,
+                                desired_root,
+                                closing.decoration.layout_scale,
+                            )?;
+                            let position_changed = desired_client.x
+                                != closing.decoration.client_rect.x
+                                || desired_client.y != closing.decoration.client_rect.y;
+                            let size_changed = desired_client.width
+                                != closing.decoration.client_rect.width
+                                || desired_client.height != closing.decoration.client_rect.height;
+                            if size_changed {
+                                let layout = closing
+                                    .decoration
+                                    .tree
+                                    .layout_for_client_with_scale(
+                                        desired_client,
+                                        closing.decoration.layout_scale,
+                                    )
+                                    .map_err(super::DecorationEvaluationError::Layout)?;
+                                let shared_edges = build_shared_edge_geometry_map(&layout);
+                                let content_clip = content_clip_for_layout(
+                                    &closing.decoration.tree,
+                                    &layout,
+                                    &shared_edges,
+                                );
+                                let order_map = build_render_order_map(&layout);
+                                closing.decoration.layout = layout;
+                                closing.decoration.content_clip = content_clip;
+                                closing.decoration.client_rect = desired_client;
+                                closing.decoration.snapshot.position = WindowPositionSnapshot {
+                                    x: desired_client.x,
+                                    y: desired_client.y,
+                                    width: desired_client.width,
+                                    height: desired_client.height,
+                                };
+                                closing.decoration.buffers =
+                                    build_cached_buffers(&closing.decoration.layout, &order_map);
+                                closing.decoration.shader_buffers =
+                                    build_shader_buffers(&closing.decoration.layout, &order_map);
+                                freeze_manual_shader_buffers(
+                                    &previous_shader_buffers,
+                                    &mut closing.decoration.shader_buffers,
+                                );
+                                closing.decoration.text_buffers = build_text_buffers_with_fallback(
+                                    &closing.decoration.layout,
+                                    &order_map,
+                                    closing_raster_scale,
+                                    &mut self.text_rasterizer,
+                                    &previous_text_buffers,
+                                );
+                                closing.decoration.icon_buffers = build_icon_buffers(
+                                    &closing.decoration.layout,
+                                    &order_map,
+                                    closing_raster_scale,
+                                    &closing.decoration.snapshot,
+                                    &mut self.icon_rasterizer,
+                                );
+                                closing.live.rect = desired_client;
+                            } else if position_changed {
+                                let dx = desired_client.x - closing.decoration.client_rect.x;
+                                let dy = desired_client.y - closing.decoration.client_rect.y;
+                                translate_cached_decoration_position(
+                                    &mut closing.decoration,
+                                    dx,
+                                    dy,
+                                    desired_client,
+                                );
+                                closing.live.rect = desired_client;
+                            }
+                        }
+                    }
+                    closing.transform = evaluation.transform;
+                    let next_root = transformed_root_rect(
+                        closing.decoration.layout.root.rect,
+                        closing.transform,
+                    );
+                    push_damage_pair(
+                        &mut self.pending_decoration_damage,
+                        Some(previous_root),
+                        next_root,
+                    );
+                    if evaluation.next_poll_in_ms.is_none() && closing.transform.opacity <= 0.001 {
+                        pending_finalize_close_damage.push(next_root);
+                        pending_window_actions.push(crate::ssd::RuntimeWindowAction {
+                            window_id: window_id.clone(),
+                            action: crate::ssd::WaylandWindowAction::FinalizeClose,
+                        });
+                    }
+                    self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
+                    self.schedule_redraw();
+                    closing_runtime_updates = closing_runtime_updates.saturating_add(1);
+                    animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
+                    processed_runtime_dirty_window_ids.insert(window_id);
+                    continue;
+                }
+                let Some(evaluation_node) = evaluation.node else {
+                    return Err(DecorationEvaluationError::RuntimeProtocol(
+                        "cached closing evaluation returned no tree without managedWindowOnly"
+                            .into(),
+                    ));
+                };
+                let next_tree = DecorationTree::new(evaluation_node);
                 closing.decoration.managed_window = evaluation.managed_window;
                 closing.decoration.window_effects = evaluation.window_effects;
                 let dirty_node_ids = evaluation.dirty_node_ids;
@@ -2288,8 +2455,13 @@ impl ShojiWM {
         );
         for window_id in processed_runtime_dirty_window_ids {
             self.runtime_dirty_window_ids.remove(&window_id);
+            self.runtime_managed_only_window_ids.remove(&window_id);
         }
         self.runtime_dirty_window_ids.retain(|window_id| {
+            live_window_ids.contains(window_id)
+                || self.closing_window_snapshots.contains_key(window_id)
+        });
+        self.runtime_managed_only_window_ids.retain(|window_id| {
             live_window_ids.contains(window_id)
                 || self.closing_window_snapshots.contains_key(window_id)
         });

@@ -24,8 +24,8 @@ pub use bridge::{
     WireStyle, WireWindowAction, WireWindowEffectConfig, decode_tree_json,
 };
 pub use evaluator::{
-    DecorationEvaluationError, DecorationEvaluationResult, DecorationEvaluator,
-    DecorationHandlerInvocation, DecorationKeyBindingInvocation,
+    DecorationCachedEvaluationResult, DecorationEvaluationError, DecorationEvaluationResult,
+    DecorationEvaluator, DecorationHandlerInvocation, DecorationKeyBindingInvocation,
     DecorationPointerMoveAsyncInvocation, DecorationSchedulerTick, DecorationWindowMoveInvocation,
     DecorationWindowResizeInvocation, DecorationWindowStateRequestInvocation,
     LayerEffectEvaluationResult, NodeDecorationEvaluator, RuntimeEventConfigUpdate,

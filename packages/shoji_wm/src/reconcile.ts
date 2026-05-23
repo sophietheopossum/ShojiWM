@@ -4,7 +4,9 @@ import { read } from "./signals";
 import { createElementNode } from "./runtime";
 import { createComponentStateStore, withComponentRenderRoot } from "./runtime";
 import {
+  enterWindowManagedDependencyScope,
   enterWindowDependencyScope,
+  leaveWindowManagedDependencyScope,
   leaveWindowDependencyScope,
 } from "./runtime-hooks";
 import {
@@ -60,6 +62,10 @@ export interface CompositionEvaluationCache {
   readonly lastManagedWindow: ManagedWindowState;
   update(snapshot: WaylandWindowSnapshot): CompositionEvaluationResult | null;
   reevaluate(dirtyNodeIds?: readonly string[]): CompositionEvaluationResult;
+  reevaluateManagedWindow(): Pick<
+    CompositionEvaluationResult,
+    "transform" | "managedWindow" | "version"
+  >;
   invokeHandler(handlerId: string): boolean;
   setContext(context: WindowCompositionContext): void;
 }
@@ -160,7 +166,7 @@ export function createCompositionEvaluationCache(
       const rendered = withComponentRenderRoot(currentSnapshot.id, componentStateStore, () =>
         evaluate(handle.window, context)
       );
-      const extracted = extractManagedWindowRoot(rendered, handle);
+      const extracted = extractManagedWindowRoot(rendered, handle, currentSnapshot.id);
       tree = extracted.tree;
       managedWindow = extracted.managedWindow;
       managedWindowProps = extracted.props;
@@ -195,7 +201,7 @@ export function createCompositionEvaluationCache(
         dirtyNodeIdSet,
         serializationContext,
       );
-      managedWindow = snapshotManagedWindow(managedWindowProps, handle);
+      managedWindow = snapshotManagedWindow(currentSnapshot.id, managedWindowProps, handle);
       handle.updateManagedWindow(managedWindow);
       transform = managedWindow.transform;
     } finally {
@@ -251,6 +257,17 @@ export function createCompositionEvaluationCache(
       }
       return evaluateCurrentTree();
     },
+    reevaluateManagedWindow() {
+      managedWindow = snapshotManagedWindow(currentSnapshot.id, managedWindowProps, handle);
+      handle.updateManagedWindow(managedWindow);
+      transform = managedWindow.transform;
+      version += 1;
+      return {
+        transform,
+        managedWindow,
+        version,
+      };
+    },
     invokeHandler(handlerId) {
       const handler = runtimeHandlers.get(handlerId);
       if (!handler) {
@@ -277,6 +294,7 @@ function normalizeRootComposition(rendered: CompositionRenderable): CompositionC
 function extractManagedWindowRoot(
   rendered: CompositionRenderable,
   handle: ReactiveWaylandWindowHandle,
+  windowId: string,
 ): {
   tree: CompositionChild;
   managedWindow: ManagedWindowState;
@@ -286,13 +304,13 @@ function extractManagedWindowRoot(
   if (!isManagedWindowNode(normalized)) {
     return {
       tree: normalized,
-      managedWindow: snapshotManagedWindow(undefined, handle),
+      managedWindow: snapshotManagedWindow(windowId, undefined, handle),
     };
   }
 
   return {
     tree: managedWindowChildrenAsRoot(normalized),
-    managedWindow: snapshotManagedWindow(normalized.props as ManagedWindowProps, handle),
+    managedWindow: snapshotManagedWindow(windowId, normalized.props as ManagedWindowProps, handle),
     props: normalized.props as ManagedWindowProps,
   };
 }
@@ -312,30 +330,42 @@ function isManagedWindowNode(node: CompositionChild): node is CompositionElement
 }
 
 function snapshotManagedWindow(
+  windowId: string,
   props: ManagedWindowProps | undefined,
   handle: ReactiveWaylandWindowHandle,
 ): ManagedWindowState {
-  const legacyTransform = snapshotTransform(handle);
-  const transform = snapshotManagedWindowTransform(props?.transform, legacyTransform);
-  const opacity = props?.opacity === undefined ? transform.opacity : read(props.opacity);
-  const visible = props?.visible === undefined ? true : read(props.visible);
-  const idle = props?.idle === undefined ? false : read(props.idle);
+  enterWindowManagedDependencyScope(windowId);
+  try {
+    const legacyTransform = snapshotTransform(handle);
+    const transform = snapshotManagedWindowTransform(props?.transform, legacyTransform);
+    const opacity = props?.opacity === undefined ? transform.opacity : read(props.opacity);
+    const visible = props?.visible === undefined ? true : read(props.visible);
+    const idle = props?.idle === undefined ? false : read(props.idle);
 
-  return {
-    managed: props !== undefined,
-    rect: props?.rect === undefined ? undefined : snapshotManagedWindowRect(read(props.rect)),
-    workspace: props?.workspace === undefined ? undefined : read(props.workspace),
-    visibleOutputs: props?.visibleOutputs === undefined ? undefined : snapshotManagedWindowVisibleOutputs(read(props.visibleOutputs)),
-    visible,
-    idle,
-    interactive: props?.interactive === undefined ? true : read(props.interactive),
-    forceRectSize: props?.forceRectSize === undefined ? false : read(props.forceRectSize),
-    zIndex: props?.zIndex === undefined ? undefined : read(props.zIndex),
-    transform: {
-      ...transform,
-      opacity: visible && !idle ? opacity : 0,
-    },
-  };
+    return {
+      managed: props !== undefined,
+      rect:
+        props?.rect === undefined
+          ? undefined
+          : snapshotManagedWindowRect(read(props.rect)),
+      workspace: props?.workspace === undefined ? undefined : read(props.workspace),
+      visibleOutputs:
+        props?.visibleOutputs === undefined
+          ? undefined
+          : snapshotManagedWindowVisibleOutputs(read(props.visibleOutputs)),
+      visible,
+      idle,
+      interactive: props?.interactive === undefined ? true : read(props.interactive),
+      forceRectSize: props?.forceRectSize === undefined ? false : read(props.forceRectSize),
+      zIndex: props?.zIndex === undefined ? undefined : read(props.zIndex),
+      transform: {
+        ...transform,
+        opacity: visible && !idle ? opacity : 0,
+      },
+    };
+  } finally {
+    leaveWindowManagedDependencyScope();
+  }
 }
 
 function snapshotManagedWindowVisibleOutputs(outputs: readonly string[] | null): string[] | null {

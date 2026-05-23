@@ -9,8 +9,10 @@ let activeWindowDependencyScope: string | null = null;
 let activeLayerDependencyScope: string | null = null;
 let activeWindowNodeDependencyScope: string | null = null;
 let activeLayerNodeDependencyScope: string | null = null;
+let activeWindowManagedDependencyScope: string | null = null;
 const windowSignalDependencies = new WeakMap<object, Set<string>>();
 const layerSignalDependencies = new WeakMap<object, Set<string>>();
+const windowManagedSignalDependencies = new WeakMap<object, Set<string>>();
 const windowStructuralSignalDependencies = new WeakMap<object, Set<string>>();
 const layerStructuralSignalDependencies = new WeakMap<object, Set<string>>();
 const windowNodeSignalDependencies = new WeakMap<object, Map<string, Set<string>>>();
@@ -21,6 +23,7 @@ const windowNodeDependencies = new Map<string, Map<string, Set<object>>>();
 const layerNodeDependencies = new Map<string, Map<string, Set<object>>>();
 const dirtyWindowNodeIds = new Map<string, Set<string>>();
 const dirtyLayerNodeIds = new Map<string, Set<string>>();
+const dirtyManagedWindowIds = new Set<string>();
 // Windows/layers that received a structural-dep write since the last
 // takeDirty*NodeIds call. Tracked separately because a structural write may be
 // followed by cascading writes from derived computed signals — those cascades
@@ -57,6 +60,7 @@ export function enterWindowDependencyScope(windowId: string): void {
 export function leaveWindowDependencyScope(): void {
   activeWindowDependencyScope = null;
   activeWindowNodeDependencyScope = null;
+  activeWindowManagedDependencyScope = null;
 }
 
 export function enterLayerDependencyScope(layerId: string): void {
@@ -80,6 +84,17 @@ export function enterWindowNodeDependencyScope(nodeId: string): void {
 
 export function leaveWindowNodeDependencyScope(): void {
   activeWindowNodeDependencyScope = null;
+}
+
+export function enterWindowManagedDependencyScope(windowId: string): void {
+  activeWindowManagedDependencyScope =
+    activeWindowDependencyScope === windowId ? windowId : null;
+  activeWindowNodeDependencyScope = null;
+  activeLayerNodeDependencyScope = null;
+}
+
+export function leaveWindowManagedDependencyScope(): void {
+  activeWindowManagedDependencyScope = null;
 }
 
 export function enterLayerNodeDependencyScope(nodeId: string): void {
@@ -114,6 +129,25 @@ export function takeDirtyWindowNodeIds(windowId: string): string[] {
   return Array.from(dirty);
 }
 
+export function takeManagedWindowOnlyDirty(windowId: string): boolean {
+  if (!isManagedWindowOnlyDirty(windowId)) {
+    dirtyManagedWindowIds.delete(windowId);
+    return false;
+  }
+  dirtyManagedWindowIds.delete(windowId);
+  return true;
+}
+
+export function isManagedWindowOnlyDirty(windowId: string): boolean {
+  if (!dirtyManagedWindowIds.has(windowId)) {
+    return false;
+  }
+  if (windowsWithStructuralWrite.has(windowId) || dirtyWindowNodeIds.has(windowId)) {
+    return false;
+  }
+  return true;
+}
+
 export function takeDirtyLayerNodeIds(layerId: string): string[] {
   if (layersWithStructuralWrite.has(layerId)) {
     layersWithStructuralWrite.delete(layerId);
@@ -129,6 +163,31 @@ export function takeDirtyLayerNodeIds(layerId: string): string[] {
 }
 
 export function trackSignalRead(signal: object): void {
+  const managedWindowId = activeWindowManagedDependencyScope;
+  if (managedWindowId) {
+    let dependentWindows = windowSignalDependencies.get(signal);
+    if (!dependentWindows) {
+      dependentWindows = new Set<string>();
+      windowSignalDependencies.set(signal, dependentWindows);
+    }
+    dependentWindows.add(managedWindowId);
+
+    let managedWindows = windowManagedSignalDependencies.get(signal);
+    if (!managedWindows) {
+      managedWindows = new Set<string>();
+      windowManagedSignalDependencies.set(signal, managedWindows);
+    }
+    managedWindows.add(managedWindowId);
+
+    let dependencies = windowDependencies.get(managedWindowId);
+    if (!dependencies) {
+      dependencies = new Set<object>();
+      windowDependencies.set(managedWindowId, dependencies);
+    }
+    dependencies.add(signal);
+    return;
+  }
+
   const windowId = activeWindowDependencyScope;
   if (windowId) {
     let dependentWindows = windowSignalDependencies.get(signal);
@@ -239,15 +298,23 @@ export function trackSignalRead(signal: object): void {
 export function trackSignalWrite(signal: object): void {
   const dependentWindows = windowSignalDependencies.get(signal);
   const dependentLayers = layerSignalDependencies.get(signal);
+  const managedWindows = windowManagedSignalDependencies.get(signal);
   const structuralWindows = windowStructuralSignalDependencies.get(signal);
   const structuralLayers = layerStructuralSignalDependencies.get(signal);
   const dependentWindowNodes = windowNodeSignalDependencies.get(signal);
   const dependentLayerNodes = layerNodeSignalDependencies.get(signal);
   const hasWindowDeps = !!dependentWindows && dependentWindows.size > 0;
   const hasLayerDeps = !!dependentLayers && dependentLayers.size > 0;
+  const hasManagedWindowDeps = !!managedWindows && managedWindows.size > 0;
   const hasWindowNodeDeps = !!dependentWindowNodes && dependentWindowNodes.size > 0;
   const hasLayerNodeDeps = !!dependentLayerNodes && dependentLayerNodes.size > 0;
-  if (!hasWindowDeps && !hasLayerDeps && !hasWindowNodeDeps && !hasLayerNodeDeps) {
+  if (
+    !hasWindowDeps &&
+    !hasLayerDeps &&
+    !hasManagedWindowDeps &&
+    !hasWindowNodeDeps &&
+    !hasLayerNodeDeps
+  ) {
     markRuntimeDirty();
     return;
   }
@@ -262,6 +329,11 @@ export function trackSignalWrite(signal: object): void {
       markLayerDirty(layerId);
     }
   }
+  if (managedWindows) {
+    for (const windowId of managedWindows) {
+      dirtyManagedWindowIds.add(windowId);
+    }
+  }
   if (structuralWindows) {
     for (const windowId of structuralWindows) {
       // A structural dependency may affect tree shape, so node-scoped patches
@@ -269,6 +341,7 @@ export function trackSignalWrite(signal: object): void {
       // re-added by derived signals during the cascading notify() — record the
       // intent until the runtime collects dirty ids.
       dirtyWindowNodeIds.delete(windowId);
+      dirtyManagedWindowIds.delete(windowId);
       windowsWithStructuralWrite.add(windowId);
     }
   }
@@ -330,10 +403,13 @@ function clearWindowDependencies(windowId: string): void {
     dependentWindows?.delete(windowId);
     const structuralWindows = windowStructuralSignalDependencies.get(signal);
     structuralWindows?.delete(windowId);
+    const managedWindows = windowManagedSignalDependencies.get(signal);
+    managedWindows?.delete(windowId);
   }
 
   windowDependencies.delete(windowId);
   dirtyWindowNodeIds.delete(windowId);
+  dirtyManagedWindowIds.delete(windowId);
   windowsWithStructuralWrite.delete(windowId);
 
   const nodeDependenciesByWindow = windowNodeDependencies.get(windowId);

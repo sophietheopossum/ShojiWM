@@ -49,9 +49,11 @@ import {
   leaveLayerDependencyScope,
   read,
   takeDirtyLayerNodeIds,
+  takeManagedWindowOnlyDirty,
   takeDirtyWindowNodeIds,
   type WindowManagerEventController,
   installSchedulerBridge,
+  isManagedWindowOnlyDirty,
   type CompositionEvaluationCache,
   type DisplayConfigDraft,
   type WindowCompositionFunction,
@@ -235,12 +237,13 @@ type RuntimeRequestWithTimestamp = Extract<RuntimeRequest, { nowMs: number }>;
 interface EvaluateSuccess {
   requestId: number;
   ok: true;
-  kind: "evaluate" | "evaluatePreview";
-  serialized: unknown;
+  kind: "evaluate" | "evaluatePreview" | "evaluateCached";
+  serialized?: unknown;
   transform: WindowTransform;
   managedWindow: ManagedWindowState;
   windowEffects?: WindowEffectAssignment | null;
   dirtyNodeIds?: string[];
+  managedWindowOnly?: boolean;
   nextPollInMs?: number;
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
@@ -256,6 +259,7 @@ interface SchedulerTickSuccess {
   kind: "schedulerTick";
   dirty: boolean;
   dirtyWindowIds: string[];
+  dirtyManagedWindowIds?: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
   dirtyLayerNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
@@ -295,6 +299,7 @@ interface InvokeHandlerSuccess {
   managedWindow?: ManagedWindowState;
   windowEffects?: WindowEffectAssignment | null;
   dirtyWindowIds: string[];
+  dirtyManagedWindowIds?: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
   nextPollInMs?: number;
@@ -313,6 +318,7 @@ interface InvokeKeyBindingSuccess {
   invoked: boolean;
   dirty: boolean;
   dirtyWindowIds: string[];
+  dirtyManagedWindowIds?: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
   dirtyLayerNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
@@ -332,6 +338,7 @@ interface WindowResizeSuccess {
   invoked: boolean;
   dirty: boolean;
   dirtyWindowIds: string[];
+  dirtyManagedWindowIds?: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
   dirtyLayerNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
@@ -351,6 +358,7 @@ interface WindowMoveSuccess {
   invoked: boolean;
   dirty: boolean;
   dirtyWindowIds: string[];
+  dirtyManagedWindowIds?: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
   dirtyLayerNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
@@ -370,6 +378,7 @@ interface WindowStateRequestSuccess {
   invoked: boolean;
   dirty: boolean;
   dirtyWindowIds: string[];
+  dirtyManagedWindowIds?: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
   dirtyLayerNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
@@ -392,6 +401,7 @@ interface StartCloseSuccess {
   managedWindow?: ManagedWindowState;
   windowEffects?: WindowEffectAssignment | null;
   dirtyWindowIds: string[];
+  dirtyManagedWindowIds?: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
   nextPollInMs?: number;
@@ -410,6 +420,7 @@ interface PointerMoveAsyncSuccess {
   invoked: boolean;
   dirty: boolean;
   dirtyWindowIds: string[];
+  dirtyManagedWindowIds?: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
   dirtyLayerNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
@@ -809,6 +820,7 @@ async function main() {
             kind: "schedulerTick",
             dirty: tick.dirty,
             dirtyWindowIds: tick.dirtyWindowIds,
+            dirtyManagedWindowIds: tick.dirtyManagedWindowIds,
             dirtyWindowNodeIds: tick.dirtyWindowNodeIds,
             dirtyLayerNodeIds: tick.dirtyLayerNodeIds,
             actions: tick.actions,
@@ -868,6 +880,7 @@ async function main() {
             managedWindow: result.managedWindow,
             windowEffects: result.windowEffects,
             dirtyNodeIds: result.dirtyNodeIds,
+            managedWindowOnly: result.managedWindowOnly,
             nextPollInMs: hasActiveAnimations() ? 0 : result.nextPollInMs,
             displayConfig: pendingDisplayConfigPayload(),
             keyBindingConfig,
@@ -1082,16 +1095,29 @@ function evaluateCached(
   effectConfig: RuntimeEffectConfig,
   windowId: string,
 ): {
-  serialized: unknown;
+  serialized?: unknown;
   transform: WindowTransform;
   managedWindow: ManagedWindowState;
   windowEffects: WindowEffectAssignment | null;
   dirtyNodeIds?: string[];
+  managedWindowOnly?: boolean;
   nextPollInMs?: number;
 } {
   const entry = cacheByWindowId.get(windowId);
   if (!entry) {
     throw new Error(`missing cache entry for closing window ${windowId}`);
+  }
+
+  if (takeManagedWindowOnlyDirty(windowId)) {
+    const reevaluated = entry.cache.reevaluateManagedWindow();
+    return {
+      transform: reevaluated.transform,
+      managedWindow: reevaluated.managedWindow,
+      windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
+      dirtyNodeIds: [],
+      managedWindowOnly: true,
+      nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
+    };
   }
 
   const dirtyNodeIds = takeDirtyWindowNodeIds(windowId);
@@ -1518,6 +1544,7 @@ function registerPoll(
 function processSchedulerTick(nowMs: number): {
   dirty: boolean;
   dirtyWindowIds: string[];
+  dirtyManagedWindowIds?: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
   dirtyLayerNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
@@ -1551,6 +1578,7 @@ function processSchedulerTick(nowMs: number): {
 function collectRuntimeMutationState(): {
   dirty: boolean;
   dirtyWindowIds: string[];
+  dirtyManagedWindowIds?: string[];
   dirtyWindowNodeIds?: Record<string, string[]>;
   dirtyLayerNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
@@ -1570,6 +1598,9 @@ function collectRuntimeMutationState(): {
   dirtyWindowIds.clear();
   const nextDirtyLayerIds = Array.from(dirtyLayerIds);
   dirtyLayerIds.clear();
+  const dirtyManagedWindowIds = nextDirtyWindowIds.filter((windowId) =>
+    isManagedWindowOnlyDirty(windowId),
+  );
   const dirtyWindowNodeIds = Object.fromEntries(
     nextDirtyWindowIds
       .map((windowId) => [windowId, takeDirtyWindowNodeIds(windowId)] as const)
@@ -1587,6 +1618,8 @@ function collectRuntimeMutationState(): {
   return {
     dirty,
     dirtyWindowIds: nextDirtyWindowIds,
+    dirtyManagedWindowIds:
+      dirtyManagedWindowIds.length > 0 ? dirtyManagedWindowIds : undefined,
     dirtyWindowNodeIds:
       Object.keys(dirtyWindowNodeIds).length > 0 ? dirtyWindowNodeIds : undefined,
     dirtyLayerNodeIds:
@@ -1615,6 +1648,7 @@ function invokeGlobalKeyBinding(
     invoked: true,
     dirty: result.dirty,
     dirtyWindowIds: result.dirtyWindowIds,
+    dirtyManagedWindowIds: result.dirtyManagedWindowIds,
     dirtyWindowNodeIds: result.dirtyWindowNodeIds,
     dirtyLayerNodeIds: result.dirtyLayerNodeIds,
     actions: result.actions,
@@ -1654,6 +1688,7 @@ function invokeWindowResize(
     invoked: true,
     dirty: result.dirty,
     dirtyWindowIds: result.dirtyWindowIds,
+    dirtyManagedWindowIds: result.dirtyManagedWindowIds,
     dirtyWindowNodeIds: result.dirtyWindowNodeIds,
     dirtyLayerNodeIds: result.dirtyLayerNodeIds,
     actions: result.actions,
@@ -1693,6 +1728,7 @@ function invokeWindowMove(
     invoked: true,
     dirty: result.dirty,
     dirtyWindowIds: result.dirtyWindowIds,
+    dirtyManagedWindowIds: result.dirtyManagedWindowIds,
     dirtyWindowNodeIds: result.dirtyWindowNodeIds,
     dirtyLayerNodeIds: result.dirtyLayerNodeIds,
     actions: result.actions,
@@ -1722,6 +1758,7 @@ function invokeWindowMaximizeRequest(
     invoked: true,
     dirty: result.dirty,
     dirtyWindowIds: result.dirtyWindowIds,
+    dirtyManagedWindowIds: result.dirtyManagedWindowIds,
     dirtyWindowNodeIds: result.dirtyWindowNodeIds,
     dirtyLayerNodeIds: result.dirtyLayerNodeIds,
     actions: result.actions,
@@ -1751,6 +1788,7 @@ function invokeWindowMinimizeRequest(
     invoked: true,
     dirty: result.dirty,
     dirtyWindowIds: result.dirtyWindowIds,
+    dirtyManagedWindowIds: result.dirtyManagedWindowIds,
     dirtyWindowNodeIds: result.dirtyWindowNodeIds,
     dirtyLayerNodeIds: result.dirtyLayerNodeIds,
     actions: result.actions,
@@ -1780,6 +1818,7 @@ function invokeWindowActivateRequest(
     invoked: true,
     dirty: result.dirty,
     dirtyWindowIds: result.dirtyWindowIds,
+    dirtyManagedWindowIds: result.dirtyManagedWindowIds,
     dirtyWindowNodeIds: result.dirtyWindowNodeIds,
     dirtyLayerNodeIds: result.dirtyLayerNodeIds,
     actions: result.actions,
@@ -1818,6 +1857,7 @@ async function invokePointerMoveAsync(
     invoked: true,
     dirty: result.dirty,
     dirtyWindowIds: result.dirtyWindowIds,
+    dirtyManagedWindowIds: result.dirtyManagedWindowIds,
     dirtyWindowNodeIds: result.dirtyWindowNodeIds,
     dirtyLayerNodeIds: result.dirtyLayerNodeIds,
     actions: result.actions,
@@ -1891,7 +1931,7 @@ function startClose(
   const actions = entry.pendingActions.splice(0, entry.pendingActions.length);
   return {
     invoked: true,
-    serialized: reevaluated.serialized,
+    serialized: reevaluated?.serialized,
     transform: entry.cache.lastTransform,
     managedWindow: entry.cache.lastManagedWindow,
     windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
@@ -1929,8 +1969,14 @@ function invokeHandler(
     };
   }
 
-  const dirtyNodeIds = takeDirtyWindowNodeIds(windowId);
-  const reevaluated = entry.cache.reevaluate(dirtyNodeIds);
+  const managedWindowOnly = isManagedWindowOnlyDirty(windowId);
+  const dirtyNodeIds = managedWindowOnly ? [] : takeDirtyWindowNodeIds(windowId);
+  const reevaluated = managedWindowOnly
+    ? undefined
+    : entry.cache.reevaluate(dirtyNodeIds);
+  if (managedWindowOnly) {
+    entry.cache.reevaluateManagedWindow();
+  }
   const actions = entry.pendingActions.splice(0, entry.pendingActions.length);
   if (process.env.SHOJI_SSD_HANDLER_DEBUG) {
     console.debug(
@@ -1939,19 +1985,21 @@ function invokeHandler(
         windowId,
         handlerId,
         dirtyNodeIds,
-        nodeCount: countSerializedNodes(reevaluated.serialized),
-        topLevel: summarizeSerializedChildren(reevaluated.serialized),
+        managedWindowOnly,
+        nodeCount: reevaluated ? countSerializedNodes(reevaluated.serialized) : 0,
+        topLevel: reevaluated ? summarizeSerializedChildren(reevaluated.serialized) : null,
       }),
     );
   }
 
   return {
     invoked: true,
-    serialized: reevaluated.serialized,
+    serialized: reevaluated?.serialized,
     transform: entry.cache.lastTransform,
     managedWindow: entry.cache.lastManagedWindow,
     windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
     dirtyWindowIds: [windowId],
+    dirtyManagedWindowIds: managedWindowOnly ? [windowId] : undefined,
     dirtyWindowNodeIds: { [windowId]: dirtyNodeIds },
     actions,
     nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
