@@ -21,7 +21,15 @@ import {
     read,
 } from "shoji_wm";
 import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
-import { HybridWindowManager, OPEN_ANIMATION, TITLEBAR_HEIGHT, WINDOW_BORDER_PX, WINDOW_STATE_MINIMIZED, WINDOW_STATE_RECT } from "./window-manager";
+import {
+    HybridWindowManager,
+    OPEN_ANIMATION,
+    TITLEBAR_HEIGHT,
+    WINDOW_BORDER_PX,
+    WINDOW_STATE_MINIMIZED,
+    WINDOW_STATE_RECT,
+    WINDOW_STATE_WORKSPACE_VISIBLE,
+} from "./window-manager";
 
 const NOCTALIA_SHELL_PATH = "/home/bea4dev/Documents/development/noctalia-shell-shojiwm";
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
@@ -50,6 +58,21 @@ WINDOW_MANAGER.key.bind("screenshot", "Super+P", () => {
 });
 WINDOW_MANAGER.key.bind("screenshot-freeze", "Super+Ctrl+P", () => {
     WINDOW_MANAGER.process.spawn({ command: "hyprshot -m region --freeze --raw | swappy -f -" });
+});
+WINDOW_MANAGER.key.bind("toggle-tiling-mode", "Super+S", () => {
+    HYBRID_WINDOW_MANAGER.toggleCurrentWorkspaceTiling();
+});
+WINDOW_MANAGER.key.bind("tile-focus-left", "Super+Ctrl+Left", () => {
+    HYBRID_WINDOW_MANAGER.focusTile(-1);
+});
+WINDOW_MANAGER.key.bind("tile-focus-right", "Super+Ctrl+Right", () => {
+    HYBRID_WINDOW_MANAGER.focusTile(1);
+});
+WINDOW_MANAGER.key.bind("workspace-prev", "Super+Ctrl+Up", () => {
+    HYBRID_WINDOW_MANAGER.switchWorkspace(-1);
+});
+WINDOW_MANAGER.key.bind("workspace-next", "Super+Ctrl+Down", () => {
+    HYBRID_WINDOW_MANAGER.switchWorkspace(1);
 });
 
 WINDOW_MANAGER.output.applyDisplayConfig((display) => {
@@ -136,7 +159,8 @@ function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
 
 WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
     const openVariable = window.animation.signal(OPEN_ANIMATION);
-    const opacity = openVariable;
+    const workspaceVisible = window.state[WINDOW_STATE_WORKSPACE_VISIBLE];
+    const opacity = computed(() => openVariable() * (workspaceVisible() ? 1 : 0));
     const translateY = openVariable(variable => (1 - variable) * 200);
     const rect = computed(() => {
         const base = window.state[WINDOW_STATE_RECT]();
@@ -150,6 +174,7 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
     });
     const forceRectSize = computed(() => window.isResizable() && !window.isTransient());
     const minimized = window.state[WINDOW_STATE_MINIMIZED];
+    const inactive = computed(() => minimized() || !workspaceVisible());
 
     const borderColor = window.isFocused(focused => focused ? "#d7ba7d" : "#4f5666");
     const titlebarBackground = window.isFocused(focused => focused ? "#1f243080" : "#2a2f3a80");
@@ -251,8 +276,8 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
             rect={rect}
             zIndex={HYBRID_WINDOW_MANAGER.getWindowZIndex(window)}
             forceRectSize={forceRectSize}
-            idle={minimized}
-            interactive={minimized(value => !value)}
+            idle={inactive}
+            interactive={inactive(value => !value)}
             opacity={opacity}
         >
             <WindowBorder

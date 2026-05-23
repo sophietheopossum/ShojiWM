@@ -1050,6 +1050,11 @@ fn render_surface(
             output_geo.size.h,
         ));
     }
+    let windows_top_to_bottom_for_output: Vec<_> = state
+        .windows_for_output_top_to_bottom(&output)
+        .into_iter()
+        .cloned()
+        .collect();
     let captured_blink_damage = {
         let window_source_damage_snapshot = state.window_source_damage.clone();
         let ShojiWM {
@@ -1114,30 +1119,7 @@ fn render_surface(
         let pointer_pos = seat.get_pointer().unwrap().current_location();
         let output_geo = space.output_geometry(&output).unwrap();
         let scale = Scale::from(output.current_scale().fractional_scale());
-        let mut indexed_windows_top_to_bottom: Vec<_> = space
-            .elements_for_output(&output)
-            .cloned()
-            .enumerate()
-            .collect();
-        indexed_windows_top_to_bottom.sort_by(|(left_index, left), (right_index, right)| {
-            let left_z = window_decorations
-                .get(left)
-                .filter(|decoration| decoration.managed_window.managed)
-                .and_then(|decoration| decoration.managed_window.z_index)
-                .unwrap_or(0);
-            let right_z = window_decorations
-                .get(right)
-                .filter(|decoration| decoration.managed_window.managed)
-                .and_then(|decoration| decoration.managed_window.z_index)
-                .unwrap_or(0);
-            right_z
-                .cmp(&left_z)
-                .then_with(|| right_index.cmp(left_index))
-        });
-        let windows_top_to_bottom: Vec<_> = indexed_windows_top_to_bottom
-            .into_iter()
-            .map(|(_, window)| window)
-            .collect();
+        let windows_top_to_bottom = windows_top_to_bottom_for_output;
         let all_windows: Vec<_> = space.elements().cloned().collect();
         let window_count = all_windows.len();
         let closing_snapshots = closing_window_snapshots

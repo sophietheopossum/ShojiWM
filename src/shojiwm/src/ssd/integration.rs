@@ -1149,6 +1149,7 @@ impl ShojiWM {
                 primary_output_name.as_deref(),
                 target_output_name,
                 force_async_asset_refresh,
+                force_output_animation_reevaluate,
             ) {
                 continue;
             }
@@ -4979,8 +4980,9 @@ fn should_process_window_for_refresh(
     primary_output_name: Option<&str>,
     target_output_name: Option<&str>,
     force_async_asset_refresh: bool,
+    force_output_animation_reevaluate: bool,
 ) -> bool {
-    if force_async_asset_refresh {
+    if force_async_asset_refresh || force_output_animation_reevaluate {
         return true;
     }
 
@@ -5046,15 +5048,24 @@ mod tests {
             Some("eDP-1"),
             Some("DP-4"),
             true,
+            false,
         ));
         assert!(!should_process_window_for_refresh(
             Some("eDP-1"),
             Some("DP-4"),
             false,
+            false,
+        ));
+        assert!(should_process_window_for_refresh(
+            Some("eDP-1"),
+            Some("DP-4"),
+            false,
+            true,
         ));
         assert!(should_process_window_for_refresh(
             Some("DP-4"),
             Some("DP-4"),
+            false,
             false,
         ));
     }

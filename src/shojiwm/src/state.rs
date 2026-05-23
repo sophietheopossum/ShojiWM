@@ -321,6 +321,14 @@ pub struct ShojiWM {
     pub xwayland_refresh_override_mhz: Arc<AtomicI32>,
 }
 
+fn logical_rect_intersects_output(rect: LogicalRect, output_geo: Rectangle<i32, Logical>) -> bool {
+    let left = rect.x.max(output_geo.loc.x);
+    let top = rect.y.max(output_geo.loc.y);
+    let right = (rect.x + rect.width).min(output_geo.loc.x + output_geo.size.w);
+    let bottom = (rect.y + rect.height).min(output_geo.loc.y + output_geo.size.h);
+    right > left && bottom > top
+}
+
 impl ShojiWM {
     fn output_auto_sort_key(output_name: &str) -> (i32, String) {
         let rank = if output_name.starts_with("eDP")
@@ -2115,7 +2123,11 @@ impl ShojiWM {
     }
 
     pub fn windows_for_output_top_to_bottom<'a>(&'a self, output: &'a Output) -> Vec<&'a Window> {
-        self.sorted_windows_top_to_bottom(self.space.elements_for_output(output))
+        self.sorted_windows_top_to_bottom(
+            self.space
+                .elements()
+                .filter(|window| self.window_intersects_output(window, output)),
+        )
     }
 
     fn sorted_windows_top_to_bottom<'a, I>(&self, windows: I) -> Vec<&'a Window>
@@ -2131,6 +2143,32 @@ impl ShojiWM {
                 .then_with(|| right_index.cmp(left_index))
         });
         indexed.into_iter().map(|(_, window)| window).collect()
+    }
+
+    fn window_intersects_output(&self, window: &Window, output: &Output) -> bool {
+        let Some(output_geo) = self.space.output_geometry(output) else {
+            return false;
+        };
+
+        if let Some(decoration) = self
+            .window_decorations
+            .get(window)
+            .filter(|decoration| decoration.managed_window.managed)
+        {
+            let rect =
+                transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
+            return logical_rect_intersects_output(rect, output_geo);
+        }
+
+        let Some(location) = self.space.element_location(window) else {
+            return false;
+        };
+        let bbox = window.bbox();
+        let rect = Rectangle::<i32, Logical>::new(
+            Point::from((location.x + bbox.loc.x, location.y + bbox.loc.y)),
+            bbox.size,
+        );
+        rect.intersection(output_geo).is_some()
     }
 
     pub fn managed_window_z_index(&self, window: &Window) -> i32 {
