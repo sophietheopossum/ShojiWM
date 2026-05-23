@@ -106,3 +106,10 @@ export function playRectAnimation(
         easing,
     });
 }
+
+export function stopRectAnimation(
+    window: WaylandWindow,
+    windowRectState: WindowStateKey<ManagedWindowRect>,
+): void {
+    activeRectAnimations.get(window)?.get(windowRectState)?.();
+}

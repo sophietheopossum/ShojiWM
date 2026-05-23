@@ -21,7 +21,7 @@ import {
     read,
 } from "shoji_wm";
 import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
-import { HybridWindowManager, OPEN_ANIMATION, WINDOW_STATE_MINIMIZED, WINDOW_STATE_RECT } from "./window-manager";
+import { HybridWindowManager, OPEN_ANIMATION, TITLEBAR_HEIGHT, WINDOW_BORDER_PX, WINDOW_STATE_MINIMIZED, WINDOW_STATE_RECT } from "./window-manager";
 
 const NOCTALIA_SHELL_PATH = "/home/bea4dev/Documents/development/noctalia-shell-shojiwm";
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
@@ -123,9 +123,6 @@ WINDOW_MANAGER.event.onWindowMinimizeRequest((event) => {
 WINDOW_MANAGER.event.onWindowActivateRequest((event) => {
     HYBRID_WINDOW_MANAGER.onWindowActivateRequest(event);
 });
-
-const WINDOW_BORDER_PX = 2;
-const TITLEBAR_HEIGHT = 30;
 
 function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
     const client = window.position;

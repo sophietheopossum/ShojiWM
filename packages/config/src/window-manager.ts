@@ -1,5 +1,6 @@
 import { animationVariable, createWindowStack, createWindowState, cubicBezier, read, seconds, WINDOW_MANAGER, type PointerMoveEvent, type ReadonlySignal, type WaylandWindow, type WindowActivateRequestEvent, type WindowMaximizeRequestEvent, type WindowMinimizeRequestEvent, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect } from "shoji_wm";
 import type { ManagedWindowRect, WindowSizeConstraints } from "shoji_wm/types";
+import { playRectAnimation, stopRectAnimation } from "./window-animation";
 
 export const WINDOW_STATE_RECT = createWindowState<ManagedWindowRect>("rect", {
     default: (window) => window.rect,
@@ -14,14 +15,21 @@ export const WINDOW_STATE_MAXIMIZED = createWindowState<boolean>("maximized", {
     default: false,
 });
 
-const OPEN_CLOSE_ANIMATION_DURATION = seconds(1.0);
+const OPEN_CLOSE_ANIMATION_DURATION = seconds(0.5);
+const WINDOW_MANAGEMENT_ANIMATION_DURATION = seconds(0.5);
+const UNMAXIMIZE_GRAB_ANIMATION_DURATION = 90;
+const WINDOW_MANAGEMENT_EASING = cubicBezier(0.1, 1.1, 0.1, 1.1);
+const WINDOW_CLOSE_EASING = cubicBezier(0.3, -0.3, 0, 1);
 export const OPEN_ANIMATION = animationVariable("window.open");
+export const WINDOW_BORDER_PX = 2;
+export const TITLEBAR_HEIGHT = 30;
 
 export class HybridWindowManager {
     private readonly workspaces = new Map<number, Workspace>();
     private readonly windowStack = createWindowStack();
     private readonly naturalRootRect: (rect: WaylandWindow) => ManagedWindowRect;
     private currentMonitor: string;
+    private isGrabbing = false;
 
     public constructor(naturalRootRect: (rect: WaylandWindow) => ManagedWindowRect) {
         this.currentMonitor = "";
@@ -42,7 +50,7 @@ export class HybridWindowManager {
         window.animation.start(OPEN_ANIMATION, {
             duration: OPEN_CLOSE_ANIMATION_DURATION,
             to: 1,
-            easing: cubicBezier(0.1, 0.93, 0.1, 0.93)
+            easing: WINDOW_MANAGEMENT_EASING,
         });
     }
 
@@ -53,13 +61,19 @@ export class HybridWindowManager {
         } else {
             window.state[WINDOW_STATE_RECT].set(this.naturalRootRect(window));
         }
+
+        if (window.isMaximized()) {
+            window.state[WINDOW_STATE_RESTORE_RECT].set(this.initialRestoreRectForMaximizedWindow(window));
+            window.state[WINDOW_STATE_RECT].set(this.maximizedRectForWindow(window));
+            window.state[WINDOW_STATE_MAXIMIZED].set(true);
+        }
     }
 
     public onStartClose(window: WaylandWindow) {
         window.animation.start(OPEN_ANIMATION, {
             duration: OPEN_CLOSE_ANIMATION_DURATION,
             to: 0,
-            easing: cubicBezier(0.1, 0.93, 0.1, 0.93)
+            easing: WINDOW_CLOSE_EASING,
         });
     }
 
@@ -77,21 +91,70 @@ export class HybridWindowManager {
     }
 
     public onWindowResize(event: WindowResizeEvent) {
+        stopRectAnimation(event.window, WINDOW_STATE_RECT);
         event.window.state[WINDOW_STATE_RECT].set(this.constrainResizeRect(event));
     }
 
     public onWindowMove(event: WindowMoveEvent) {
-        event.window.state[WINDOW_STATE_RECT].set(event.currentRect);
+        if (event.phase === "start") {
+            this.isGrabbing = true;
+        }
+
+        const window = event.window;
+        if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+            const restoreRect = window.state[WINDOW_STATE_RESTORE_RECT]() ?? event.currentRect;
+            const width = read(restoreRect.width);
+            const height = read(restoreRect.height);
+            const nextRect = this.restoreRectForMaximizedMove(event, width, height);
+            if (event.phase === "start") {
+                playRectAnimation(
+                    window,
+                    WINDOW_STATE_RECT,
+                    nextRect,
+                    WINDOW_MANAGEMENT_EASING,
+                    UNMAXIMIZE_GRAB_ANIMATION_DURATION,
+                );
+            } else {
+                stopRectAnimation(window, WINDOW_STATE_RECT);
+                window.state[WINDOW_STATE_RECT].set(nextRect);
+            }
+            window.state[WINDOW_STATE_RESTORE_RECT].set(nextRect);
+
+            if (event.phase === "end") {
+                this.isGrabbing = false;
+                window.unmaximize();
+            } else if (event.phase === "cancel") {
+                this.isGrabbing = false;
+            }
+            return;
+        }
+
+        stopRectAnimation(window, WINDOW_STATE_RECT);
+        window.state[WINDOW_STATE_RECT].set(event.currentRect);
+
+        if (event.phase === "end" || event.phase === "cancel") {
+            this.isGrabbing = false;
+        }
     }
 
     public onWindowMaximizeRequest(event: WindowMaximizeRequestEvent) {
+        if (this.isGrabbing) {
+            return;
+        }
+
         const window = event.window;
         window.state[WINDOW_STATE_MINIMIZED].set(false);
 
         if (!event.maximized) {
             const restoreRect = window.state[WINDOW_STATE_RESTORE_RECT]();
             if (restoreRect) {
-                window.state[WINDOW_STATE_RECT].set(restoreRect);
+                playRectAnimation(
+                    window,
+                    WINDOW_STATE_RECT,
+                    restoreRect,
+                    WINDOW_MANAGEMENT_EASING,
+                    WINDOW_MANAGEMENT_ANIMATION_DURATION,
+                );
             }
             window.state[WINDOW_STATE_RESTORE_RECT].set(null);
             window.state[WINDOW_STATE_MAXIMIZED].set(false);
@@ -99,13 +162,25 @@ export class HybridWindowManager {
         }
 
         if (!window.state[WINDOW_STATE_MAXIMIZED]()) {
-            window.state[WINDOW_STATE_RESTORE_RECT].set(window.state[WINDOW_STATE_RECT]());
+            const currentRect = window.state[WINDOW_STATE_RECT]();
+            const currentWidth = read(currentRect.width);
+            const currentHeight = read(currentRect.height);
+            if (currentWidth > 1 && currentHeight > 1) {
+                window.state[WINDOW_STATE_RESTORE_RECT].set(currentRect);
+            }
         }
-        window.state[WINDOW_STATE_RECT].set(this.maximizedRectForWindow(window));
+        playRectAnimation(
+            window,
+            WINDOW_STATE_RECT,
+            this.maximizedRectForWindow(window),
+            WINDOW_MANAGEMENT_EASING,
+            WINDOW_MANAGEMENT_ANIMATION_DURATION,
+        );
         window.state[WINDOW_STATE_MAXIMIZED].set(true);
     }
 
     public onWindowMinimizeRequest(event: WindowMinimizeRequestEvent) {
+        stopRectAnimation(event.window, WINDOW_STATE_RECT);
         event.window.state[WINDOW_STATE_MINIMIZED].set(event.minimized);
     }
 
@@ -198,6 +273,37 @@ export class HybridWindowManager {
             };
         }
         return rect;
+    }
+
+    private initialRestoreRectForMaximizedWindow(window: WaylandWindow): ManagedWindowRect {
+        const maximizedRect = this.maximizedRectForWindow(window);
+        const width = Math.max(1, read(maximizedRect.width) * 0.7);
+        const height = Math.max(1, read(maximizedRect.height) * 0.7);
+        return {
+            x: read(maximizedRect.x) + (read(maximizedRect.width) - width) / 2,
+            y: read(maximizedRect.y) + (read(maximizedRect.height) - height) / 2,
+            width,
+            height,
+        };
+    }
+
+    private restoreRectForMaximizedMove(
+        event: WindowMoveEvent,
+        width: number,
+        height: number,
+    ): ManagedWindowRect {
+        const pointer = event.currentPointer;
+        const titlebarCenterY = WINDOW_BORDER_PX + TITLEBAR_HEIGHT / 2;
+        const pointerOffsetY = event.source === "modifier"
+            ? height / 2
+            : Math.min(height / 2, titlebarCenterY);
+
+        return {
+            x: pointer.x - width / 2,
+            y: pointer.y - pointerOffsetY,
+            width,
+            height,
+        };
     }
 
     private outputNameAt(x: number, y: number): string | undefined {
