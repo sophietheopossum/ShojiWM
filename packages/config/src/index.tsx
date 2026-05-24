@@ -94,6 +94,16 @@ WINDOW_MANAGER.output.applyDisplayConfig((display) => {
         position: "auto",
         scale: 1.25,
     };
+    display["eDP-2"] = {
+        resolution: "best",
+        position: "auto",
+        scale: 1.8,
+    };
+    display["HDMI-A-1"] = {
+        resolution: "best",
+        position: "auto",
+        scale: 1.5,
+    },
     display["DP-4"] = {
         resolution: "best",
         position: "auto",
