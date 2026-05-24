@@ -80,6 +80,26 @@ import {
   type WindowTransform,
 } from "shoji_wm";
 
+function debugSSD(message: string, details: Record<string, unknown> = {}): void {
+  if (!process.env.SHOJI_SSD_SUPPRESSION_DEBUG) {
+    return;
+  }
+  console.info(`ssd-suppression ${message}`, JSON.stringify(details));
+}
+
+function snapshotForDebug(snapshot: WaylandWindowSnapshot): Record<string, unknown> {
+  return {
+    windowId: snapshot.id,
+    title: snapshot.title,
+    appId: snapshot.appId,
+    position: snapshot.position,
+    rect: snapshot.rect,
+    focused: snapshot.isFocused,
+    resizable: snapshot.isResizable,
+    transient: snapshot.isTransient,
+  };
+}
+
 interface EvaluateRequest {
   requestId: number;
   kind: "evaluate";
@@ -555,6 +575,7 @@ const polls = new Map<number, RuntimePoll>();
 const dirtyWindowIds = new Set<string>();
 const dirtyLayerIds = new Set<string>();
 let runtimeDirty = false;
+let immediateDirtyPoll: PollHandle | null = null;
 let nextPollId = 1;
 let currentSchedulerTimeMs = 0;
 let lastAnimationAdvanceMs: number | undefined;
@@ -682,14 +703,17 @@ async function main() {
     markRuntimeDirty() {
       if (statsEnabled) stats.markRuntimeDirty++;
       runtimeDirty = true;
+      ensureImmediateDirtyPoll();
     },
     markWindowDirty(windowId) {
       if (statsEnabled) stats.markWindowDirty++;
       dirtyWindowIds.add(windowId);
+      ensureImmediateDirtyPoll();
     },
     markLayerDirty(layerId) {
       if (statsEnabled) stats.markLayerDirty++;
       dirtyLayerIds.add(layerId);
+      ensureImmediateDirtyPoll();
     },
   });
 
@@ -1146,26 +1170,47 @@ function evaluateSnapshot(
 } {
   const existing = cacheByWindowId.get(snapshot.id);
   if (!existing) {
+    debugSSD("runtime-evaluate-new-cache", {
+      nowMs,
+      snapshot: snapshotForDebug(snapshot),
+    });
     const entry = createRuntimeCacheEntry(snapshot, composition, RENDER_COMPOSITION_CONTEXT);
     cacheByWindowId.set(snapshot.id, entry);
     if (!openedWindowIds.has(snapshot.id)) {
       openedWindowIds.add(snapshot.id);
+      debugSSD("runtime-emit-open", {
+        windowId: snapshot.id,
+        phase: "evaluate-new-cache",
+      });
       events.emitOpen(entry.cache.window);
     }
     events.emitFocus(entry.cache.window, snapshot.isFocused);
     if (!firstCommittedWindowIds.has(snapshot.id)) {
       firstCommittedWindowIds.add(snapshot.id);
+      debugSSD("runtime-emit-first-commit", {
+        windowId: snapshot.id,
+        phase: "evaluate-new-cache",
+      });
       events.emitFirstCommit(entry.cache.window);
     }
     dirtyWindowIds.delete(snapshot.id);
+    const dirtyNodeIds = takeDirtyWindowNodeIds(snapshot.id);
+    debugSSD("runtime-evaluate-new-cache-reevaluate", {
+      windowId: snapshot.id,
+      dirtyNodeIds,
+    });
     return {
-      serialized: entry.cache.reevaluate(takeDirtyWindowNodeIds(snapshot.id)).serialized,
+      serialized: entry.cache.reevaluate(dirtyNodeIds).serialized,
       windowEffects: evaluateWindowEffects(effectConfig, snapshot.id, entry),
     };
   }
 
   const wasPreconfigured = existing.preconfigured;
   if (wasPreconfigured) {
+    debugSSD("runtime-evaluate-preconfigured-to-render", {
+      nowMs,
+      snapshot: snapshotForDebug(snapshot),
+    });
     existing.preconfigured = false;
     reanchorAnimationEntries(existing.animationEntries, nowMs);
     dirtyWindowIds.add(snapshot.id);
@@ -1180,6 +1225,11 @@ function evaluateSnapshot(
   }
   if (!firstCommittedWindowIds.has(snapshot.id)) {
     firstCommittedWindowIds.add(snapshot.id);
+    debugSSD("runtime-emit-first-commit", {
+      windowId: snapshot.id,
+      phase: "evaluate-existing",
+      wasPreconfigured,
+    });
     events.emitFirstCommit(existing.cache.window);
     dirtyWindowIds.add(snapshot.id);
   }
@@ -1187,12 +1237,22 @@ function evaluateSnapshot(
   const wasDirty = dirtyWindowIds.delete(snapshot.id);
   if (wasDirty) {
     const dirtyNodeIds = takeDirtyWindowNodeIds(snapshot.id);
+    debugSSD("runtime-evaluate-existing-dirty", {
+      windowId: snapshot.id,
+      wasPreconfigured,
+      dirtyNodeIds,
+    });
     return {
       serialized: existing.cache.reevaluate(dirtyNodeIds).serialized,
       windowEffects: evaluateWindowEffects(effectConfig, snapshot.id, existing),
     };
   }
 
+  debugSSD("runtime-evaluate-existing-clean", {
+    windowId: snapshot.id,
+    wasPreconfigured,
+    updated: updated !== undefined,
+  });
   return {
     serialized: updated?.serialized ?? existing.cache.lastSerialized,
     windowEffects: evaluateWindowEffects(effectConfig, snapshot.id, existing),
@@ -1217,19 +1277,39 @@ function evaluatePreconfigure(
   // compositor timestamp, preventing open animations from appearing halfway through.
   let entry = cacheByWindowId.get(snapshot.id);
   if (!entry) {
+    debugSSD("runtime-preconfigure-new-cache", {
+      snapshot: snapshotForDebug(snapshot),
+    });
     entry = createRuntimeCacheEntry(snapshot, composition, PRECONFIGURE_COMPOSITION_CONTEXT);
     cacheByWindowId.set(snapshot.id, entry);
     if (!openedWindowIds.has(snapshot.id)) {
       openedWindowIds.add(snapshot.id);
+      debugSSD("runtime-emit-open", {
+        windowId: snapshot.id,
+        phase: "preconfigure-new-cache",
+      });
       events.emitOpen(entry.cache.window);
     }
     if (!initialConfiguredWindowIds.has(snapshot.id)) {
       initialConfiguredWindowIds.add(snapshot.id);
+      debugSSD("runtime-emit-initial-configure", {
+        windowId: snapshot.id,
+        phase: "preconfigure-new-cache",
+      });
       events.emitInitialConfigure(entry.cache.window);
     }
     events.emitFocus(entry.cache.window, snapshot.isFocused);
-    entry.cache.reevaluate(takeDirtyWindowNodeIds(snapshot.id));
+    const dirtyNodeIds = takeDirtyWindowNodeIds(snapshot.id);
+    debugSSD("runtime-preconfigure-reevaluate", {
+      windowId: snapshot.id,
+      dirtyNodeIds,
+      phase: "new-cache",
+    });
+    entry.cache.reevaluate(dirtyNodeIds);
   } else {
+    debugSSD("runtime-preconfigure-existing-cache", {
+      snapshot: snapshotForDebug(snapshot),
+    });
     entry.cache.setContext(PRECONFIGURE_COMPOSITION_CONTEXT);
     const focusChanged = entry.latestSnapshot.isFocused !== snapshot.isFocused;
     entry.latestSnapshot = snapshot;
@@ -1239,12 +1319,26 @@ function evaluatePreconfigure(
     }
     if (!initialConfiguredWindowIds.has(snapshot.id)) {
       initialConfiguredWindowIds.add(snapshot.id);
+      debugSSD("runtime-emit-initial-configure", {
+        windowId: snapshot.id,
+        phase: "preconfigure-existing-cache",
+      });
       events.emitInitialConfigure(entry.cache.window);
     }
-    entry.cache.reevaluate(takeDirtyWindowNodeIds(snapshot.id));
+    const dirtyNodeIds = takeDirtyWindowNodeIds(snapshot.id);
+    debugSSD("runtime-preconfigure-reevaluate", {
+      windowId: snapshot.id,
+      dirtyNodeIds,
+      phase: "existing-cache",
+    });
+    entry.cache.reevaluate(dirtyNodeIds);
   }
 
   entry.preconfigured = true;
+  debugSSD("runtime-preconfigure-result", {
+    windowId: snapshot.id,
+    managedWindow: entry.cache.lastManagedWindow,
+  });
   return {
     serialized: entry.cache.lastSerialized,
     transform: entry.cache.lastTransform,
@@ -1541,6 +1635,24 @@ function registerPoll(
   return handle;
 }
 
+function ensureImmediateDirtyPoll(): void {
+  if (hasActiveAnimations()) {
+    return;
+  }
+  if (immediateDirtyPoll && !immediateDirtyPoll.cancelled) {
+    return;
+  }
+  immediateDirtyPoll = registerPoll(
+    1,
+    (handle) => {
+      handle.cancel();
+      immediateDirtyPoll = null;
+    },
+    "none",
+  );
+  debugSSD("runtime-immediate-dirty-poll-scheduled");
+}
+
 function processSchedulerTick(nowMs: number): {
   dirty: boolean;
   dirtyWindowIds: string[];
@@ -1614,6 +1726,20 @@ function collectRuntimeMutationState(): {
   const actions = drainPendingActions();
   const dirty = runtimeDirty || nextDirtyWindowIds.length > 0 || nextDirtyLayerIds.length > 0;
   runtimeDirty = false;
+  if (dirty) {
+    debugSSD("runtime-collect-dirty", {
+      dirtyWindowIds: nextDirtyWindowIds,
+      dirtyLayerIds: nextDirtyLayerIds,
+      dirtyManagedWindowIds,
+      dirtyWindowNodeIds,
+      dirtyLayerNodeIds,
+      actions: actions.map((action) => ({
+        windowId: action.windowId,
+        action: action.action,
+      })),
+      nextPollInMs,
+    });
+  }
 
   return {
     dirty,

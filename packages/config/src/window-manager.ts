@@ -1,4 +1,4 @@
-import { animationVariable, createWindowStack, createWindowState, cubicBezier, effect, read, seconds, WINDOW_MANAGER, type PointerMoveEvent, type ReadonlySignal, type WaylandWindow, type WindowActivateRequestEvent, type WindowMaximizeRequestEvent, type WindowMinimizeRequestEvent, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect, type WindowStateKey } from "shoji_wm";
+import { animationVariable, createManagedPoll, createWindowStack, createWindowState, cubicBezier, effect, read, seconds, WINDOW_MANAGER, type PointerMoveEvent, type PollHandle, type ReadonlySignal, type WaylandWindow, type WindowActivateRequestEvent, type WindowMaximizeRequestEvent, type WindowMinimizeRequestEvent, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect, type WindowStateKey } from "shoji_wm";
 import type { ManagedWindowRect, WindowSizeConstraints } from "shoji_wm/types";
 import { playRectAnimation, stopRectAnimation } from "./window-animation";
 
@@ -46,6 +46,34 @@ const TILE_GAP = 12;
 const TILE_MARGIN = 12;
 const TILE_WIDTH_RATIO = 0.5;
 const TILE_MIN_WIDTH = 240;
+const MANAGED_WINDOW_ONLY_REBUILD_SUPPRESSION = {
+    allowManagedWindowOnly: true,
+    onViolation: "fallback-last",
+} as const;
+const MANAGED_WINDOW_ONLY_ANIMATION = {
+    suppressSSDRebuild: true,
+} as const;
+interface LayoutOptions {
+    suppressSSDRebuild?: boolean;
+}
+
+function debugSSD(message: string, details: Record<string, unknown> = {}) {
+    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+    if (!env?.SHOJI_SSD_SUPPRESSION_DEBUG) {
+        return;
+    }
+    console.info(`ssd-suppression ${message}`, JSON.stringify(details));
+}
+
+function rectForDebug(rect: ManagedWindowRect) {
+    return {
+        x: read(rect.x),
+        y: read(rect.y),
+        width: read(rect.width),
+        height: read(rect.height),
+    };
+}
+
 export const OPEN_ANIMATION = animationVariable("window.open");
 export const WINDOW_BORDER_PX = 2;
 export const TITLEBAR_HEIGHT = 30;
@@ -81,6 +109,13 @@ export class HybridWindowManager {
     }
 
     public onOpen(window: WaylandWindow) {
+        debugSSD("wm-on-open", {
+            windowId: window.id,
+            title: window.title.peek(),
+            appId: window.appId.peek(),
+            rect: rectForDebug(window.rect),
+            position: { ...window.position },
+        });
         window.focus();
         this.windowStack.add(window);
 
@@ -94,6 +129,15 @@ export class HybridWindowManager {
 
     public onFirstCommit(window: WaylandWindow) {
         const workspace = this.getCurrentWorkspace();
+        debugSSD("wm-on-first-commit", {
+            windowId: window.id,
+            title: window.title.peek(),
+            appId: window.appId.peek(),
+            workspace: workspace ? `${workspace.monitor}:${workspace.index}` : null,
+            tiled: workspace?.isTiled ?? false,
+            rect: rectForDebug(window.rect),
+            position: { ...window.position },
+        });
         if (workspace) {
             workspace.addWindow(window);
             this.syncWorkspaceVisibility();
@@ -323,19 +367,23 @@ export class HybridWindowManager {
     }
 
     public toggleCurrentWorkspaceTiling() {
-        const workspace = this.getCurrentWorkspace();
-        if (!workspace) {
-            return;
-        }
-        workspace.setTiled(!workspace.isTiled);
+        withManagedWindowOnlySSDRebuildSuppressed(() => {
+            const workspace = this.getCurrentWorkspace();
+            if (!workspace) {
+                return;
+            }
+            workspace.setTiled(!workspace.isTiled);
+        });
     }
 
     public focusTile(direction: -1 | 1) {
-        const workspace = this.getCurrentWorkspace();
-        if (!workspace?.isTiled) {
-            return;
-        }
-        workspace.focusRelative(direction);
+        withManagedWindowOnlySSDRebuildSuppressed(() => {
+            const workspace = this.getCurrentWorkspace();
+            if (!workspace?.isTiled) {
+                return;
+            }
+            workspace.focusRelative(direction);
+        });
     }
 
     public closeFocusedWindow() {
@@ -349,49 +397,51 @@ export class HybridWindowManager {
     }
 
     public switchWorkspace(direction: -1 | 1) {
-        this.syncWorkspaces();
-        const monitor = this.currentMonitor || WINDOW_MANAGER.output.list.at(0);
-        if (!monitor) {
-            return;
-        }
-
-        const currentIndex = this.activeWorkspaceByMonitor.get(monitor) ?? 1;
-        const nextIndex = Math.max(1, currentIndex + direction);
-        if (nextIndex === currentIndex) {
-            return;
-        }
-
-        const fromWorkspace = this.ensureWorkspace(monitor, currentIndex);
-        const toWorkspace = this.ensureWorkspace(monitor, nextIndex);
-        const distance = this.workspaceTransitionDistance(monitor);
-
-        this.activeWorkspaceByMonitor.set(monitor, nextIndex);
-        this.currentMonitor = monitor;
-
-        for (const workspace of this.workspaces.values()) {
-            if (workspace === fromWorkspace || workspace === toWorkspace) {
-                continue;
+        withManagedWindowOnlySSDRebuildSuppressed(() => {
+            this.syncWorkspaces();
+            const monitor = this.currentMonitor || WINDOW_MANAGER.output.list.at(0);
+            if (!monitor) {
+                return;
             }
-            workspace.setVisible(workspace.isActive());
-        }
 
-        fromWorkspace.animateWorkspaceTransition({
-            fromOffsetY: 0,
-            toOffsetY: -direction * distance,
-            fromOpacity: 1,
-            toOpacity: 0,
-            visibleAfter: false,
+            const currentIndex = this.activeWorkspaceByMonitor.get(monitor) ?? 1;
+            const nextIndex = Math.max(1, currentIndex + direction);
+            if (nextIndex === currentIndex) {
+                return;
+            }
+
+            const fromWorkspace = this.ensureWorkspace(monitor, currentIndex);
+            const toWorkspace = this.ensureWorkspace(monitor, nextIndex);
+            const distance = this.workspaceTransitionDistance(monitor);
+
+            this.activeWorkspaceByMonitor.set(monitor, nextIndex);
+            this.currentMonitor = monitor;
+
+            for (const workspace of this.workspaces.values()) {
+                if (workspace === fromWorkspace || workspace === toWorkspace) {
+                    continue;
+                }
+                workspace.setVisible(workspace.isActive());
+            }
+
+            fromWorkspace.animateWorkspaceTransition({
+                fromOffsetY: 0,
+                toOffsetY: -direction * distance,
+                fromOpacity: 1,
+                toOpacity: 0,
+                visibleAfter: false,
+            });
+            toWorkspace.prepareWorkspaceTransition(direction * distance, 0);
+            toWorkspace.applyLayout();
+            toWorkspace.animateWorkspaceTransition({
+                fromOffsetY: direction * distance,
+                toOffsetY: 0,
+                fromOpacity: 0,
+                toOpacity: 1,
+                visibleAfter: true,
+            });
+            toWorkspace.focusActiveWindow();
         });
-        toWorkspace.prepareWorkspaceTransition(direction * distance, 0);
-        toWorkspace.applyLayout();
-        toWorkspace.animateWorkspaceTransition({
-            fromOffsetY: direction * distance,
-            toOffsetY: 0,
-            fromOpacity: 0,
-            toOpacity: 1,
-            visibleAfter: true,
-        });
-        toWorkspace.focusActiveWindow();
     }
 
     public getCurrentWorkspace(): Workspace | undefined {
@@ -669,6 +719,16 @@ export class Workspace {
         if (this.windows.map(window => window.id).includes(window.id)) {
             return;
         }
+        debugSSD("workspace-add-window", {
+            windowId: window.id,
+            monitor: this.monitor,
+            workspace: this.index,
+            tiled: this.isTiled,
+            beforeCount: this.windows.length,
+            openRunning: window.animation.running(OPEN_ANIMATION),
+            rect: rectForDebug(window.rect),
+            position: { ...window.position },
+        });
         this.windows.push(window);
         this.activeWindowId = window.id;
         const visible = this.isActive();
@@ -683,10 +743,17 @@ export class Workspace {
 
         if (this.isTiled) {
             const initialRect = this.centeredFloatingRect(window);
+            debugSSD("workspace-add-window-tiled-initial-layout", {
+                windowId: window.id,
+                monitor: this.monitor,
+                workspace: this.index,
+                initialRect: rectForDebug(initialRect),
+                suppressSSDRebuild: false,
+            });
             window.state[WINDOW_STATE_FLOATING_RECT].set(initialRect);
             this.setTileWidthFromRect(window, initialRect, true);
             this.scrollToWindow(window);
-            this.applyLayout();
+            this.applyLayout({ suppressSSDRebuild: false });
         } else {
             window.state[WINDOW_STATE_RECT].set(this.centeredFloatingRect(window));
         }
@@ -786,6 +853,7 @@ export class Workspace {
                 options.toOffsetY,
                 WINDOW_MANAGEMENT_EASING,
                 WORKSPACE_SWITCH_ANIMATION_DURATION,
+                MANAGED_WINDOW_ONLY_ANIMATION,
             );
             playNumberStateAnimation(
                 window,
@@ -794,6 +862,7 @@ export class Workspace {
                 options.toOpacity,
                 WINDOW_MANAGEMENT_EASING,
                 WORKSPACE_SWITCH_ANIMATION_DURATION,
+                MANAGED_WINDOW_ONLY_ANIMATION,
             );
         }
 
@@ -801,7 +870,9 @@ export class Workspace {
             if (this.visibilityAnimationToken !== token) {
                 return;
             }
-            this.setVisible(options.visibleAfter);
+            withManagedWindowOnlySSDRebuildSuppressed(() => {
+                this.setVisible(options.visibleAfter);
+            });
         }, WORKSPACE_SWITCH_ANIMATION_DURATION + 32);
     }
 
@@ -835,7 +906,14 @@ export class Workspace {
         for (const window of this.windows) {
             const rect = window.state[WINDOW_STATE_FLOATING_RECT]();
             if (rect) {
-                playRectAnimation(window, WINDOW_STATE_RECT, rect, WINDOW_MANAGEMENT_EASING, WINDOW_MANAGEMENT_ANIMATION_DURATION);
+                playRectAnimation(
+                    window,
+                    WINDOW_STATE_RECT,
+                    rect,
+                    WINDOW_MANAGEMENT_EASING,
+                    WINDOW_MANAGEMENT_ANIMATION_DURATION,
+                    MANAGED_WINDOW_ONLY_ANIMATION,
+                );
             }
             window.state[WINDOW_STATE_FLOATING_RECT].set(null);
             this.syncWindowVisibleOutputs(window);
@@ -846,7 +924,7 @@ export class Workspace {
         }
     }
 
-    public applyLayout() {
+    public applyLayout(options: LayoutOptions = {}) {
         if (!this.isTiled) {
             return;
         }
@@ -865,6 +943,23 @@ export class Workspace {
 
         const viewportRect = this.tileViewportRect();
         const tileHeight = read(viewportRect.height);
+        const suppressSSDRebuild = options.suppressSSDRebuild ?? true;
+        const canSuppress = this.canSuppressLayoutSSDRebuild(tileable);
+        const animationOptions = suppressSSDRebuild && canSuppress
+            ? MANAGED_WINDOW_ONLY_ANIMATION
+            : undefined;
+        debugSSD("workspace-apply-layout", {
+            monitor: this.monitor,
+            workspace: this.index,
+            windowIds: tileable.map((window) => window.id),
+            activeWindowId: this.activeWindowId,
+            draggingWindowId: this.draggingWindowId,
+            scrollOffset: this.scrollOffset,
+            requestedSuppress: suppressSSDRebuild,
+            canSuppress,
+            usingSuppression: animationOptions !== undefined,
+            viewportRect: rectForDebug(viewportRect),
+        });
         let nextX = read(viewportRect.x) - this.scrollOffset;
 
         tileable.forEach((window, index) => {
@@ -878,12 +973,23 @@ export class Workspace {
                     height: tileHeight,
                 };
             if (window.id !== this.draggingWindowId) {
+                debugSSD("workspace-apply-layout-window", {
+                    windowId: window.id,
+                    monitor: this.monitor,
+                    workspace: this.index,
+                    index,
+                    openRunning: window.animation.running(OPEN_ANIMATION),
+                    maximized: window.state[WINDOW_STATE_MAXIMIZED](),
+                    targetRect: rectForDebug(rect),
+                    usingSuppression: animationOptions !== undefined,
+                });
                 playRectAnimation(
                     window,
                     WINDOW_STATE_RECT,
                     rect,
                     WINDOW_MANAGEMENT_EASING,
                     TILE_ANIMATION_DURATION,
+                    animationOptions,
                 );
             }
             nextX += tileWidth + (index === tileable.length - 1 ? 0 : TILE_GAP);
@@ -1018,6 +1124,14 @@ export class Workspace {
                 ? [this.monitor]
                 : null,
         );
+    }
+
+    private canSuppressLayoutSSDRebuild(tileable: WaylandWindow[]): boolean {
+        // Opening windows may still be building decoration structure, labels,
+        // icons, and shader inputs. SSD rebuild suppression is global, so using
+        // it for existing windows' layout animation would also hide those
+        // initial decoration updates until an unrelated interaction occurs.
+        return !tileable.some((window) => window.animation.running(OPEN_ANIMATION));
     }
 
     private tileableWindows(): WaylandWindow[] {
@@ -1275,8 +1389,19 @@ function insetRect(
     };
 }
 
+function withManagedWindowOnlySSDRebuildSuppressed<T>(callback: () => T): T {
+    return WINDOW_MANAGER.runtime.withSSDRebuildSuppressed(
+        MANAGED_WINDOW_ONLY_REBUILD_SUPPRESSION,
+        callback,
+    );
+}
+
 const numberAnimationVariableByStateKey = new Map<symbol, ReturnType<typeof animationVariable>>();
 const activeNumberAnimations = new WeakMap<WaylandWindow, Map<symbol, () => void>>();
+
+interface NumberStateAnimationOptions {
+    suppressSSDRebuild?: boolean;
+}
 
 function getNumberAnimationVariable(stateKey: symbol): ReturnType<typeof animationVariable> {
     let variable = numberAnimationVariableByStateKey.get(stateKey);
@@ -1294,6 +1419,7 @@ function playNumberStateAnimation(
     to: number,
     easing: (progress: number) => number,
     duration: number,
+    options: NumberStateAnimationOptions = {},
 ): void {
     const variable = getNumberAnimationVariable(stateKey);
     let perWindow = activeNumberAnimations.get(window);
@@ -1303,6 +1429,19 @@ function playNumberStateAnimation(
     }
 
     perWindow.get(stateKey)?.();
+    const suppression = options.suppressSSDRebuild
+        ? WINDOW_MANAGER.runtime.suppressSSDRebuild({
+            ...MANAGED_WINDOW_ONLY_REBUILD_SUPPRESSION,
+            windowIds: [window.id],
+        })
+        : null;
+    debugSSD("number-animation-start", {
+        windowId: window.id,
+        stateKey: stateKey.description,
+        from,
+        to,
+        suppressSSDRebuild: options.suppressSSDRebuild === true,
+    });
     window.state[stateKey].set(from);
     window.animation.set(variable, 0);
 
@@ -1311,14 +1450,31 @@ function playNumberStateAnimation(
         window.state[stateKey].set(from + (to - from) * progress());
     });
 
+    let poll: PollHandle | null = null;
     const teardown = () => {
-        clearTimeout(timer);
+        poll?.cancel();
+        poll = null;
         dispose();
+        suppression?.release();
+        debugSSD("number-animation-teardown", {
+            windowId: window.id,
+            stateKey: stateKey.description,
+            current: window.state[stateKey](),
+        });
         if (perWindow!.get(stateKey) === teardown) {
             perWindow!.delete(stateKey);
         }
     };
-    const timer = setTimeout(teardown, duration + 32);
+    poll = createManagedPoll(
+        1,
+        () => {
+            if (window.animation.running(variable)) {
+                return;
+            }
+            teardown();
+        },
+        "none",
+    );
     perWindow.set(stateKey, teardown);
 
     window.animation.start(variable, {

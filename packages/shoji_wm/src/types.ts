@@ -753,9 +753,58 @@ export interface WindowManagerDefinition {
   process: ProcessController;
   key: KeyBindingController;
   pointer: PointerController;
+  runtime: RuntimeController;
   window: WindowManagerWindowController;
   layer: LayerController;
   display?: DisplayConfig;
+}
+
+export type SSDRebuildSuppressionViolationPolicy =
+  | "warn"
+  | "fallback-last"
+  | "fallback"
+  | "throw"
+  | "suppress-unsafe";
+
+export interface SSDRebuildSuppressionOptions {
+  /**
+   * Allow updates that only affect <ManagedWindow> props to stay on the managed-window fast path.
+   * Decoration tree/style/text/image/shader updates are treated as violations.
+   */
+  allowManagedWindowOnly?: boolean;
+  /**
+   * Restrict suppression to specific windows. Decoration updates for other
+   * windows fall back to the normal rebuild path instead of being delayed by
+   * an unrelated animation.
+   */
+  windowIds?: readonly string[];
+  /**
+   * Restrict suppression to specific layers. Decoration updates for other
+   * layers fall back to the normal rebuild path.
+   */
+  layerIds?: readonly string[];
+  /**
+   * - "fallback": warn and fall back to the normal SSD rebuild path for the violating update.
+   * - "warn": warn and keep suppressing SSD rebuilds, applying only managed-window updates.
+   * - "fallback-last": warn, keep suppressing during the active scope, then rebuild
+   *   windows/layers that had decoration-affecting changes when the scope is released.
+   * - "throw": throw immediately when a decoration-affecting update is detected.
+   * - "suppress-unsafe": keep suppressing without warning. Intended for tightly-scoped
+   *   benchmarking or code that can prove only <ManagedWindow> props change.
+   */
+  onViolation?: SSDRebuildSuppressionViolationPolicy;
+}
+
+export interface SSDRebuildSuppressionHandle {
+  release(): void;
+}
+
+export interface RuntimeController {
+  suppressSSDRebuild(options?: SSDRebuildSuppressionOptions): SSDRebuildSuppressionHandle;
+  withSSDRebuildSuppressed<T>(
+    options: SSDRebuildSuppressionOptions | undefined,
+    callback: () => T,
+  ): T;
 }
 
 export type DisplayModePreference =

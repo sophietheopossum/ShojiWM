@@ -102,8 +102,16 @@ import type {
   KeyBindingOptions,
   KeyBindingEventPhase,
   PointerController,
+  RuntimeController,
+  SSDRebuildSuppressionHandle,
+  SSDRebuildSuppressionOptions,
+  SSDRebuildSuppressionViolationPolicy,
 } from "./types";
 import { createWindowManagerEventController } from "./events";
+import {
+  suppressSSDRebuild,
+  withSSDRebuildSuppressed,
+} from "./runtime-hooks";
 import {
   KEY_BINDING_CONTROLLER,
   beginKeyBindingRegistration,
@@ -324,11 +332,13 @@ export {
   markLayerDirty,
   markRuntimeDirty,
   markWindowDirty,
+  suppressSSDRebuild,
   takeDirtyLayerNodeIds,
   takeManagedWindowOnlyDirty,
   takeDirtyWindowNodeIds,
   trackSignalRead,
   trackSignalWrite,
+  withSSDRebuildSuppressed,
 } from "./runtime-hooks";
 
 export type {
@@ -434,6 +444,10 @@ export type {
   KeyBindingOptions,
   KeyBindingEventPhase,
   PointerController,
+  RuntimeController,
+  SSDRebuildSuppressionHandle,
+  SSDRebuildSuppressionOptions,
+  SSDRebuildSuppressionViolationPolicy,
 } from "./types";
 export { CompositionSerializationError, serializeCompositionTree } from "./serialize";
 
@@ -473,6 +487,11 @@ const WINDOW_CONTROLLER: WindowManagerWindowController = {
   },
 };
 
+const RUNTIME_CONTROLLER: RuntimeController = {
+  suppressSSDRebuild,
+  withSSDRebuildSuppressed,
+};
+
 /**
  * Placeholder namespace for future WM-level entrypoints.
  */
@@ -485,6 +504,7 @@ export const WINDOW_MANAGER: WindowManagerDefinition = {
   process: PROCESS_CONTROLLER,
   key: KEY_BINDING_CONTROLLER,
   pointer: POINTER_CONTROLLER,
+  runtime: RUNTIME_CONTROLLER,
   window: WINDOW_CONTROLLER,
   layer: LAYER_CONTROLLER,
 };

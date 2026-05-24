@@ -2,9 +2,12 @@ import {
     type AnimationVariable,
     type WaylandWindow,
     type WindowStateKey,
+    WINDOW_MANAGER,
     animationVariable,
     computed,
+    createManagedPoll,
     read,
+    type PollHandle,
 } from "shoji_wm";
 import type { ManagedWindowRect } from "shoji_wm/types";
 
@@ -17,6 +20,26 @@ const rectAnimationVariableByStateKey = new Map<symbol, AnimationVariable>();
 // Per-(window, state-key) teardown for the currently-running rect animation.
 // WeakMap on the window so entries vanish when the window does.
 const activeRectAnimations = new WeakMap<WaylandWindow, Map<symbol, () => void>>();
+export interface RectAnimationOptions {
+    suppressSSDRebuild?: boolean;
+}
+
+function debugSSD(message: string, details: Record<string, unknown> = {}) {
+    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+    if (!env?.SHOJI_SSD_SUPPRESSION_DEBUG) {
+        return;
+    }
+    console.info(`ssd-suppression ${message}`, JSON.stringify(details));
+}
+
+function snapshotRectForDebug(rect: ManagedWindowRect) {
+    return {
+        x: read(rect.x),
+        y: read(rect.y),
+        width: read(rect.width),
+        height: read(rect.height),
+    };
+}
 
 function getRectAnimationVariable(stateKey: symbol): AnimationVariable {
     let variable = rectAnimationVariableByStateKey.get(stateKey);
@@ -48,6 +71,7 @@ export function playRectAnimation(
     to: ManagedWindowRect,
     easing: (progress: number) => number,
     duration: number,
+    options: RectAnimationOptions = {},
 ): void {
     const variable = getRectAnimationVariable(windowRectState);
 
@@ -56,7 +80,15 @@ export function playRectAnimation(
         perWindow = new Map();
         activeRectAnimations.set(window, perWindow);
     }
-    perWindow.get(windowRectState)?.();
+    const previous = perWindow.get(windowRectState);
+    previous?.();
+    const suppression = options.suppressSSDRebuild
+        ? WINDOW_MANAGER.runtime.suppressSSDRebuild({
+            allowManagedWindowOnly: true,
+            onViolation: "fallback-last",
+            windowIds: [window.id],
+        })
+        : null;
 
     const currentRect = window.state[windowRectState]();
     const from = {
@@ -71,6 +103,14 @@ export function playRectAnimation(
         width: read(to.width),
         height: read(to.height),
     };
+    debugSSD("rect-animation-start", {
+        windowId: window.id,
+        stateKey: windowRectState.description,
+        hadPrevious: previous !== undefined,
+        suppressSSDRebuild: options.suppressSSDRebuild === true,
+        from,
+        target,
+    });
 
     // Snap the variable to 0 *before* subscribing so the first effect tick
     // writes the from-rect verbatim. Without this, a prior animation that
@@ -85,14 +125,30 @@ export function playRectAnimation(
         height: computed(() => from.height + (target.height - from.height) * progress()),
     });
 
+    let poll: PollHandle | null = null;
     const teardown = () => {
-        clearTimeout(timer);
+        poll?.cancel();
+        poll = null;
+        suppression?.release();
+        debugSSD("rect-animation-teardown", {
+            windowId: window.id,
+            stateKey: windowRectState.description,
+            current: snapshotRectForDebug(window.state[windowRectState]()),
+        });
         if (perWindow!.get(windowRectState) === teardown) {
             perWindow!.delete(windowRectState);
         }
     };
-    // Small slack to let the final frame land before we unsubscribe.
-    const timer = setTimeout(teardown, duration + 32);
+    poll = createManagedPoll(
+        1,
+        () => {
+            if (window.animation.running(variable)) {
+                return;
+            }
+            teardown();
+        },
+        "none",
+    );
     perWindow.set(windowRectState, teardown);
 
     window.animation.start(variable, {
