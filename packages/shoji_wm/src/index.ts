@@ -111,6 +111,7 @@ import type {
   KeyBindingEventPhase,
   PointerController,
   RuntimeController,
+  DebugController,
   SSDRebuildSuppressionHandle,
   SSDRebuildSuppressionOptions,
   SSDRebuildSuppressionViolationPolicy,
@@ -134,6 +135,7 @@ import {
   takePendingPointerConfig,
 } from "./pointer";
 import { OUTPUT_CONTROLLER } from "./output";
+import { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
 import { LAYER_CONTROLLER, updateLayerSnapshots } from "./layer";
 import {
   PROCESS_CONTROLLER,
@@ -249,6 +251,7 @@ export {
   updateOutputState,
 } from "./output";
 export { LAYER_CONTROLLER, updateLayerSnapshots } from "./layer";
+export { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
 export {
   KEY_BINDING_CONTROLLER,
   beginKeyBindingRegistration,
@@ -454,6 +457,7 @@ export type {
   KeyBindingEventPhase,
   PointerController,
   RuntimeController,
+  DebugController,
   SSDRebuildSuppressionHandle,
   SSDRebuildSuppressionOptions,
   SSDRebuildSuppressionViolationPolicy,
@@ -516,6 +520,7 @@ export const WINDOW_MANAGER: WindowManagerDefinition = {
   runtime: RUNTIME_CONTROLLER,
   window: WINDOW_CONTROLLER,
   layer: LAYER_CONTROLLER,
+  debug: DEBUG_CONTROLLER,
 };
 
 export function windowAction(

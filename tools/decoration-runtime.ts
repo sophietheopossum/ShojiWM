@@ -41,6 +41,7 @@ import {
   installRuntimeHooks,
   enterWindowDependencyScope,
   invokeKeyBinding,
+  takePendingDebugConfig,
   takePendingDisplayConfig,
   takePendingKeyBindingConfig,
   takePendingPointerConfig,
@@ -309,6 +310,7 @@ interface SchedulerTickSuccess {
   eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
+  debugConfig?: { fpsCounter: boolean };
 }
 
 interface WindowClosedSuccess {
@@ -917,6 +919,7 @@ async function main() {
           const eventConfig = pendingEventConfigPayload(events);
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
+          const debugConfig = takePendingDebugConfig();
           await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
@@ -934,6 +937,7 @@ async function main() {
             eventConfig,
             processConfig,
             processActions,
+            debugConfig,
           });
         } else if (request.kind === "windowClosed") {
           closeWindow(events, request.windowId);

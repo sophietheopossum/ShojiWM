@@ -4,6 +4,7 @@ pub mod clipped_surface;
 pub mod damage;
 pub mod damage_blink;
 pub mod decoration;
+pub mod fps_counter;
 pub mod icon;
 pub mod image_copy_capture_render;
 pub mod rounded;

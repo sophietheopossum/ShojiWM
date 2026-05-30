@@ -85,6 +85,12 @@ WINDOW_MANAGER.key.bind("workspace-next", "Super+Ctrl+Down", () => {
     HYBRID_WINDOW_MANAGER.switchWorkspace(1);
 });
 
+let fpsCounter = false;
+WINDOW_MANAGER.key.bind("fps", "Super+Shift+F", () => {
+    fpsCounter = !fpsCounter;
+    WINDOW_MANAGER.debug.fpsCounter = fpsCounter;
+})
+
 WINDOW_MANAGER.output.applyDisplayConfig((display) => {
     display["eDP-1"] = {
         resolution: "best",
@@ -100,12 +106,12 @@ WINDOW_MANAGER.output.applyDisplayConfig((display) => {
         resolution: "best",
         position: "auto",
         scale: 1.5,
-    },
-        display["DP-4"] = {
-            resolution: "best",
-            position: "auto",
-            scale: 1.5,
-        };
+    };
+    display["DP-4"] = {
+        resolution: "best",
+        position: "auto",
+        scale: 1.5,
+    };
     display["DP-2"] = {
         resolution: "best",
         position: "auto",

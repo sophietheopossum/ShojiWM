@@ -1172,6 +1172,7 @@ fn render_surface(
             transform_snapshot_window_ids,
             screencopy_state,
             image_copy_capture_pending,
+            fps_counter,
             ..
         } = state;
 
@@ -3845,10 +3846,21 @@ fn render_surface(
             presented,
         );
 
+        // FPS overlay: pre-rasterized glyph buffers composed at the top-left
+        // of this output. Built before render_frame so it sits in the
+        // top-most position (smithay treats index 0 as front-most).
+        let fps_overlay_elements: Vec<TtyRenderElements> = fps_counter
+            .render_elements(&mut backend.renderer, output.name().as_str(), output_geo, scale)
+            .into_iter()
+            .map(TtyRenderElements::Text)
+            .collect();
+
         // After capture has run against the cursor / content slices by
         // reference, move them into a single element list for the DRM render.
-        let mut elements: Vec<TtyRenderElements> =
-            Vec::with_capacity(cursor_elements.len() + content_for_capture.len());
+        let mut elements: Vec<TtyRenderElements> = Vec::with_capacity(
+            fps_overlay_elements.len() + cursor_elements.len() + content_for_capture.len(),
+        );
+        elements.extend(fps_overlay_elements);
         elements.extend(cursor_elements);
         elements.extend(content_for_capture);
 
@@ -3858,6 +3870,7 @@ fn render_surface(
             CLEAR_COLOR,
             TTY_FRAME_FLAGS,
         )?;
+        fps_counter.record_present(output.name().as_str());
         if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some()
             && (frame_transform_snapshot_window_count > 0 || frame_had_transform_snapshot_damage)
         {

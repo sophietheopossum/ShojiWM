@@ -808,7 +808,23 @@ export interface WindowManagerDefinition {
   runtime: RuntimeController;
   window: WindowManagerWindowController;
   layer: LayerController;
+  debug: DebugController;
   display?: DisplayConfig;
+}
+
+/**
+ * Debug knobs. Toggles here are surfaced into compositor overlays / logs and
+ * do not affect production behavior. Read-write properties take effect on the
+ * next scheduler tick.
+ */
+export interface DebugController {
+  /**
+   * When true, the compositor draws a small FPS / frame-time overlay in the
+   * top-left corner of every output. The overlay uses a pre-rasterized glyph
+   * atlas (built once on first enable) so toggling it has near-zero per-frame
+   * cost beyond the composite of ~6-8 glyph buffers.
+   */
+  fpsCounter: boolean;
 }
 
 export type SSDRebuildSuppressionViolationPolicy =

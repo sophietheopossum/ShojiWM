@@ -327,6 +327,7 @@ pub struct ShojiWM {
     pub default_decoration_mode: DecorationMode,
     pub display_config: DisplayConfig,
     pub clock: Clock<Monotonic>,
+    pub fps_counter: crate::backend::fps_counter::FpsCounter,
 
     pub xwayland_shell_state: XWaylandShellState,
     pub xwayland: Option<XWayland>,
@@ -816,6 +817,7 @@ impl ShojiWM {
             default_decoration_mode: DecorationMode::ServerSide,
             display_config: DisplayConfig::from_env(),
             clock,
+            fps_counter: crate::backend::fps_counter::FpsCounter::new(),
 
             xwayland_shell_state,
             xwayland: None,
@@ -1230,6 +1232,7 @@ impl ShojiWM {
                 state.consume_runtime_pointer_config(tick.pointer_config);
                 state.consume_runtime_event_config(tick.event_config);
                 state.consume_runtime_process_config(tick.process_config);
+                state.consume_runtime_debug_config(tick.debug_config);
                 if !tick.process_actions.is_empty() {
                     state.apply_runtime_process_actions(tick.process_actions);
                 }
@@ -1545,6 +1548,15 @@ impl ShojiWM {
     pub fn consume_runtime_event_config(&mut self, update: Option<RuntimeEventConfigUpdate>) {
         if let Some(update) = update {
             self.apply_runtime_event_config_update(update);
+        }
+    }
+
+    pub fn consume_runtime_debug_config(
+        &mut self,
+        update: Option<crate::runtime_debug::RuntimeDebugConfigUpdate>,
+    ) {
+        if let Some(update) = update {
+            self.fps_counter.set_enabled(update.fps_counter);
         }
     }
 

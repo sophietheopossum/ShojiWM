@@ -25,6 +25,7 @@ use super::{
 };
 use crate::{
     config::RuntimeDisplayConfigUpdate,
+    runtime_debug::RuntimeDebugConfigUpdate,
     runtime_key_binding::RuntimeKeyBindingConfigUpdate,
     runtime_pointer::RuntimePointerConfigUpdate,
     runtime_process::{RuntimeProcessAction, RuntimeProcessConfigUpdate},
@@ -237,6 +238,7 @@ pub struct DecorationSchedulerTick {
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
+    pub debug_config: Option<RuntimeDebugConfigUpdate>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -797,6 +799,8 @@ struct RuntimeSchedulerResponse {
     process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
     process_actions: Option<Vec<RuntimeProcessAction>>,
+    #[serde(rename = "debugConfig")]
+    debug_config: Option<RuntimeDebugConfigUpdate>,
     error: Option<String>,
 }
 
@@ -2078,6 +2082,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
+            debug_config: response.debug_config,
         })
     }
 

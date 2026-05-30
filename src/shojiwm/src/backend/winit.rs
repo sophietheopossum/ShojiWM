@@ -989,6 +989,16 @@ pub fn init_winit(
                         content_elements.extend(scene_elements);
 
                         let mut elements: Vec<WinitRenderElements> = Vec::new();
+                        // FPS overlay sits in front of everything else; build
+                        // before the blink + content layers so it ends up at
+                        // index 0 (top-most under smithay's element model).
+                        let fps_overlay_elements: Vec<WinitRenderElements> = state
+                            .fps_counter
+                            .render_elements(renderer, output.name().as_str(), output_geo, scale)
+                            .into_iter()
+                            .map(WinitRenderElements::Text)
+                            .collect();
+                        elements.extend(fps_overlay_elements);
                         elements.extend(
                             damage_blink::elements_for_output(
                                 state.damage_blink_rects_for_output(&output),
@@ -1069,6 +1079,7 @@ pub fn init_winit(
                                 }
 
                                 state.post_repaint(&output, frame_time, &render_output_result.states);
+                                state.fps_counter.record_present(output.name().as_str());
                             }
                         }
                     }
