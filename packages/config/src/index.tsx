@@ -350,10 +350,16 @@ const CloseButton = ({ window }: { window: WaylandWindow }) => {
 const MaximizeButton = ({ window }: { window: WaylandWindow }) => {
     const [hover, setHover] = useState(false);
 
-    const borderColor = hover(hover => hover ? "#00000000" : "#00BFFF30");
+    const borderColor = computed(() => {
+        if (!window.isResizable()) {
+            return "#00000000";
+        }
+        return hover() ? "#00000000" : "#00BFFF30";
+    });
+    const shouldHover = computed(() => hover() && window.isResizable());
 
     var icon: CompositionRenderable | null = null;
-    if (hover()) {
+    if (shouldHover()) {
         const src = window.isMaximized(maximized => {
             return maximized ? "./assets/minimize-2.svg" : "./assets/maximize-2.svg";
         });
@@ -384,6 +390,10 @@ const MaximizeButton = ({ window }: { window: WaylandWindow }) => {
                     border: { px: 1, color: borderColor },
                 }}
                 onClick={() => {
+                    if (!read(window.isResizable)) {
+                        return;
+                    }
+
                     if (read(window.isMaximized)) {
                         window.unmaximize();
                     } else {

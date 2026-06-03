@@ -84,6 +84,11 @@ export class HybridWindowManager {
         workspace: Workspace;
         lastWorkspaceSwitchAt: number;
     } | null = null;
+    private floatingDrag: {
+        window: WaylandWindow;
+        workspace: Workspace;
+        lastWorkspaceSwitchAt: number;
+    } | null = null;
 
     public constructor(naturalRootRect: (rect: WaylandWindow) => ManagedWindowRect) {
         this.currentMonitor = "";
@@ -107,6 +112,7 @@ export class HybridWindowManager {
         const workspace = this.getCurrentWorkspace();
         if (workspace) {
             workspace.addWindow(window);
+            this.raiseTiledWorkspaceFloatingWindows(workspace);
             this.syncWorkspaceVisibility();
         } else {
             window.state[WINDOW_STATE_RECT].set(this.naturalRootRect(window));
@@ -150,6 +156,7 @@ export class HybridWindowManager {
             const workspace = this.findWorkspaceForWindow(window);
             if (workspace?.isTiled && workspace.isActive()) {
                 workspace.focusWindow(window);
+                this.raiseTiledWorkspaceFloatingWindows(workspace);
             }
         }
     }
@@ -162,17 +169,27 @@ export class HybridWindowManager {
         const workspace = this.findWorkspaceForWindow(event.window);
         if (workspace?.isTiled && workspace.shouldTile(event.window)) {
             workspace.resizeTile(event);
+            this.raiseTiledWorkspaceFloatingWindows(workspace);
             return;
         }
 
+        const nextRect = this.constrainResizeRect(event);
         stopRectAnimation(event.window, WINDOW_STATE_RECT);
-        event.window.state[WINDOW_STATE_RECT].set(this.constrainResizeRect(event));
+        event.window.state[WINDOW_STATE_RECT].set(nextRect);
+        workspace?.syncFloatingWindowRect(event.window, nextRect);
+        this.raiseTiledWorkspaceFloatingWindows(workspace);
     }
 
     public onWindowMove(event: WindowMoveEvent) {
         const workspace = this.findWorkspaceForWindow(event.window);
         if (workspace?.isTiled && workspace.shouldTile(event.window)) {
             this.onTileWindowMove(event, workspace);
+            this.raiseTiledWorkspaceFloatingWindows(workspace);
+            return;
+        }
+
+        if (workspace?.isTiled && !workspace.shouldTile(event.window)) {
+            this.onFloatingWindowMove(event, workspace);
             return;
         }
 
@@ -199,6 +216,7 @@ export class HybridWindowManager {
                 window.state[WINDOW_STATE_RECT].set(nextRect);
             }
             window.state[WINDOW_STATE_RESTORE_RECT].set(nextRect);
+            workspace?.syncFloatingWindowRect(window, nextRect);
 
             if (event.phase === "end") {
                 this.isGrabbing = false;
@@ -211,9 +229,78 @@ export class HybridWindowManager {
 
         stopRectAnimation(window, WINDOW_STATE_RECT);
         window.state[WINDOW_STATE_RECT].set(event.currentRect);
+        workspace?.syncFloatingWindowRect(window, event.currentRect);
 
         if (event.phase === "end" || event.phase === "cancel") {
             this.isGrabbing = false;
+        }
+        this.raiseTiledWorkspaceFloatingWindows(workspace);
+    }
+
+    private onFloatingWindowMove(event: WindowMoveEvent, workspace: Workspace) {
+        const window = event.window;
+        if (event.phase === "start" || !this.floatingDrag || this.floatingDrag.window.id !== window.id) {
+            this.isGrabbing = true;
+            this.floatingDrag = {
+                window,
+                workspace,
+                lastWorkspaceSwitchAt: event.timestamp,
+            };
+        }
+
+        const drag = this.floatingDrag;
+        if (!drag) {
+            return;
+        }
+
+        let nextRect: ManagedWindowRect = event.currentRect;
+        if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+            const restoreRect = window.state[WINDOW_STATE_RESTORE_RECT]() ?? event.currentRect;
+            const width = read(restoreRect.width);
+            const height = read(restoreRect.height);
+            nextRect = this.restoreRectForMaximizedMove(event, width, height);
+            window.state[WINDOW_STATE_RESTORE_RECT].set(nextRect);
+        }
+
+        if (window.state[WINDOW_STATE_MAXIMIZED]() && event.phase === "start") {
+            playRectAnimation(
+                window,
+                WINDOW_STATE_RECT,
+                nextRect,
+                WINDOW_MANAGEMENT_EASING,
+                UNMAXIMIZE_GRAB_ANIMATION_DURATION,
+            );
+        } else {
+            stopRectAnimation(window, WINDOW_STATE_RECT);
+            window.state[WINDOW_STATE_RECT].set(nextRect);
+        }
+
+        if (event.phase !== "cancel") {
+            const targetWorkspace = this.workspaceForFloatingDrag(event, drag);
+            if (targetWorkspace !== drag.workspace) {
+                drag.workspace.removeFloatingWindow(window);
+                drag.workspace.applyLayout();
+                targetWorkspace.adoptFloatingWindow(window, nextRect);
+                drag.workspace = targetWorkspace;
+                this.syncWorkspaceVisibility();
+                window.focus();
+            } else {
+                targetWorkspace.syncFloatingWindowRect(window, nextRect);
+            }
+
+            this.raiseTiledWorkspaceFloatingWindows(targetWorkspace);
+        }
+
+        if (event.phase === "end" || event.phase === "cancel") {
+            stopRectAnimation(window, WINDOW_STATE_RECT);
+            window.state[WINDOW_STATE_RECT].set(nextRect);
+            drag.workspace.syncFloatingWindowRect(window, nextRect);
+            this.raiseTiledWorkspaceFloatingWindows(drag.workspace);
+            this.floatingDrag = null;
+            this.isGrabbing = false;
+            if (event.phase === "end" && window.state[WINDOW_STATE_MAXIMIZED]()) {
+                window.unmaximize();
+            }
         }
     }
 
@@ -267,6 +354,7 @@ export class HybridWindowManager {
                 window.state[WINDOW_STATE_RESTORE_RECT].set(null);
                 window.state[WINDOW_STATE_MAXIMIZED].set(false);
                 workspace.applyLayout();
+                this.raiseTiledWorkspaceFloatingWindows(workspace);
                 return;
             }
 
@@ -274,6 +362,7 @@ export class HybridWindowManager {
             window.state[WINDOW_STATE_MAXIMIZED].set(true);
             workspace.focusWindow(window);
             workspace.applyLayout();
+            this.raiseTiledWorkspaceFloatingWindows(workspace);
             window.focus();
             return;
         }
@@ -281,6 +370,7 @@ export class HybridWindowManager {
         if (!event.maximized) {
             const restoreRect = window.state[WINDOW_STATE_RESTORE_RECT]();
             if (restoreRect) {
+                workspace?.syncFloatingWindowRect(window, restoreRect);
                 playRectAnimation(
                     window,
                     WINDOW_STATE_RECT,
@@ -302,14 +392,17 @@ export class HybridWindowManager {
                 window.state[WINDOW_STATE_RESTORE_RECT].set(currentRect);
             }
         }
+        const maximizedRect = this.maximizedRectForWindow(window);
+        workspace?.syncFloatingWindowRect(window, maximizedRect);
         playRectAnimation(
             window,
             WINDOW_STATE_RECT,
-            this.maximizedRectForWindow(window),
+            maximizedRect,
             WINDOW_MANAGEMENT_EASING,
             WINDOW_MANAGEMENT_ANIMATION_DURATION,
         );
         window.state[WINDOW_STATE_MAXIMIZED].set(true);
+        this.raiseTiledWorkspaceFloatingWindows(workspace);
     }
 
     public onWindowMinimizeRequest(event: WindowMinimizeRequestEvent) {
@@ -318,6 +411,7 @@ export class HybridWindowManager {
         const workspace = this.findWorkspaceForWindow(event.window);
         if (workspace?.isTiled) {
             workspace.applyLayout();
+            this.raiseTiledWorkspaceFloatingWindows(workspace);
         }
     }
 
@@ -337,6 +431,7 @@ export class HybridWindowManager {
                 return;
             }
             workspace.setTiled(!workspace.isTiled);
+            this.raiseTiledWorkspaceFloatingWindows(workspace);
         });
     }
 
@@ -347,6 +442,7 @@ export class HybridWindowManager {
                 return;
             }
             workspace.focusRelative(direction);
+            this.raiseTiledWorkspaceFloatingWindows(workspace);
         });
     }
 
@@ -404,6 +500,8 @@ export class HybridWindowManager {
             visibleAfter: true,
         });
         toWorkspace.focusActiveWindow();
+        this.raiseTiledWorkspaceFloatingWindows(fromWorkspace);
+        this.raiseTiledWorkspaceFloatingWindows(toWorkspace);
     }
 
     public getCurrentWorkspace(): Workspace | undefined {
@@ -413,6 +511,20 @@ export class HybridWindowManager {
 
     public getWindowZIndex(window: WaylandWindow): ReadonlySignal<number> {
         return this.windowStack.zIndex(window);
+    }
+
+    private raiseTiledWorkspaceFloatingWindows(workspace: Workspace | undefined) {
+        if (!workspace?.isTiled) {
+            return;
+        }
+
+        const floating = workspace.floatingWindows()
+            .filter((window) => this.windowStack.has(window))
+            .sort((a, b) => this.windowStack.zIndexValue(a) - this.windowStack.zIndexValue(b));
+
+        for (const window of floating) {
+            this.windowStack.raise(window);
+        }
     }
 
     private syncWorkspaces() {
@@ -462,6 +574,7 @@ export class HybridWindowManager {
         this.syncWorkspaceVisibility();
         workspace.applyLayout();
         workspace.focusActiveWindow();
+        this.raiseTiledWorkspaceFloatingWindows(workspace);
     }
 
     private syncWorkspaceVisibility() {
@@ -480,6 +593,29 @@ export class HybridWindowManager {
     }
 
     private workspaceForTileDrag(event: WindowMoveEvent, drag: NonNullable<HybridWindowManager["tileDrag"]>): Workspace {
+        const monitor = event.outputName && WINDOW_MANAGER.output.list.includes(event.outputName)
+            ? event.outputName
+            : drag.workspace.monitor;
+        let index = this.activeWorkspaceByMonitor.get(monitor) ?? 1;
+        const edgeDirection = this.tileDragWorkspaceEdgeDirection(monitor, event.currentPointer.y);
+
+        if (
+            edgeDirection !== 0 &&
+            event.timestamp - drag.lastWorkspaceSwitchAt >= TILE_DRAG_WORKSPACE_SWITCH_INTERVAL_MS
+        ) {
+            const nextIndex = Math.max(1, index + edgeDirection);
+            if (nextIndex !== index) {
+                this.currentMonitor = monitor;
+                this.switchWorkspace(edgeDirection);
+                drag.lastWorkspaceSwitchAt = event.timestamp;
+                index = this.activeWorkspaceByMonitor.get(monitor) ?? nextIndex;
+            }
+        }
+
+        return this.ensureWorkspace(monitor, index);
+    }
+
+    private workspaceForFloatingDrag(event: WindowMoveEvent, drag: NonNullable<HybridWindowManager["floatingDrag"]>): Workspace {
         const monitor = event.outputName && WINDOW_MANAGER.output.list.includes(event.outputName)
             ? event.outputName
             : drag.workspace.monitor;
@@ -693,12 +829,16 @@ export class Workspace {
             return;
         }
 
-        if (this.isTiled) {
+        if (this.isTiled && this.shouldTile(window)) {
             const initialRect = this.centeredFloatingRect(window);
             window.state[WINDOW_STATE_FLOATING_RECT].set(initialRect);
             this.setTileWidthFromRect(window, initialRect, true);
             this.scrollToWindow(window);
             this.applyLayout({ suppressSSDRebuild: false });
+        } else if (this.isTiled) {
+            const initialRect = this.centeredFloatingRect(window);
+            window.state[WINDOW_STATE_FLOATING_RECT].set(this.viewportRectToFloatingContentRect(initialRect));
+            window.state[WINDOW_STATE_RECT].set(initialRect);
         } else {
             window.state[WINDOW_STATE_RECT].set(this.centeredFloatingRect(window));
         }
@@ -730,6 +870,17 @@ export class Workspace {
         }
         this.windows.splice(index, 1);
         this.draggingWindowId = null;
+    }
+
+    public removeFloatingWindow(window: WaylandWindow) {
+        const index = this.windows.findIndex((current) => current.id === window.id);
+        if (index < 0) {
+            return;
+        }
+        this.windows.splice(index, 1);
+        if (this.activeWindowId === window.id) {
+            this.activeWindowId = this.activeWindow(this.tileableWindows())?.id ?? null;
+        }
     }
 
     public hasWindow(window: WaylandWindow): boolean {
@@ -830,11 +981,14 @@ export class Workspace {
             : undefined;
         this.isTiled = tiled;
         if (tiled) {
+            this.scrollOffset = 0;
             for (const window of this.tileableWindows()) {
                 this.captureFloatingRect(window);
                 this.setTileWidthFromRect(window, window.state[WINDOW_STATE_FLOATING_RECT]() ?? window.state[WINDOW_STATE_RECT](), true);
             }
-            this.scrollOffset = 0;
+            for (const window of this.floatingWindows()) {
+                this.captureFloatingRect(window);
+            }
             const tileable = this.tileableWindows();
             const previousActiveWindow = this.activeWindow(tileable);
             this.activeWindowId = (focusedTileableWindow ?? previousActiveWindow ?? tileable.at(0))?.id ?? null;
@@ -849,10 +1003,13 @@ export class Workspace {
         for (const window of this.windows) {
             const rect = window.state[WINDOW_STATE_FLOATING_RECT]();
             if (rect) {
+                const viewportRect = this.shouldTile(window)
+                    ? rect
+                    : this.floatingContentRectToViewportRect(rect);
                 playRectAnimation(
                     window,
                     WINDOW_STATE_RECT,
-                    rect,
+                    viewportRect,
                     WINDOW_MANAGEMENT_EASING,
                     WINDOW_MANAGEMENT_ANIMATION_DURATION,
                     MANAGED_WINDOW_ONLY_ANIMATION,
@@ -873,8 +1030,15 @@ export class Workspace {
         }
 
         const tileable = this.tileableWindows();
+        const suppressSSDRebuild = options.suppressSSDRebuild ?? true;
+        const canSuppress = this.canSuppressLayoutSSDRebuild(tileable);
+        const animationOptions = suppressSSDRebuild && canSuppress
+            ? MANAGED_WINDOW_ONLY_ANIMATION
+            : undefined;
+
         if (tileable.length === 0) {
             this.activeWindowId = null;
+            this.applyFloatingLayout(animationOptions);
             return;
         }
 
@@ -886,11 +1050,6 @@ export class Workspace {
 
         const viewportRect = this.tileViewportRect();
         const tileHeight = read(viewportRect.height);
-        const suppressSSDRebuild = options.suppressSSDRebuild ?? true;
-        const canSuppress = this.canSuppressLayoutSSDRebuild(tileable);
-        const animationOptions = suppressSSDRebuild && canSuppress
-            ? MANAGED_WINDOW_ONLY_ANIMATION
-            : undefined;
         let nextX = read(viewportRect.x) - this.scrollOffset;
 
         tileable.forEach((window, index) => {
@@ -915,6 +1074,8 @@ export class Workspace {
             }
             nextX += tileWidth + (index === tileable.length - 1 ? 0 : TILE_GAP);
         });
+
+        this.applyFloatingLayout(animationOptions);
     }
 
     public resizeTile(event: WindowResizeEvent) {
@@ -966,6 +1127,18 @@ export class Workspace {
         window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
         window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
         window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(visible ? 1 : 0);
+        stopRectAnimation(window, WINDOW_STATE_RECT);
+        window.state[WINDOW_STATE_RECT].set(rect);
+    }
+
+    public adoptFloatingWindow(window: WaylandWindow, rect: ManagedWindowRect) {
+        if (!this.hasWindow(window)) {
+            this.windows.push(window);
+        }
+        const visible = this.isActive();
+        this.syncWindowVisibleOutputs(window);
+        resetWorkspaceVisualState(window, visible);
+        window.state[WINDOW_STATE_FLOATING_RECT].set(this.viewportRectToFloatingContentRect(rect));
         stopRectAnimation(window, WINDOW_STATE_RECT);
         window.state[WINDOW_STATE_RECT].set(rect);
     }
@@ -1063,6 +1236,13 @@ export class Workspace {
         return this.windows.find((window) => read(window.isFocused));
     }
 
+    public syncFloatingWindowRect(window: WaylandWindow, viewportRect: ManagedWindowRect) {
+        if (!this.isTiled || this.shouldTile(window)) {
+            return;
+        }
+        window.state[WINDOW_STATE_FLOATING_RECT].set(this.viewportRectToFloatingContentRect(viewportRect));
+    }
+
     private activeWindow(windows = this.windows): WaylandWindow | undefined {
         return windows.find((window) => window.id === this.activeWindowId);
     }
@@ -1111,7 +1291,29 @@ export class Workspace {
 
     private captureFloatingRect(window: WaylandWindow) {
         if (!window.state[WINDOW_STATE_FLOATING_RECT]()) {
-            window.state[WINDOW_STATE_FLOATING_RECT].set(window.state[WINDOW_STATE_RECT]());
+            const rect = this.isTiled
+                ? this.viewportRectToFloatingContentRect(window.state[WINDOW_STATE_RECT]())
+                : window.state[WINDOW_STATE_RECT]();
+            window.state[WINDOW_STATE_FLOATING_RECT].set(rect);
+        }
+    }
+
+    public floatingWindows(): WaylandWindow[] {
+        return this.windows.filter((window) => !this.shouldTile(window) && !window.state[WINDOW_STATE_MINIMIZED]());
+    }
+
+    private applyFloatingLayout(animationOptions: LayoutOptions | undefined) {
+        for (const window of this.floatingWindows()) {
+            const contentRect = window.state[WINDOW_STATE_FLOATING_RECT]() ?? this.viewportRectToFloatingContentRect(this.centeredFloatingRect(window));
+            window.state[WINDOW_STATE_FLOATING_RECT].set(contentRect);
+            playRectAnimation(
+                window,
+                WINDOW_STATE_RECT,
+                this.floatingContentRectToViewportRect(contentRect),
+                WINDOW_MANAGEMENT_EASING,
+                TILE_ANIMATION_DURATION,
+                animationOptions,
+            );
         }
     }
 
@@ -1133,6 +1335,24 @@ export class Workspace {
             y: logicalY + (logicalHeight - read(sizeRect.height)) / 2,
             width: read(sizeRect.width),
             height: read(sizeRect.height),
+        };
+    }
+
+    private viewportRectToFloatingContentRect(rect: ManagedWindowRect): ManagedWindowRect {
+        return {
+            x: read(rect.x) + this.scrollOffset,
+            y: read(rect.y),
+            width: read(rect.width),
+            height: read(rect.height),
+        };
+    }
+
+    private floatingContentRectToViewportRect(rect: ManagedWindowRect): ManagedWindowRect {
+        return {
+            x: read(rect.x) - this.scrollOffset,
+            y: read(rect.y),
+            width: read(rect.width),
+            height: read(rect.height),
         };
     }
 
@@ -1371,7 +1591,7 @@ function scheduleWorkspaceVisualAnimation(
     easing: EasingFunction,
     duration: number,
 ): void {
-    window.cancelAnimation(WORKSPACE_VISUAL_ANIMATION_CHANNEL);
+    cancelWorkspaceVisualAnimation(window);
     window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(toOffsetY);
     window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(toOpacity);
 
@@ -1395,4 +1615,17 @@ function scheduleWorkspaceVisualAnimation(
             mode: "override",
         },
     });
+}
+
+function resetWorkspaceVisualState(window: WaylandWindow, visible: boolean): void {
+    cancelWorkspaceVisualAnimation(window);
+    window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(visible);
+    window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
+    window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(visible ? 1 : 0);
+}
+
+function cancelWorkspaceVisualAnimation(window: WaylandWindow): void {
+    window.cancelAnimation(WORKSPACE_VISUAL_ANIMATION_CHANNEL);
+    window.cancelAnimation(WORKSPACE_VISUAL_RECT_ANIMATION_CHANNEL);
+    window.cancelAnimation(WORKSPACE_VISUAL_OPACITY_ANIMATION_CHANNEL);
 }
