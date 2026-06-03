@@ -37,37 +37,9 @@ const NOCTALIA_SHELL_PATH =
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
 const HOT_RELOAD_WINDOW_MANAGER_STATE = "config.hybrid-window-manager";
 
-function hotReloadDebugEnabled(): boolean {
-  const env = (globalThis as { process?: { env?: Record<string, string> } })
-    .process?.env;
-  const value = env?.SHOJI_HOT_RELOAD_DEBUG;
-  return value !== undefined && value !== "" && value !== "0";
-}
-
-function hotReloadDebug(
-  message: string,
-  details: Record<string, unknown> = {},
-): void {
-  if (!hotReloadDebugEnabled()) {
-    return;
-  }
-  console.info(`hot-reload ${message}`, JSON.stringify(details));
-}
-
 WINDOW_MANAGER.onDisable((event) => {
   if (event.isReloading) {
     const snapshot = HYBRID_WINDOW_MANAGER.snapshot();
-    hotReloadDebug("config-disable-persist", {
-      reason: event.reason,
-      workspaceCount: snapshot.workspaces.length,
-      workspaces: snapshot.workspaces.map((workspace) => ({
-        monitor: workspace.monitor,
-        index: workspace.index,
-        isTiled: workspace.isTiled,
-        activeWindowId: workspace.activeWindowId,
-        windowIds: workspace.windows.map((window) => window.id),
-      })),
-    });
     event.persist(HOT_RELOAD_WINDOW_MANAGER_STATE, snapshot);
   }
 });
@@ -77,18 +49,6 @@ WINDOW_MANAGER.onEnable((event) => {
     const snapshot = event.restore<
       ReturnType<typeof HYBRID_WINDOW_MANAGER.snapshot>
     >(HOT_RELOAD_WINDOW_MANAGER_STATE);
-    hotReloadDebug("config-enable-restore", {
-      reason: event.reason,
-      hasSnapshot: snapshot !== undefined,
-      workspaceCount: snapshot?.workspaces.length ?? 0,
-      workspaces: snapshot?.workspaces.map((workspace) => ({
-        monitor: workspace.monitor,
-        index: workspace.index,
-        isTiled: workspace.isTiled,
-        activeWindowId: workspace.activeWindowId,
-        windowIds: workspace.windows.map((window) => window.id),
-      })),
-    });
     if (snapshot) {
       HYBRID_WINDOW_MANAGER.restore(snapshot);
     }
