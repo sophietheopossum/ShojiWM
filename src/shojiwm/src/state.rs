@@ -1516,11 +1516,7 @@ impl ShojiWM {
             .max(0.1)
     }
 
-    fn runtime_output_logical_width_for_mode(
-        output: &Output,
-        mode: OutputMode,
-        scale: f64,
-    ) -> i32 {
+    fn runtime_output_logical_width_for_mode(output: &Output, mode: OutputMode, scale: f64) -> i32 {
         let physical_size = output.current_transform().transform_size(mode.size);
         ((physical_size.w as f64) / scale.max(0.1)).round().max(1.0) as i32
     }
@@ -1554,7 +1550,10 @@ impl ShojiWM {
                 .and_then(|config| config.resolution.as_ref())
                 .and_then(|preference| self.resolve_runtime_output_mode(output, preference));
             target_modes.insert(output.name(), target_mode.or_else(|| output.current_mode()));
-            target_scales.insert(output.name(), self.runtime_output_target_scale_value(output));
+            target_scales.insert(
+                output.name(),
+                self.runtime_output_target_scale_value(output),
+            );
         }
 
         let mut manual_positions = std::collections::BTreeMap::new();
@@ -1598,8 +1597,7 @@ impl ShojiWM {
                 && let Some(mode) = target_modes.get(&output_name).and_then(|mode| *mode)
             {
                 let scale = target_scales.get(&output_name).copied().unwrap_or(1.0);
-                auto_cursor_x +=
-                    Self::runtime_output_logical_width_for_mode(output, mode, scale);
+                auto_cursor_x += Self::runtime_output_logical_width_for_mode(output, mode, scale);
             }
         }
 
@@ -1614,9 +1612,7 @@ impl ShojiWM {
                 .runtime_output_configs
                 .get(&name)
                 .and_then(|config| config.scale)
-                .map(|_| {
-                    OutputScale::Fractional(target_scales.get(&name).copied().unwrap_or(1.0))
-                });
+                .map(|_| OutputScale::Fractional(target_scales.get(&name).copied().unwrap_or(1.0)));
 
             if let Some(mode) = target_mode {
                 let current_mode = output.current_mode();

@@ -1583,9 +1583,7 @@ impl ShojiWM {
         if hot_reload_debug_enabled() {
             info!(
                 window_id,
-                reset_live,
-                reset_closing,
-                "hot reload: reset managed animation state to static"
+                reset_live, reset_closing, "hot reload: reset managed animation state to static"
             );
         }
     }

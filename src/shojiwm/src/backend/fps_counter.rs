@@ -114,10 +114,7 @@ impl FpsCounter {
             return;
         }
         let now = Instant::now();
-        let state = self
-            .per_output
-            .entry(output_name.to_owned())
-            .or_default();
+        let state = self.per_output.entry(output_name.to_owned()).or_default();
         if let Some(last) = state.last_present_at {
             let delta_ms = now.duration_since(last).as_secs_f32() * 1000.0;
             // Ignore implausible intervals (long pauses, startup, etc.) so a
@@ -333,8 +330,9 @@ fn rasterize_glyph(
         None,
     );
 
-    let advance_logical =
-        ((glyph_w_px as f32) / ATLAS_RASTER_SCALE as f32).ceil().max(1.0) as i32;
+    let advance_logical = ((glyph_w_px as f32) / ATLAS_RASTER_SCALE as f32)
+        .ceil()
+        .max(1.0) as i32;
 
     Some(GlyphEntry {
         buffer,

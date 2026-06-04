@@ -496,11 +496,11 @@ pub fn device_added(
 
     let drm_loop_handle = loop_handle.clone();
     loop_handle.insert_source(drm_events, move |event, metadata, state| {
-            if let DrmEvent::VBlank(crtc) = event {
-                trace!(?node, ?crtc, "received drm vblank");
-                frame_finish(state, &drm_loop_handle, node, crtc, metadata);
-            }
-        })?;
+        if let DrmEvent::VBlank(crtc) = event {
+            trace!(?node, ?crtc, "received drm vblank");
+            frame_finish(state, &drm_loop_handle, node, crtc, metadata);
+        }
+    })?;
 
     for scan in backend
         .drm_scanner
