@@ -20,7 +20,8 @@ use smithay::{
         },
         egl::{EGLContext, EGLDisplay, context::ContextPriority},
         renderer::{
-            Bind, ExportMem, ImportDma, ImportEgl, ImportMemWl, Offscreen, Texture,
+            Bind, Color32F, ExportMem, ImportDma, ImportEgl, ImportMemWl, Offscreen, Renderer,
+            Texture,
             damage::OutputDamageTracker,
             element::{
                 AsRenderElements, Element, Id, Kind, RenderElement, RenderElementStates,
@@ -52,7 +53,7 @@ use smithay::{
     },
     render_elements,
     utils::{
-        Buffer, DeviceFd, IsAlive, Logical, Monotonic, Physical, Point, Rectangle, Scale,
+        Buffer, DeviceFd, IsAlive, Logical, Monotonic, Physical, Point, Rectangle, Scale, Size,
         Transform, user_data::UserDataMap,
     },
     wayland::{
@@ -881,6 +882,96 @@ render_elements! {
     RelocatedBackdrop=RelocateRenderElement<crate::backend::shader_effect::StableBackdropTextureElement>,
     TransformedBackdrop=RelocateRenderElement<RescaleRenderElement<RelocateRenderElement<crate::backend::shader_effect::StableBackdropTextureElement>>>,
     Cursor=PointerRenderElement<GlesRenderer>,
+}
+
+pub struct OutputCaptureMirror {
+    texture: GlesTexture,
+    damage_tracker: OutputDamageTracker,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    transform: Transform,
+}
+
+fn render_output_capture_mirror(
+    renderer: &mut GlesRenderer,
+    mirror: &mut Option<OutputCaptureMirror>,
+    output: &Output,
+    elements: &[TtyRenderElements],
+) -> Result<
+    Option<(TtyRenderElements, TtyRenderElements, RenderElementStates)>,
+    Box<dyn std::error::Error>,
+> {
+    let Some(mode) = output.current_mode() else {
+        return Ok(None);
+    };
+    let size = mode.size;
+    let scale: Scale<f64> = output.current_scale().fractional_scale().into();
+    let transform = output.current_transform();
+
+    let recreate = mirror.as_ref().is_none_or(|mirror| {
+        mirror.size != size || mirror.scale != scale || mirror.transform != transform
+    });
+    if recreate {
+        let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+        let texture =
+            Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Abgr8888, buffer_size)?;
+        *mirror = Some(OutputCaptureMirror {
+            texture,
+            damage_tracker: OutputDamageTracker::new(size, scale, transform),
+            size,
+            scale,
+            transform,
+        });
+    }
+
+    let Some(mirror) = mirror.as_mut() else {
+        return Ok(None);
+    };
+    let mirror_logical_size: Size<i32, Logical> = (
+        ((size.w as f64) / scale.x.abs().max(0.0001)).round() as i32,
+        ((size.h as f64) / scale.y.abs().max(0.0001)).round() as i32,
+    )
+        .into();
+    let mirror_src = Rectangle::<f64, Logical>::from_size((size.w as f64, size.h as f64).into());
+    let mirror_render_states = {
+        let mut target = renderer.bind(&mut mirror.texture)?;
+        mirror
+            .damage_tracker
+            .render_output(
+                renderer,
+                &mut target,
+                0,
+                elements,
+                Color32F::new(
+                    CLEAR_COLOR[0],
+                    CLEAR_COLOR[1],
+                    CLEAR_COLOR[2],
+                    CLEAR_COLOR[3],
+                ),
+            )?
+            .states
+    };
+
+    let make_element = || {
+        TextureRenderElement::from_static_texture(
+            Id::new(),
+            renderer.context_id(),
+            (0.0, 0.0),
+            mirror.texture.clone(),
+            1,
+            Transform::Normal,
+            None,
+            Some(mirror_src),
+            Some(mirror_logical_size),
+            None,
+            Kind::Unspecified,
+        )
+    };
+    Ok(Some((
+        TtyRenderElements::Snapshot(make_element()),
+        TtyRenderElements::Snapshot(make_element()),
+        mirror_render_states,
+    )))
 }
 
 struct ProfiledTtyRenderElement<'a> {
@@ -4071,12 +4162,57 @@ fn render_surface(
             .map(TtyRenderElements::Cursor)
             .collect();
 
+        let use_capture_mirror = screencopy_state.has_screencopy_for_output(&output)
+            || crate::backend::image_copy_capture_render::has_pending_output_capture(
+                image_copy_capture_pending,
+                &output,
+            );
+        let mut mirrored_capture_content = None;
+        let mut mirrored_display_content = None;
+        let mut mirrored_render_states = None;
+        if use_capture_mirror {
+            let output_name = output.name();
+            let mut mirror = state.output_capture_mirrors.remove(&output_name);
+            match render_output_capture_mirror(
+                &mut backend.renderer,
+                &mut mirror,
+                &output,
+                &content_for_capture,
+            ) {
+                Ok(Some((capture_element, display_element, render_states))) => {
+                    mirrored_capture_content = Some(vec![capture_element]);
+                    mirrored_display_content = Some(vec![display_element]);
+                    mirrored_render_states = Some(render_states);
+                    if let Some(mirror) = mirror {
+                        state.output_capture_mirrors.insert(output_name, mirror);
+                    }
+                }
+                Ok(None) => {
+                    if let Some(mirror) = mirror {
+                        state.output_capture_mirrors.insert(output_name, mirror);
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        output = %output.name(),
+                        ?err,
+                        "screencopy mirror: falling back to direct content render"
+                    );
+                }
+            }
+        } else {
+            state.output_capture_mirrors.remove(output.name().as_str());
+        }
+        let capture_content_for_output = mirrored_capture_content
+            .as_deref()
+            .unwrap_or(content_for_capture.as_slice());
+
         crate::backend::screencopy_render::process_screencopy_queue_for_output(
             screencopy_state,
             loop_handle,
             &mut backend.renderer,
             &output,
-            &content_for_capture,
+            capture_content_for_output,
             &cursor_elements,
         );
         // Phase 5b-ii: serve ext-image-copy-capture-v1 frames for this output
@@ -4085,7 +4221,7 @@ fn render_surface(
             image_copy_capture_pending,
             &mut backend.renderer,
             &output,
-            &content_for_capture,
+            capture_content_for_output,
             &cursor_elements,
             presented,
         );
@@ -4138,7 +4274,11 @@ fn render_surface(
         elements.extend(error_background_elements);
         elements.extend(fps_overlay_elements);
         elements.extend(cursor_elements);
-        elements.extend(content_for_capture);
+        if let Some(mirrored_display_content) = mirrored_display_content {
+            elements.extend(mirrored_display_content);
+        } else {
+            elements.extend(content_for_capture);
+        }
 
         let result = crate::backend::shader_effect::with_gpu_timing_renderer_span(
             &mut backend.renderer,
@@ -4214,6 +4354,19 @@ fn render_surface(
         }
         surface.estimated_render_duration =
             blend_render_duration(surface.estimated_render_duration, render_elapsed);
+        let effective_render_states_storage = mirrored_render_states.map(|mut states| {
+            states.states.extend(
+                result
+                    .states
+                    .states
+                    .iter()
+                    .map(|(id, state)| (id.clone(), *state)),
+            );
+            states
+        });
+        let effective_render_states = effective_render_states_storage
+            .as_ref()
+            .unwrap_or(&result.states);
         // Update primary-scanout metadata unconditionally — even for no-damage frames.
         //
         // Firefox's root wl_surface commits without a buffer (pure frame-callback registration).
@@ -4227,11 +4380,15 @@ fn render_surface(
             &state.space,
             &output,
             &cursor_status_for_log,
-            &result.states,
+            effective_render_states,
             window_decorations,
         );
         if !result.is_empty {
-            restore_presented_window_surface_primary_outputs(&state.space, &output, &result.states);
+            restore_presented_window_surface_primary_outputs(
+                &state.space,
+                &output,
+                effective_render_states,
+            );
             if frame_liveness_debug_enabled() {
                 tracing::info!(
                     output = %output.name(),
@@ -4243,8 +4400,8 @@ fn render_surface(
             if std::env::var_os("SHOJI_FRAME_THROTTLE_DEBUG").is_some() {
                 tracing::info!(
                     output = %output.name(),
-                    states_count = result.states.states.len(),
-                    states_ids = ?result.states.states.keys().map(|id| format!("{:?}", id)).collect::<Vec<_>>(),
+                    states_count = effective_render_states.states.len(),
+                    states_ids = ?effective_render_states.states.keys().map(|id| format!("{:?}", id)).collect::<Vec<_>>(),
                     "tty DAMAGE frame",
                 );
             }
@@ -4399,7 +4556,7 @@ fn render_surface(
                 }
             }
             let output_presentation_feedback =
-                take_presentation_feedback(&output, &state.space, &result.states);
+                take_presentation_feedback(&output, &state.space, effective_render_states);
             surface
                 .drm_output
                 .queue_frame(Some(output_presentation_feedback))?;
@@ -4434,7 +4591,7 @@ fn render_surface(
                     output = %output.name(),
                     callback_time_ms = callback_time.as_secs_f64() * 1000.0,
                     frame_time_ms = frame_time.as_secs_f64() * 1000.0,
-                    result_states_count = result.states.states.len(),
+                    result_states_count = effective_render_states.states.len(),
                     total_cpu_elapsed_ms = total_cpu_elapsed.as_secs_f64() * 1000.0,
                     render_elapsed_ms = timing.render_elapsed_ms,
                     frame_callback_sequence,
@@ -4446,7 +4603,7 @@ fn render_surface(
             state.post_repaint_with_sequence(
                 &output,
                 callback_time,
-                &result.states,
+                effective_render_states,
                 Some(frame_callback_sequence),
             );
             let _ = state.display_handle.flush_clients();

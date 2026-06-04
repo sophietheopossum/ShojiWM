@@ -302,6 +302,7 @@ pub struct ShojiWM {
     pub layer_backdrop_cache: HashMap<String, crate::backend::shader_effect::CachedBackdropTexture>,
     pub layer_framebuffer_effect_states:
         HashMap<String, crate::backend::shader_effect::ShaderEffectElementState>,
+    pub output_capture_mirrors: HashMap<String, crate::backend::tty::OutputCaptureMirror>,
     pub pointer_contents: PointerContents,
     pub decoration_hover_target: Option<TrackedDecorationInteractionTarget>,
     pub decoration_active_target: Option<TrackedDecorationInteractionTarget>,
@@ -790,6 +791,7 @@ impl ShojiWM {
             config_error_report,
             layer_backdrop_cache: HashMap::new(),
             layer_framebuffer_effect_states: HashMap::new(),
+            output_capture_mirrors: HashMap::new(),
             pointer_contents: PointerContents::default(),
             decoration_hover_target: None,
             decoration_active_target: None,

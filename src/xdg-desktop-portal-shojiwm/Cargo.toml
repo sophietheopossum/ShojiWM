@@ -23,3 +23,5 @@ rustix = { version = "1.1", features = ["fs", "mm", "shm"] }
 toml = "0.8"
 pipewire = { version = "0.9", features = ["v0_3_77"] }
 libspa = { version = "0.9", features = ["v0_3_65"] }
+gbm = "0.18"
+drm-fourcc = "2.2"

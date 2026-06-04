@@ -65,6 +65,13 @@ pub enum CaptureTarget {
     Toplevel(ForeignToplevelWeakHandle),
 }
 
+pub fn has_pending_output_capture(pending: &[PendingCapture], output: &Output) -> bool {
+    pending.iter().any(|entry| match &entry.target {
+        CaptureTarget::Output(weak) => weak.upgrade().is_some_and(|o| &o == output),
+        CaptureTarget::Toplevel(_) => false,
+    })
+}
+
 /// Render any queued image-copy-capture frames whose target is `output`.
 ///
 /// Consumes those entries from `pending`. Each handled frame either calls

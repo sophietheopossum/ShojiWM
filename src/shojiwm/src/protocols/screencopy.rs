@@ -139,6 +139,15 @@ impl ScreencopyManagerState {
         self.cleanup_queues();
     }
 
+    pub fn has_screencopy_for_output(&self, output: &Output) -> bool {
+        self.queues.values().any(|queue| {
+            queue
+                .screencopies
+                .iter()
+                .any(|screencopy| screencopy.output() == output)
+        })
+    }
+
     fn cleanup_queues(&mut self) {
         self.queues
             .retain(|manager, queue| manager.is_alive() || !queue.is_empty());

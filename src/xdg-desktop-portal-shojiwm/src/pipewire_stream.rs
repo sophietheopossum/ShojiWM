@@ -21,11 +21,10 @@
 //! - **`PW_STREAM_FLAG_ALLOC_BUFFERS`** tells PipeWire to pre-allocate the
 //!   buffer slots from our `SPA_PARAM_Buffers` advert; our `add_buffer`
 //!   callback fires once per slot with the empty `pw_buffer` so we can
-//!   populate `spa_data{type=MemFd, fd, maxsize}`. The crucial property is
-//!   that **the memfd we install on each pw_buffer is the same memory we
-//!   wrap as a `wl_buffer` via `wl_shm_pool`**. wlr-screencopy writes to the
-//!   `wl_buffer`, PipeWire consumers read from the `pw_buffer`, and there
-//!   is exactly one byte of pixels on the wire: zero-copy.
+//!   populate `spa_data{type, fd, maxsize}`. The preferred path allocates a
+//!   GBM DMA-BUF and exposes the same BO both as a linux-dmabuf `wl_buffer`
+//!   and as a PipeWire DMA-BUF. If GBM or linux-dmabuf is unavailable we fall
+//!   back to the older memfd + `wl_shm_pool` path.
 //!
 //! - **Wayland-driven queue** is what actually closes the timing loop. With
 //!   DRIVER set, `on_process` no longer fires on its own — there is no
@@ -46,7 +45,7 @@
 //!   removes all cross-thread synchronization around the stream handle: the
 //!   wayland event callbacks (which call `dequeue_raw_buffer` /
 //!   `queue_raw_buffer`) and the PipeWire stream callbacks (which set up
-//!   memfds in `add_buffer`) all run on the same thread, accessing
+//!   buffers in `add_buffer`) all run on the same thread, accessing
 //!   `AppState` through one `Rc<RefCell<_>>`.
 //!
 //!   `pipewire::stream::StreamRc` is `Rc`-based (`!Send`), and switching to
@@ -64,7 +63,8 @@
 //!      with PipeWire) and just wait for the synchronization event.
 //!   3. `BufferDone` arrives → `dequeue_raw_buffer()` pops a pw_buffer; we
 //!      look up its paired `wl_buffer` and call `frame.copy(&wl_buffer)`.
-//!      The compositor writes pixels directly into the memfd PipeWire owns.
+//!      The compositor writes pixels directly into the PipeWire-owned backing
+//!      storage.
 //!   4. `Ready` arrives → we set `chunk.size` on the pw_buffer, call
 //!      `queue_raw_buffer()` (this is the wake-up signal for consumers AND
 //!      the cycle advance for the DRIVER stream), then immediately call
@@ -84,14 +84,18 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io::Cursor;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
+use drm_fourcc::{DrmFourcc, DrmModifier};
+use gbm::{BufferObject, BufferObjectFlags, Device as GbmDevice};
 use pipewire as pw;
 use pw::spa;
 use pw::spa::pod::serialize::PodSerializer;
@@ -101,6 +105,9 @@ use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle};
 use spa::sys as spa_sys;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
+};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
@@ -169,10 +176,12 @@ struct AppState {
     manager: Option<ZwlrScreencopyManagerV1>,
     target_output: Option<wl_output::WlOutput>,
     shm: Option<wl_shm::WlShm>,
+    dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+    gbm: Option<GbmDevice<File>>,
 
     // PipeWire stream (cloneable Rc handle)
     stream: Option<pw::stream::StreamRc>,
-    /// pw_buffer raw ptr → its wrapping wl_buffer + owned memfd.
+    /// pw_buffer raw ptr -> its wrapping wl_buffer + backing storage.
     pw_buffer_slots: HashMap<usize, BufferSlot>,
     /// pw_buffer raw ptr → its negotiated stride (cached at add_buffer time).
     pw_buffer_stride: HashMap<usize, i32>,
@@ -208,8 +217,27 @@ struct PendingFrame {
 
 struct BufferSlot {
     wl_buffer: wl_buffer::WlBuffer,
-    _shm_pool: wl_shm_pool::WlShmPool,
-    _fd: OwnedFd,
+    _storage: BufferSlotStorage,
+}
+
+enum BufferSlotStorage {
+    Shm {
+        _shm_pool: wl_shm_pool::WlShmPool,
+        _fd: OwnedFd,
+    },
+    Dmabuf {
+        _bo: BufferObject<()>,
+        _wl_fd: OwnedFd,
+    },
+}
+
+struct AllocatedSlot {
+    wl_buffer: wl_buffer::WlBuffer,
+    storage: BufferSlotStorage,
+    fd_for_pw: OwnedFd,
+    stride: i32,
+    size: usize,
+    data_type: spa_sys::spa_data_type,
 }
 
 // Raw pw_buffer pointers don't carry Send / Sync inferred by the compiler, but
@@ -250,6 +278,8 @@ fn run(
         manager: None,
         target_output: None,
         shm: None,
+        dmabuf: None,
+        gbm: None,
         stream: None,
         pw_buffer_slots: HashMap::new(),
         pw_buffer_stride: HashMap::new(),
@@ -286,6 +316,27 @@ fn run(
             .map(|tx| tx.send(Err("compositor doesn't expose wl_shm".into())));
         return Err("no wl_shm".into());
     }
+    state.gbm = match init_gbm_device() {
+        Ok(Some(device)) if state.dmabuf.is_some() => {
+            tracing::info!(
+                backend = device.backend_name(),
+                "screencast: DMA-BUF capture enabled"
+            );
+            Some(device)
+        }
+        Ok(Some(_)) => {
+            tracing::info!("screencast: zwp_linux_dmabuf_v1 missing; using SHM capture");
+            None
+        }
+        Ok(None) => {
+            tracing::info!("screencast: no render node found; using SHM capture");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("screencast: failed to initialize GBM ({e}); using SHM capture");
+            None
+        }
+    };
     if state.target_output.is_none() {
         let _ = state
             .node_id_tx
@@ -334,7 +385,7 @@ fn run(
 
     // Negotiate format + buffer params.
     let format_bytes = build_video_format_param(&spec)?;
-    let buffers_bytes = build_buffers_param(&spec)?;
+    let buffers_bytes = build_buffers_param(&spec, state_rc.borrow().gbm.is_some())?;
     let format_pod = Pod::from_bytes(&format_bytes).ok_or("format POD parse failed".to_string())?;
     let buffers_pod =
         Pod::from_bytes(&buffers_bytes).ok_or("buffers POD parse failed".to_string())?;
@@ -430,6 +481,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
                 state.shm =
                     Some(registry.bind::<wl_shm::WlShm, _, _>(name, version.min(1), qh, ()));
             }
+            "zwp_linux_dmabuf_v1" => {
+                state.dmabuf = Some(
+                    registry.bind::<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _, _>(
+                        name,
+                        version.min(3),
+                        qh,
+                        (),
+                    ),
+                );
+            }
             "zwlr_screencopy_manager_v1" => {
                 state.manager = Some(registry.bind::<ZwlrScreencopyManagerV1, _, _>(
                     name,
@@ -495,6 +556,37 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for AppState {
         _: &QueueHandle<Self>,
     ) {
     }
+}
+
+impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for AppState {
+    fn event(
+        _: &mut Self,
+        _: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        _: zwp_linux_dmabuf_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, ()> for AppState {
+    fn event(
+        _: &mut Self,
+        _: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        event: zwp_linux_buffer_params_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if matches!(event, zwp_linux_buffer_params_v1::Event::Failed) {
+            tracing::warn!("screencast: DMA-BUF wl_buffer creation failed");
+        }
+    }
+
+    wayland_client::event_created_child!(AppState, zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, [
+        zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE => (wl_buffer::WlBuffer, ())
+    ]);
 }
 
 impl Dispatch<ZwlrScreencopyManagerV1, ()> for AppState {
@@ -589,51 +681,33 @@ impl AppState {
     }
 
     fn on_add_buffer(&mut self, _stream: &pw::stream::Stream, buffer: *mut pw::sys::pw_buffer) {
-        let stride = (self.spec.width * 4) as i32;
-        let size = stride as usize * self.spec.height as usize;
-
-        // Allocate a memfd for this slot.
-        let memfd =
-            match rustix::fs::memfd_create("shojiwm-portal-pwbuf", rustix::fs::MemfdFlags::CLOEXEC)
-            {
-                Ok(fd) => fd,
+        let slot = match self.create_dmabuf_slot() {
+            Ok(Some(slot)) => slot,
+            Ok(None) => match self.create_shm_slot() {
+                Ok(slot) => slot,
                 Err(e) => {
-                    tracing::error!("memfd_create: {e}");
+                    tracing::error!("create SHM screencast buffer: {e}");
                     return;
                 }
-            };
-        if let Err(e) = rustix::fs::ftruncate(&memfd, size as u64) {
-            tracing::error!("ftruncate: {e}");
-            return;
-        }
-
-        // Wrap as wl_buffer through wl_shm_pool.
-        let Some(shm) = self.shm.as_ref() else {
-            return;
-        };
-        let pool = shm.create_pool(memfd.as_fd(), size as i32, &self.qh, ());
-        let wl_format = wl_shm::Format::Xrgb8888;
-        let wl_buf = pool.create_buffer(
-            0,
-            self.spec.width as i32,
-            self.spec.height as i32,
-            stride,
-            wl_format,
-            &self.qh,
-            (),
-        );
-
-        // Tell PipeWire about this buffer's storage. We hand the fd over by
-        // dup'ing it (PW expects to own the fd and will close it via
-        // remove_buffer; we still want to keep ours alive for as long as the
-        // wl_buffer references it).
-        let fd_for_pw = match memfd.try_clone() {
-            Ok(c) => c.into_raw_fd(),
+            },
             Err(e) => {
-                tracing::error!("dup memfd for pw: {e}");
-                return;
+                tracing::warn!("create DMA-BUF screencast buffer: {e}; falling back to SHM");
+                match self.create_shm_slot() {
+                    Ok(slot) => slot,
+                    Err(e) => {
+                        tracing::error!("create SHM screencast buffer: {e}");
+                        return;
+                    }
+                }
             }
         };
+        let stride = slot.stride;
+        let size = slot.size;
+        let data_type = slot.data_type;
+        let fd_for_pw = slot.fd_for_pw.into_raw_fd();
+        let wl_buf = slot.wl_buffer;
+        let storage = slot.storage;
+
         unsafe {
             let buf = (*buffer).buffer;
             if buf.is_null() {
@@ -646,7 +720,7 @@ impl AppState {
                 return;
             }
             let data = &mut datas[0];
-            data.type_ = spa_sys::SPA_DATA_MemFd;
+            data.type_ = data_type;
             data.flags = spa_sys::SPA_DATA_FLAG_READWRITE;
             data.fd = fd_for_pw as i64;
             data.data = std::ptr::null_mut();
@@ -665,10 +739,109 @@ impl AppState {
             key,
             BufferSlot {
                 wl_buffer: wl_buf,
+                _storage: storage,
+            },
+        );
+    }
+
+    fn create_dmabuf_slot(
+        &self,
+    ) -> Result<Option<AllocatedSlot>, Box<dyn std::error::Error + Send + Sync>> {
+        let (Some(dmabuf), Some(gbm)) = (self.dmabuf.as_ref(), self.gbm.as_ref()) else {
+            return Ok(None);
+        };
+
+        let flags = BufferObjectFlags::RENDERING | BufferObjectFlags::LINEAR;
+        if !gbm.is_format_supported(DrmFourcc::Xrgb8888, flags) {
+            return Ok(None);
+        }
+
+        let bo = gbm.create_buffer_object::<()>(
+            self.spec.width,
+            self.spec.height,
+            DrmFourcc::Xrgb8888,
+            flags,
+        )?;
+        if bo.plane_count() != 1 {
+            return Err(format!(
+                "expected single-plane XRGB8888 BO, got {}",
+                bo.plane_count()
+            )
+            .into());
+        }
+        let stride = bo.stride_for_plane(0) as i32;
+        let size = stride as usize * self.spec.height as usize;
+        let modifier = u64::from(DrmModifier::Linear);
+        let modifier_hi = (modifier >> 32) as u32;
+        let modifier_lo = (modifier & 0xffff_ffff) as u32;
+
+        let wl_fd = bo.fd()?;
+        let fd_for_pw = bo.fd()?;
+        let params = dmabuf.create_params(&self.qh, ());
+        params.add(
+            wl_fd.as_fd(),
+            0,
+            bo.offset(0),
+            stride as u32,
+            modifier_hi,
+            modifier_lo,
+        );
+        let wl_buffer = params.create_immed(
+            self.spec.width as i32,
+            self.spec.height as i32,
+            DrmFourcc::Xrgb8888 as u32,
+            zwp_linux_buffer_params_v1::Flags::empty(),
+            &self.qh,
+            (),
+        );
+        params.destroy();
+
+        Ok(Some(AllocatedSlot {
+            wl_buffer,
+            storage: BufferSlotStorage::Dmabuf {
+                _bo: bo,
+                _wl_fd: wl_fd,
+            },
+            fd_for_pw,
+            stride,
+            size,
+            data_type: spa_sys::SPA_DATA_DmaBuf,
+        }))
+    }
+
+    fn create_shm_slot(&self) -> Result<AllocatedSlot, Box<dyn std::error::Error + Send + Sync>> {
+        let stride = (self.spec.width * 4) as i32;
+        let size = stride as usize * self.spec.height as usize;
+        let memfd =
+            rustix::fs::memfd_create("shojiwm-portal-pwbuf", rustix::fs::MemfdFlags::CLOEXEC)?;
+        rustix::fs::ftruncate(&memfd, size as u64)?;
+
+        let Some(shm) = self.shm.as_ref() else {
+            return Err("wl_shm is not bound".into());
+        };
+        let pool = shm.create_pool(memfd.as_fd(), size as i32, &self.qh, ());
+        let wl_buffer = pool.create_buffer(
+            0,
+            self.spec.width as i32,
+            self.spec.height as i32,
+            stride,
+            wl_shm::Format::Xrgb8888,
+            &self.qh,
+            (),
+        );
+        let fd_for_pw = memfd.try_clone()?;
+
+        Ok(AllocatedSlot {
+            wl_buffer,
+            storage: BufferSlotStorage::Shm {
                 _shm_pool: pool,
                 _fd: memfd,
             },
-        );
+            fd_for_pw,
+            stride,
+            size,
+            data_type: spa_sys::SPA_DATA_MemFd,
+        })
     }
 
     fn on_remove_buffer(&mut self, _stream: &pw::stream::Stream, buffer: *mut pw::sys::pw_buffer) {
@@ -827,6 +1000,32 @@ impl AppState {
     }
 }
 
+fn init_gbm_device() -> Result<Option<GbmDevice<File>>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("SHOJI_SCREENCAST_RENDER_NODE") {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates.extend((128..200).map(|idx| PathBuf::from(format!("/dev/dri/renderD{idx}"))));
+
+    for path in candidates {
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        match GbmDevice::new(file) {
+            Ok(device) => {
+                tracing::info!(path = %path.display(), "screencast: opened GBM render node");
+                return Ok(Some(device));
+            }
+            Err(e) => {
+                tracing::debug!(path = %path.display(), "GBM device init failed: {e}");
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 // ─── POD builders ─────────────────────────────────────────────────────────
 
 fn build_video_format_param(
@@ -871,10 +1070,17 @@ fn build_video_format_param(
 
 fn build_buffers_param(
     spec: &StreamSpec,
+    prefer_dmabuf: bool,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let stride = (spec.width * 4) as i32;
     let size = stride * spec.height as i32;
     let memfd_flag = 1 << spa_sys::SPA_DATA_MemFd;
+    let dmabuf_flag = 1 << spa_sys::SPA_DATA_DmaBuf;
+    let (default_data_type, data_type_flags) = if prefer_dmabuf {
+        (dmabuf_flag, vec![dmabuf_flag, memfd_flag])
+    } else {
+        (memfd_flag, vec![memfd_flag])
+    };
     let obj = Value::Object(Object {
         type_: spa_sys::SPA_TYPE_OBJECT_ParamBuffers,
         id: spa_sys::SPA_PARAM_Buffers,
@@ -898,8 +1104,8 @@ fn build_buffers_param(
                 Value::Choice(ChoiceValue::Int(Choice(
                     ChoiceFlags::empty(),
                     ChoiceEnum::Flags {
-                        default: memfd_flag,
-                        flags: vec![memfd_flag],
+                        default: default_data_type,
+                        flags: data_type_flags,
                     },
                 ))),
             ),
