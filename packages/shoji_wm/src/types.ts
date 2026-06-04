@@ -662,6 +662,84 @@ export interface PointerController {
   bindWindowMoveModifier(modifier: string): void;
 }
 
+export interface InputDeviceKindFlags {
+  keyboard: boolean;
+  pointer: boolean;
+  touchpad: boolean;
+  touch: boolean;
+  tabletTool: boolean;
+  tabletPad: boolean;
+  gesture: boolean;
+  switch: boolean;
+}
+
+export interface InputDeviceInfo {
+  name: string;
+  sysname?: string;
+  vendor?: number;
+  product?: number;
+  kind: InputDeviceKindFlags;
+}
+
+export type InputAccelProfile = "adaptive" | "flat";
+export type InputClickMethod = "buttonAreas" | "clickfinger";
+export type InputScrollMethod = "none" | "twoFinger" | "edge" | "onButtonDown";
+export type InputTapButtonMap = "leftRightMiddle" | "leftMiddleRight";
+
+export interface KeyboardInputConfig {
+  repeatRate?: number;
+  repeatDelay?: number;
+}
+
+export interface PointerInputConfig {
+  pointerAccel?: number;
+  accelProfile?: InputAccelProfile;
+  leftHanded?: boolean;
+  naturalScroll?: boolean;
+  middleEmulation?: boolean;
+}
+
+export interface TouchpadInputConfig extends PointerInputConfig {
+  tapToClick?: boolean;
+  tapButtonMap?: InputTapButtonMap;
+  clickMethod?: InputClickMethod;
+  scrollMethod?: InputScrollMethod;
+  scrollFactor?: number;
+  disableWhileTyping?: boolean;
+}
+
+export interface InputDeviceConfig {
+  keyboard?: KeyboardInputConfig;
+  pointer?: PointerInputConfig;
+  touchpad?: TouchpadInputConfig;
+}
+
+export interface InputConfigDraft {
+  global?: InputDeviceConfig;
+  device: Record<string, InputDeviceConfig | null>;
+}
+
+export interface InputConfigureContext {
+  devices: InputDeviceInfo[];
+  current: Record<string, InputDeviceInfo>;
+}
+
+export type InputConfigureFactory = (
+  input: InputConfigDraft,
+  context: InputConfigureContext,
+) => void;
+
+export interface InputController {
+  readonly devices: InputDeviceInfo[];
+  readonly current: Record<string, InputDeviceInfo>;
+  get(deviceKey: string): InputDeviceInfo | undefined;
+  find(
+    predicate: (device: InputDeviceInfo) => boolean,
+  ): InputDeviceInfo | undefined;
+  configure(factory: InputConfigureFactory): void;
+  reconfigure(): void;
+}
+
 export interface BorderValue {
   px: MaybeSignal<number>;
   color: MaybeSignal<string>;
@@ -822,6 +900,7 @@ export interface WindowManagerDefinition {
   preload: PreloadController;
   effect: WindowManagerEffectConfig;
   output: OutputController;
+  input: InputController;
   process: ProcessController;
   key: KeyBindingController;
   pointer: PointerController;

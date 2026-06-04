@@ -172,6 +172,22 @@ WINDOW_MANAGER.output.configure(() => {
   return display;
 });
 
+WINDOW_MANAGER.input.configure((input, _) => {
+  input.global = {
+    touchpad: {
+      tapToClick: true,
+      naturalScroll: true,
+      scrollMethod: "twoFinger",
+      disableWhileTyping: true,
+      scrollFactor: 0.5,
+    },
+    pointer: {
+      pointerAccel: 0.0,
+      accelProfile: "flat",
+    },
+  };
+});
+
 WINDOW_MANAGER.effect.background_effect = compileEffect({
   input: backdropSource(),
   invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },

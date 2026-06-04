@@ -26,6 +26,7 @@ use super::{
 use crate::{
     config::RuntimeDisplayConfigUpdate,
     runtime_debug::RuntimeDebugConfigUpdate,
+    runtime_input::{RuntimeInputConfigUpdate, RuntimeInputDeviceSnapshot},
     runtime_key_binding::RuntimeKeyBindingConfigUpdate,
     runtime_pointer::RuntimePointerConfigUpdate,
     runtime_process::{RuntimeProcessAction, RuntimeProcessConfigUpdate},
@@ -178,6 +179,7 @@ pub struct DecorationEvaluationResult {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
@@ -197,6 +199,7 @@ pub struct DecorationCachedEvaluationResult {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
@@ -216,6 +219,7 @@ impl From<DecorationEvaluationResult> for DecorationCachedEvaluationResult {
             display_config: result.display_config,
             key_binding_config: result.key_binding_config,
             pointer_config: result.pointer_config,
+            input_config: result.input_config,
             event_config: result.event_config,
             process_config: result.process_config,
             process_actions: result.process_actions,
@@ -235,6 +239,7 @@ pub struct DecorationSchedulerTick {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
@@ -256,6 +261,7 @@ pub struct DecorationHandlerInvocation {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
@@ -274,6 +280,7 @@ pub struct DecorationKeyBindingInvocation {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
@@ -292,6 +299,7 @@ pub struct DecorationWindowResizeInvocation {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
@@ -310,6 +318,7 @@ pub struct DecorationWindowMoveInvocation {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
@@ -328,6 +337,7 @@ pub struct DecorationWindowStateRequestInvocation {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
@@ -346,6 +356,7 @@ pub struct DecorationPointerMoveAsyncInvocation {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
@@ -364,6 +375,7 @@ pub struct LayerEffectEvaluationResult {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
@@ -480,6 +492,7 @@ impl DecorationEvaluator for StaticDecorationEvaluator {
             display_config: None,
             key_binding_config: None,
             pointer_config: None,
+            input_config: None,
             event_config: None,
             process_config: None,
             process_actions: Vec::new(),
@@ -526,6 +539,7 @@ pub struct NodeDecorationEvaluator {
     transport: RuntimeTransportKind,
     runtime: Arc<Mutex<Option<NodeDecorationRuntime>>>,
     display_state: Arc<Mutex<std::collections::BTreeMap<String, WaylandOutputSnapshot>>>,
+    input_state: Arc<Mutex<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>>,
     pointer_move_async: Arc<PointerMoveAsyncDispatcher>,
     async_event_sender: Arc<Mutex<Option<CalloopSender<DecorationPointerMoveAsyncInvocation>>>>,
 }
@@ -579,6 +593,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     EvaluatePreview {
         #[serde(rename = "requestId")]
@@ -588,6 +604,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     SchedulerTick {
         #[serde(rename = "requestId")]
@@ -596,6 +614,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     WindowClosed {
         #[serde(rename = "requestId")]
@@ -604,6 +624,8 @@ enum RuntimeRequest<'a> {
         window_id: &'a str,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     InvokeHandler {
         #[serde(rename = "requestId")]
@@ -616,6 +638,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     InvokeKeyBinding {
         #[serde(rename = "requestId")]
@@ -626,6 +650,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     WindowResize {
         #[serde(rename = "requestId")]
@@ -637,6 +663,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     WindowMove {
         #[serde(rename = "requestId")]
@@ -648,6 +676,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     WindowMaximizeRequest {
         #[serde(rename = "requestId")]
@@ -660,6 +690,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     WindowMinimizeRequest {
         #[serde(rename = "requestId")]
@@ -672,6 +704,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     WindowActivateRequest {
         #[serde(rename = "requestId")]
@@ -684,6 +718,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     PointerMoveAsync {
         #[serde(rename = "requestId")]
@@ -693,6 +729,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     StartClose {
         #[serde(rename = "requestId")]
@@ -703,6 +741,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     EvaluateCached {
         #[serde(rename = "requestId")]
@@ -715,12 +755,16 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     GetEffectConfig {
         #[serde(rename = "requestId")]
         request_id: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     EvaluateLayerEffects {
         #[serde(rename = "requestId")]
@@ -732,6 +776,8 @@ enum RuntimeRequest<'a> {
         now_ms: u64,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     LifecycleEnable {
         #[serde(rename = "requestId")]
@@ -742,6 +788,8 @@ enum RuntimeRequest<'a> {
         environment: &'a std::collections::BTreeMap<String, String>,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
     LifecycleDisable {
         #[serde(rename = "requestId")]
@@ -749,6 +797,8 @@ enum RuntimeRequest<'a> {
         reason: &'a str,
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
 }
 
@@ -777,6 +827,8 @@ struct RuntimeEvaluateResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "eventConfig")]
     event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
@@ -810,6 +862,8 @@ struct RuntimeSchedulerResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "eventConfig")]
     event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
@@ -833,6 +887,8 @@ struct RuntimeClosedResponse {
     _key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     _pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    _input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "eventConfig")]
     _event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
@@ -870,6 +926,8 @@ struct RuntimeInvokeHandlerResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "eventConfig")]
     event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
@@ -907,6 +965,8 @@ struct RuntimeStartCloseResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "eventConfig")]
     event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
@@ -930,6 +990,8 @@ struct RuntimeEffectConfigResponse {
     _key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     _pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    _input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "processConfig")]
     _process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
@@ -959,6 +1021,8 @@ struct RuntimeLayerEffectsResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "eventConfig")]
     event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
@@ -980,6 +1044,8 @@ struct RuntimeLifecycleEnableResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "eventConfig")]
     event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
@@ -1025,6 +1091,8 @@ struct RuntimeInvokeKeyBindingResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "eventConfig")]
     event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
@@ -1059,6 +1127,8 @@ struct RuntimeWindowResizeResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "eventConfig")]
     event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
@@ -1093,6 +1163,8 @@ struct RuntimeWindowMoveResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "eventConfig")]
     event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
@@ -1129,6 +1201,8 @@ struct RuntimePointerMoveAsyncResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    input_config: Option<RuntimeInputConfigUpdate>,
     #[serde(rename = "eventConfig")]
     event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
@@ -1169,6 +1243,7 @@ impl NodeDecorationEvaluator {
             transport: RuntimeTransportKind::Uds,
             runtime: Arc::new(Mutex::new(None)),
             display_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            input_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
             async_event_sender: Arc::new(Mutex::new(None)),
         }
@@ -1194,6 +1269,7 @@ impl NodeDecorationEvaluator {
             transport: RuntimeTransportKind::Stdio,
             runtime: Arc::new(Mutex::new(None)),
             display_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            input_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
             async_event_sender: Arc::new(Mutex::new(None)),
         }
@@ -1217,6 +1293,15 @@ impl NodeDecorationEvaluator {
         }
     }
 
+    pub fn set_input_state(
+        &self,
+        input_state: std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
+    ) {
+        if let Ok(mut guard) = self.input_state.lock() {
+            *guard = input_state;
+        }
+    }
+
     pub fn fresh_like(&self) -> Self {
         Self {
             program: self.program.clone(),
@@ -1228,6 +1313,12 @@ impl NodeDecorationEvaluator {
             runtime: Arc::new(Mutex::new(None)),
             display_state: Arc::new(Mutex::new(
                 self.display_state
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default(),
+            )),
+            input_state: Arc::new(Mutex::new(
+                self.input_state
                     .lock()
                     .map(|guard| guard.clone())
                     .unwrap_or_default(),
@@ -1266,6 +1357,11 @@ impl NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         let environment = runtime_environment_snapshot();
 
         let request = serde_json::to_string(&RuntimeRequest::LifecycleEnable {
@@ -1274,6 +1370,7 @@ impl NodeDecorationEvaluator {
             state,
             environment: &environment,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -1323,6 +1420,7 @@ impl NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -1345,11 +1443,17 @@ impl NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::LifecycleDisable {
             request_id,
             reason,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -1537,10 +1641,16 @@ impl NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::GetEffectConfig {
             request_id,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -1675,12 +1785,18 @@ impl NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::PointerMoveAsync {
             request_id,
             event,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -1737,6 +1853,7 @@ impl NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -1755,6 +1872,7 @@ impl Clone for NodeDecorationEvaluator {
             transport: self.transport,
             runtime: Arc::clone(&self.runtime),
             display_state: Arc::clone(&self.display_state),
+            input_state: Arc::clone(&self.input_state),
             pointer_move_async: Arc::clone(&self.pointer_move_async),
             async_event_sender: Arc::clone(&self.async_event_sender),
         }
@@ -1956,12 +2074,18 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::Evaluate {
             request_id,
             snapshot: window,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -2028,6 +2152,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -2050,12 +2175,18 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::EvaluatePreview {
             request_id,
             snapshot: window,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -2122,6 +2253,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -2145,6 +2277,11 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::EvaluateCached {
             request_id,
@@ -2152,6 +2289,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             snapshot: window,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -2225,6 +2363,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -2251,11 +2390,17 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::SchedulerTick {
             request_id,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -2321,6 +2466,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -2345,11 +2491,17 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::WindowClosed {
             request_id,
             window_id,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -2418,6 +2570,11 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::InvokeHandler {
             request_id,
@@ -2425,6 +2582,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             handler_id,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -2495,6 +2653,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -2522,12 +2681,18 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::InvokeKeyBinding {
             request_id,
             binding_id,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -2584,6 +2749,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -2612,6 +2778,11 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::WindowResize {
             request_id,
@@ -2619,6 +2790,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             event,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -2675,6 +2847,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -2703,6 +2876,11 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::WindowMove {
             request_id,
@@ -2710,6 +2888,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             event,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -2765,6 +2944,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -2789,6 +2969,11 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::WindowMaximizeRequest {
             request_id,
@@ -2797,6 +2982,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             event,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -2853,6 +3039,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -2877,6 +3064,11 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::WindowMinimizeRequest {
             request_id,
@@ -2885,6 +3077,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             event,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -2941,6 +3134,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -2965,6 +3159,11 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::WindowActivateRequest {
             request_id,
@@ -2973,6 +3172,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             event,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -3029,6 +3229,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -3060,12 +3261,18 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::StartClose {
             request_id,
             window_id,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -3135,6 +3342,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
@@ -3158,6 +3366,11 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         let request = serde_json::to_string(&RuntimeRequest::EvaluateLayerEffects {
             request_id,
@@ -3165,6 +3378,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             layers,
             now_ms,
             display_state: &display_state,
+            input_state: &input_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
         runtime.write_request(&request)?;
@@ -3226,6 +3440,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            input_config: response.input_config,
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),

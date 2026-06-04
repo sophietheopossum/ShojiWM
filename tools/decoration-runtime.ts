@@ -23,10 +23,12 @@ function findPreloadPath(configPath: string): string | null {
 import {
   advanceAnimationFrame,
   beginKeyBindingRegistration,
+  beginInputConfigurationRegistration,
   beginOutputConfigurationRegistration,
   beginPointerConfigRegistration,
   beginProcessConfigRegistration,
   commitKeyBindingRegistration,
+  commitInputConfigurationRegistration,
   commitOutputConfigurationRegistration,
   commitPointerConfigRegistration,
   commitProcessConfigRegistration,
@@ -51,6 +53,7 @@ import {
   takePendingDebugConfig,
   takePendingDisplayConfig,
   takePendingKeyBindingConfig,
+  takePendingInputConfig,
   takePendingPointerConfig,
   takePendingProcessConfig,
   leaveWindowDependencyScope,
@@ -64,6 +67,8 @@ import {
   isManagedWindowOnlyDirty,
   type CompositionEvaluationCache,
   type DisplayConfigDraft,
+  type InputConfigDraft,
+  type InputDeviceInfo,
   type WindowCompositionFunction,
   type OutputStateSnapshot,
   type PollCallback,
@@ -78,6 +83,7 @@ import {
   type RuntimeEventConfig,
   type RuntimePersistedState,
   updateOutputState,
+  updateInputState,
   updateLayerSnapshots,
   WINDOW_MANAGER,
   type WaylandLayerSnapshot,
@@ -193,6 +199,7 @@ interface EvaluateRequest {
   snapshot: WaylandWindowSnapshot;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface EvaluatePreviewRequest {
@@ -201,6 +208,7 @@ interface EvaluatePreviewRequest {
   snapshot: WaylandWindowSnapshot;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface SchedulerTickRequest {
@@ -208,6 +216,7 @@ interface SchedulerTickRequest {
   kind: "schedulerTick";
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface WindowClosedRequest {
@@ -215,6 +224,7 @@ interface WindowClosedRequest {
   kind: "windowClosed";
   windowId: string;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface StartCloseRequest {
@@ -223,6 +233,7 @@ interface StartCloseRequest {
   windowId: string;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface EvaluateCachedRequest {
@@ -232,6 +243,7 @@ interface EvaluateCachedRequest {
   snapshot?: WaylandWindowSnapshot;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface InvokeHandlerRequest {
@@ -241,6 +253,7 @@ interface InvokeHandlerRequest {
   handlerId: string;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface InvokeKeyBindingRequest {
@@ -249,6 +262,7 @@ interface InvokeKeyBindingRequest {
   bindingId: string;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface WindowResizeRequest {
@@ -258,6 +272,7 @@ interface WindowResizeRequest {
   event: RuntimeWindowResizeEvent;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface WindowMoveRequest {
@@ -267,6 +282,7 @@ interface WindowMoveRequest {
   event: RuntimeWindowMoveEvent;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface WindowMaximizeRequest {
@@ -277,6 +293,7 @@ interface WindowMaximizeRequest {
   event: RuntimeWindowMaximizeRequestEvent;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface WindowMinimizeRequest {
@@ -287,6 +304,7 @@ interface WindowMinimizeRequest {
   event: RuntimeWindowMinimizeRequestEvent;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface WindowActivateRequest {
@@ -297,6 +315,7 @@ interface WindowActivateRequest {
   event: RuntimeWindowActivateRequestEvent;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface PointerMoveAsyncRequest {
@@ -305,12 +324,14 @@ interface PointerMoveAsyncRequest {
   event: PointerMoveEvent;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface GetEffectConfigRequest {
   requestId: number;
   kind: "getEffectConfig";
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface EvaluateLayerEffectsRequest {
@@ -320,6 +341,7 @@ interface EvaluateLayerEffectsRequest {
   nowMs: number;
   layers: WaylandLayerSnapshot[];
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface LifecycleEnableRequest {
@@ -329,6 +351,7 @@ interface LifecycleEnableRequest {
   state?: RuntimePersistedState;
   environment?: Record<string, string>;
   displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
 }
 
 interface LifecycleDisableRequest {
@@ -381,6 +404,7 @@ interface EvaluateSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  inputConfig?: { config: InputConfigDraft };
   eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
@@ -400,6 +424,7 @@ interface SchedulerTickSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  inputConfig?: { config: InputConfigDraft };
   eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
@@ -413,6 +438,7 @@ interface WindowClosedSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  inputConfig?: { config: InputConfigDraft };
   eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
@@ -491,6 +517,7 @@ interface InvokeHandlerSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  inputConfig?: { config: InputConfigDraft };
   eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
@@ -511,6 +538,7 @@ interface InvokeKeyBindingSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  inputConfig?: { config: InputConfigDraft };
   eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
@@ -749,6 +777,11 @@ function pendingPointerConfigPayload(): RuntimePointerConfig | undefined {
   return takePendingPointerConfig() as RuntimePointerConfig | undefined;
 }
 
+function pendingInputConfigPayload(): { config: InputConfigDraft } | undefined {
+  const config = takePendingInputConfig();
+  return config ? { config } : undefined;
+}
+
 function pendingEventConfigPayload(
   events: WindowManagerEventController,
 ): RuntimeEventConfig | undefined {
@@ -950,11 +983,13 @@ async function main() {
     if (!loadedConfig) {
       beginKeyBindingRegistration();
       beginOutputConfigurationRegistration();
+      beginInputConfigurationRegistration();
       beginPointerConfigRegistration();
       beginProcessConfigRegistration();
       loadedConfig = (await import(moduleUrl).finally(() => {
         commitKeyBindingRegistration();
         commitOutputConfigurationRegistration();
+        commitInputConfigurationRegistration();
         commitPointerConfigRegistration();
         commitProcessConfigRegistration();
       })) as Record<string, unknown>;
@@ -988,6 +1023,7 @@ async function main() {
 
     try {
       updateOutputState(request.displayState);
+      updateInputState(request.inputState);
       if (hasRuntimeTimestamp(request)) {
         beginRuntimeTurn(request.nowMs);
       }
@@ -1052,6 +1088,7 @@ async function main() {
         runtimeConfig.events.emitEnable(request.reason, request.state);
         const keyBindingConfig = pendingKeyBindingConfigPayload();
         const pointerConfig = pendingPointerConfigPayload();
+        const inputConfig = pendingInputConfigPayload();
         const eventConfig = pendingEventConfigPayload(runtimeConfig.events);
         const processConfig = pendingProcessConfigPayload();
         const processActions = pendingProcessActionsPayload();
@@ -1072,6 +1109,7 @@ async function main() {
           displayConfig: pendingDisplayConfigPayload(),
           keyBindingConfig,
           pointerConfig,
+          inputConfig,
           eventConfig,
           processConfig,
           processActions,
@@ -1126,6 +1164,7 @@ async function main() {
                 );
           const keyBindingConfig = pendingKeyBindingConfigPayload();
           const pointerConfig = pendingPointerConfigPayload();
+          const inputConfig = pendingInputConfigPayload();
           const eventConfig = pendingEventConfigPayload(events);
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
@@ -1179,6 +1218,7 @@ async function main() {
             displayConfig: pendingDisplayConfigPayload(),
             keyBindingConfig,
             pointerConfig,
+            inputConfig,
             eventConfig,
             processConfig,
             processActions,
@@ -1189,6 +1229,7 @@ async function main() {
             if (statsEnabled && tick.dirty) stats.schedulerTickDirty++;
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const eventConfig = pendingEventConfigPayload(events);
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
@@ -1207,6 +1248,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               eventConfig,
               processConfig,
               processActions,
@@ -1216,6 +1258,7 @@ async function main() {
             closeWindow(events, request.windowId);
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
             await writeResponse(output, {
@@ -1225,6 +1268,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               processConfig,
               processActions,
             });
@@ -1232,6 +1276,7 @@ async function main() {
             const result = startClose(events, effectConfig, request.windowId);
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
             await writeResponse(output, {
@@ -1242,6 +1287,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               processConfig,
               processActions,
             });
@@ -1255,6 +1301,7 @@ async function main() {
             );
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
             // Same as evaluate: drain queued window actions (scheduleAnimation /
@@ -1287,6 +1334,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               processConfig,
               processActions,
             });
@@ -1306,6 +1354,7 @@ async function main() {
             );
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
             await writeResponse(output, {
@@ -1317,6 +1366,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               processConfig,
               processActions,
             });
@@ -1324,6 +1374,7 @@ async function main() {
             const result = invokeGlobalKeyBinding(request.bindingId);
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
             await writeResponse(output, {
@@ -1334,6 +1385,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               processConfig,
               processActions,
             });
@@ -1345,6 +1397,7 @@ async function main() {
             );
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
             await writeResponse(output, {
@@ -1355,6 +1408,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               processConfig,
               processActions,
             });
@@ -1366,6 +1420,7 @@ async function main() {
             );
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const eventConfig = pendingEventConfigPayload(events);
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
@@ -1377,6 +1432,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               eventConfig,
               processConfig,
               processActions,
@@ -1391,6 +1447,7 @@ async function main() {
             );
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const eventConfig = pendingEventConfigPayload(events);
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
@@ -1402,6 +1459,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               eventConfig,
               processConfig,
               processActions,
@@ -1416,6 +1474,7 @@ async function main() {
             );
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const eventConfig = pendingEventConfigPayload(events);
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
@@ -1427,6 +1486,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               eventConfig,
               processConfig,
               processActions,
@@ -1441,6 +1501,7 @@ async function main() {
             );
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const eventConfig = pendingEventConfigPayload(events);
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
@@ -1452,6 +1513,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               eventConfig,
               processConfig,
               processActions,
@@ -1460,6 +1522,7 @@ async function main() {
             const result = await invokePointerMoveAsync(events, request.event);
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const eventConfig = pendingEventConfigPayload(events);
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
@@ -1471,6 +1534,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               eventConfig,
               processConfig,
               processActions,
@@ -1483,6 +1547,7 @@ async function main() {
             );
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
             await writeResponse(output, {
@@ -1493,6 +1558,7 @@ async function main() {
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
               pointerConfig,
+              inputConfig,
               processConfig,
               processActions,
             });

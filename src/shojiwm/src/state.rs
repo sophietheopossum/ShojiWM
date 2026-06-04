@@ -78,6 +78,11 @@ use xcursor::parser::Image;
 use crate::activation_environment::publish_activation_environment;
 use crate::backend::tty::{apply_tty_output_mode, tty_output_available_modes};
 use crate::backend::visual::{inverse_transform_point, transformed_rect, transformed_root_rect};
+use crate::runtime_input::{
+    RuntimeInputConfig, RuntimeInputConfigUpdate, RuntimeInputDeviceSnapshot,
+    apply_config_to_libinput_devices, apply_keyboard_config, libinput_device_key,
+    snapshot_for_libinput_device,
+};
 use crate::runtime_key_binding::{
     CompiledRuntimeKeyBinding, RuntimeKeyBindingConfigUpdate, RuntimeKeyBindingEntry,
     compile_runtime_key_bindings,
@@ -292,6 +297,9 @@ pub struct ShojiWM {
     pub runtime_key_binding_entries: BTreeMap<String, RuntimeKeyBindingEntry>,
     pub runtime_key_bindings: Vec<CompiledRuntimeKeyBinding>,
     pub runtime_window_move_modifier: Option<RuntimePointerModifier>,
+    pub runtime_input_config: RuntimeInputConfig,
+    pub runtime_input_devices: BTreeMap<String, RuntimeInputDeviceSnapshot>,
+    pub runtime_libinput_devices: HashMap<String, input::Device>,
     pub runtime_pointer_move_async_enabled: bool,
     pub current_keyboard_modifiers: ModifiersState,
     pub suggested_window_offset: Option<(i32, i32)>,
@@ -782,6 +790,9 @@ impl ShojiWM {
             runtime_key_binding_entries: Default::default(),
             runtime_key_bindings: Vec::new(),
             runtime_window_move_modifier: None,
+            runtime_input_config: Default::default(),
+            runtime_input_devices: Default::default(),
+            runtime_libinput_devices: Default::default(),
             runtime_pointer_move_async_enabled: false,
             current_keyboard_modifiers: ModifiersState::default(),
             suggested_window_offset: None,
@@ -1246,6 +1257,7 @@ impl ShojiWM {
                 state.consume_runtime_display_config(tick.display_config);
                 state.consume_runtime_key_binding_config(tick.key_binding_config);
                 state.consume_runtime_pointer_config(tick.pointer_config);
+                state.consume_runtime_input_config(tick.input_config);
                 state.consume_runtime_event_config(tick.event_config);
                 state.consume_runtime_process_config(tick.process_config);
                 state.consume_runtime_debug_config(tick.debug_config);
@@ -1298,6 +1310,7 @@ impl ShojiWM {
                 self.consume_runtime_display_config(result.display_config);
                 self.consume_runtime_key_binding_config(result.key_binding_config);
                 self.consume_runtime_pointer_config(result.pointer_config);
+                self.consume_runtime_input_config(result.input_config);
                 self.consume_runtime_event_config(result.event_config);
                 self.consume_runtime_process_config(result.process_config);
                 if !result.process_actions.is_empty() {
@@ -1641,6 +1654,8 @@ impl ShojiWM {
     pub fn sync_runtime_display_state(&self) {
         self.decoration_evaluator
             .sync_display_state(self.snapshot_outputs());
+        self.decoration_evaluator
+            .sync_input_state(self.runtime_input_device_state().clone());
     }
 
     pub fn notify_runtime_outputs_changed(&mut self) {
@@ -1700,6 +1715,53 @@ impl ShojiWM {
         }
     }
 
+    pub fn register_libinput_device(&mut self, mut device: input::Device) {
+        let key = libinput_device_key(&mut device);
+        let snapshot = snapshot_for_libinput_device(&mut device);
+        self.runtime_input_devices.insert(key.clone(), snapshot);
+        self.runtime_libinput_devices.insert(key, device);
+        self.decoration_evaluator
+            .sync_input_state(self.runtime_input_device_state().clone());
+        self.apply_runtime_input_config_to_devices();
+    }
+
+    pub fn unregister_libinput_device(&mut self, mut device: input::Device) {
+        let key = libinput_device_key(&mut device);
+        self.runtime_input_devices.remove(&key);
+        self.runtime_libinput_devices.remove(&key);
+        self.decoration_evaluator
+            .sync_input_state(self.runtime_input_device_state().clone());
+        self.apply_runtime_input_config_to_devices();
+    }
+
+    pub fn runtime_input_device_state(&self) -> &BTreeMap<String, RuntimeInputDeviceSnapshot> {
+        &self.runtime_input_devices
+    }
+
+    fn apply_runtime_input_config_to_devices(&mut self) {
+        apply_keyboard_config(
+            &self.seat,
+            &self.runtime_input_config,
+            &self.runtime_input_devices,
+        );
+        apply_config_to_libinput_devices(
+            &self.runtime_input_config,
+            &self.runtime_input_devices,
+            &mut self.runtime_libinput_devices,
+        );
+    }
+
+    pub fn apply_runtime_input_config_update(&mut self, update: RuntimeInputConfigUpdate) {
+        self.runtime_input_config = update.config;
+        self.apply_runtime_input_config_to_devices();
+    }
+
+    pub fn consume_runtime_input_config(&mut self, update: Option<RuntimeInputConfigUpdate>) {
+        if let Some(update) = update {
+            self.apply_runtime_input_config_update(update);
+        }
+    }
+
     pub fn apply_runtime_event_config_update(&mut self, update: RuntimeEventConfigUpdate) {
         self.runtime_pointer_move_async_enabled = update.pointer_move_async;
     }
@@ -1717,6 +1779,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(invocation.display_config);
         self.consume_runtime_key_binding_config(invocation.key_binding_config);
         self.consume_runtime_pointer_config(invocation.pointer_config);
+        self.consume_runtime_input_config(invocation.input_config);
         self.consume_runtime_event_config(invocation.event_config);
         self.consume_runtime_process_config(invocation.process_config);
         if !invocation.process_actions.is_empty() {
@@ -1776,6 +1839,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(invocation.display_config);
         self.consume_runtime_key_binding_config(invocation.key_binding_config);
         self.consume_runtime_pointer_config(invocation.pointer_config);
+        self.consume_runtime_input_config(invocation.input_config);
         self.consume_runtime_event_config(invocation.event_config);
         self.consume_runtime_process_config(invocation.process_config);
         if !invocation.process_actions.is_empty() {

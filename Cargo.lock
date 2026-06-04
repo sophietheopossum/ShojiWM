@@ -2018,6 +2018,7 @@ dependencies = [
  "bitflags 2.11.0",
  "input-sys",
  "libc",
+ "log",
  "udev",
 ]
 
@@ -3927,6 +3928,7 @@ dependencies = [
  "fontdb 0.16.2",
  "fontdue",
  "hashbrown 0.15.5",
+ "input",
  "mimalloc",
  "png 0.17.16",
  "resvg",

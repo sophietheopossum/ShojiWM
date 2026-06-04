@@ -188,6 +188,7 @@ impl ShojiWM {
                                     invocation.key_binding_config,
                                 );
                                 self.consume_runtime_pointer_config(invocation.pointer_config);
+                                self.consume_runtime_input_config(invocation.input_config);
                                 self.consume_runtime_event_config(invocation.event_config);
                                 self.consume_runtime_process_config(invocation.process_config);
                                 if !invocation.process_actions.is_empty() {
@@ -635,6 +636,9 @@ impl ShojiWM {
                                     self.consume_runtime_pointer_config(
                                         invocation.pointer_config.clone(),
                                     );
+                                    self.consume_runtime_input_config(
+                                        invocation.input_config.clone(),
+                                    );
                                     self.consume_runtime_event_config(
                                         invocation.event_config.clone(),
                                     );
@@ -852,27 +856,37 @@ impl ShojiWM {
             }
             InputEvent::PointerAxis { event, .. } => {
                 let source = event.source();
+                let device = event.device();
+                let scroll_factor = crate::runtime_input::scroll_factor_for_backend_device(
+                    &self.runtime_input_config,
+                    &self.runtime_input_devices,
+                    &device,
+                );
 
                 let horizontal_amount = event.amount(Axis::Horizontal).unwrap_or_else(|| {
                     event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.
-                });
+                }) * scroll_factor;
                 let vertical_amount = event.amount(Axis::Vertical).unwrap_or_else(|| {
                     event.amount_v120(Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.
-                });
-                let horizontal_amount_discrete = event.amount_v120(Axis::Horizontal);
-                let vertical_amount_discrete = event.amount_v120(Axis::Vertical);
+                }) * scroll_factor;
+                let horizontal_amount_discrete = event
+                    .amount_v120(Axis::Horizontal)
+                    .map(|value| value * scroll_factor);
+                let vertical_amount_discrete = event
+                    .amount_v120(Axis::Vertical)
+                    .map(|value| value * scroll_factor);
 
                 let mut frame = AxisFrame::new(event.time_msec()).source(source);
                 if horizontal_amount != 0.0 {
                     frame = frame.value(Axis::Horizontal, horizontal_amount);
                     if let Some(discrete) = horizontal_amount_discrete {
-                        frame = frame.v120(Axis::Horizontal, discrete as i32);
+                        frame = frame.v120(Axis::Horizontal, discrete.round() as i32);
                     }
                 }
                 if vertical_amount != 0.0 {
                     frame = frame.value(Axis::Vertical, vertical_amount);
                     if let Some(discrete) = vertical_amount_discrete {
-                        frame = frame.v120(Axis::Vertical, discrete as i32);
+                        frame = frame.v120(Axis::Vertical, discrete.round() as i32);
                     }
                 }
 
@@ -1608,6 +1622,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(invocation.display_config.clone());
         self.consume_runtime_key_binding_config(invocation.key_binding_config.clone());
         self.consume_runtime_pointer_config(invocation.pointer_config.clone());
+        self.consume_runtime_input_config(invocation.input_config.clone());
         self.consume_runtime_event_config(invocation.event_config.clone());
         self.consume_runtime_process_config(invocation.process_config.clone());
         if !invocation.process_actions.is_empty() {

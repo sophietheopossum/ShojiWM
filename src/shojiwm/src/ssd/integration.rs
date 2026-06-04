@@ -650,6 +650,18 @@ impl DecorationRuntimeEvaluator {
         }
     }
 
+    pub fn sync_input_state(
+        &self,
+        input_state: std::collections::BTreeMap<
+            String,
+            crate::runtime_input::RuntimeInputDeviceSnapshot,
+        >,
+    ) {
+        if let Self::Node(evaluator) = self {
+            evaluator.set_input_state(input_state);
+        }
+    }
+
     pub fn set_async_event_sender(
         &self,
         sender: smithay::reexports::calloop::channel::Sender<
@@ -896,6 +908,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(invocation.display_config);
         self.consume_runtime_key_binding_config(invocation.key_binding_config);
         self.consume_runtime_pointer_config(invocation.pointer_config);
+        self.consume_runtime_input_config(invocation.input_config);
         self.consume_runtime_event_config(invocation.event_config);
         self.consume_runtime_process_config(invocation.process_config);
         if !invocation.process_actions.is_empty() {
@@ -946,6 +959,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(invocation.display_config);
         self.consume_runtime_key_binding_config(invocation.key_binding_config);
         self.consume_runtime_pointer_config(invocation.pointer_config);
+        self.consume_runtime_input_config(invocation.input_config);
         self.consume_runtime_event_config(invocation.event_config);
         self.consume_runtime_process_config(invocation.process_config);
         if !invocation.process_actions.is_empty() {
@@ -1055,6 +1069,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(invocation.display_config);
         self.consume_runtime_key_binding_config(invocation.key_binding_config);
         self.consume_runtime_pointer_config(invocation.pointer_config);
+        self.consume_runtime_input_config(invocation.input_config);
         self.consume_runtime_event_config(invocation.event_config);
         self.consume_runtime_process_config(invocation.process_config);
         if !invocation.process_actions.is_empty() {
@@ -1133,6 +1148,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(invocation.display_config.clone());
         self.consume_runtime_key_binding_config(invocation.key_binding_config.clone());
         self.consume_runtime_pointer_config(invocation.pointer_config.clone());
+        self.consume_runtime_input_config(invocation.input_config.clone());
         self.consume_runtime_event_config(invocation.event_config.clone());
         self.consume_runtime_process_config(invocation.process_config.clone());
         if !invocation.process_actions.is_empty() {
@@ -1264,6 +1280,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(evaluation.display_config.clone());
         self.consume_runtime_key_binding_config(evaluation.key_binding_config.clone());
         self.consume_runtime_pointer_config(evaluation.pointer_config.clone());
+        self.consume_runtime_input_config(evaluation.input_config.clone());
         self.consume_runtime_event_config(evaluation.event_config.clone());
         self.consume_runtime_process_config(evaluation.process_config.clone());
         if !evaluation.process_actions.is_empty() {
@@ -1892,6 +1909,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(evaluation.display_config.clone());
         self.consume_runtime_key_binding_config(evaluation.key_binding_config.clone());
         self.consume_runtime_pointer_config(evaluation.pointer_config.clone());
+        self.consume_runtime_input_config(evaluation.input_config.clone());
         self.consume_runtime_event_config(evaluation.event_config.clone());
         self.consume_runtime_process_config(evaluation.process_config.clone());
         if !evaluation.process_actions.is_empty() {
@@ -1965,6 +1983,7 @@ impl ShojiWM {
         let mut pending_display_config_updates = Vec::new();
         let mut pending_key_binding_config_updates = Vec::new();
         let mut pending_pointer_config_updates = Vec::new();
+        let mut pending_input_config_updates = Vec::new();
         let mut pending_event_config_updates = Vec::new();
         let mut pending_process_config_updates = Vec::new();
         let mut pending_process_actions = Vec::new();
@@ -2151,6 +2170,7 @@ impl ShojiWM {
                 pending_display_config_updates.push(evaluation.display_config.clone());
                 pending_key_binding_config_updates.push(evaluation.key_binding_config.clone());
                 pending_pointer_config_updates.push(evaluation.pointer_config.clone());
+                pending_input_config_updates.push(evaluation.input_config.clone());
                 pending_event_config_updates.push(evaluation.event_config.clone());
                 pending_process_config_updates.push(evaluation.process_config.clone());
                 pending_process_actions.extend(evaluation.process_actions.clone());
@@ -2480,6 +2500,7 @@ impl ShojiWM {
                     pending_display_config_updates.push(evaluation.display_config.clone());
                     pending_key_binding_config_updates.push(evaluation.key_binding_config.clone());
                     pending_pointer_config_updates.push(evaluation.pointer_config.clone());
+                    pending_input_config_updates.push(evaluation.input_config.clone());
                     pending_event_config_updates.push(evaluation.event_config.clone());
                     pending_process_config_updates.push(evaluation.process_config.clone());
                     pending_process_actions.extend(evaluation.process_actions.clone());
@@ -3402,6 +3423,9 @@ impl ShojiWM {
         }
         for update in pending_pointer_config_updates {
             self.consume_runtime_pointer_config(update);
+        }
+        for update in pending_input_config_updates {
+            self.consume_runtime_input_config(update);
         }
         for update in pending_event_config_updates {
             self.consume_runtime_event_config(update);

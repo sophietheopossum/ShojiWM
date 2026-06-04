@@ -58,6 +58,20 @@ import type {
   OutputPositionPreference,
   OutputResolutionPreference,
   OutputStateSnapshot,
+  InputAccelProfile,
+  InputClickMethod,
+  InputConfigDraft,
+  InputConfigureContext,
+  InputConfigureFactory,
+  InputController,
+  InputDeviceConfig,
+  InputDeviceInfo,
+  InputDeviceKindFlags,
+  InputScrollMethod,
+  InputTapButtonMap,
+  KeyboardInputConfig,
+  PointerInputConfig,
+  TouchpadInputConfig,
   ProcessController,
   ProcessEnv,
   ProcessLaunchSpec,
@@ -135,6 +149,7 @@ import {
   commitPointerConfigRegistration,
   takePendingPointerConfig,
 } from "./pointer";
+import { INPUT_CONTROLLER, installInputDeviceChangeEmitter } from "./input";
 import { OUTPUT_CONTROLLER, installOutputChangeEmitter } from "./output";
 import { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
 import { LAYER_CONTROLLER, updateLayerSnapshots } from "./layer";
@@ -237,6 +252,8 @@ export {
   type PointerMoveAsyncListener,
   type OutputChangeEvent,
   type OutputChangeListener,
+  type InputDeviceChangeEvent,
+  type InputDeviceChangeListener,
   type PointerMoveEvent,
   type PointerMovePoint,
   type RuntimeEventConfig,
@@ -281,6 +298,14 @@ export {
   commitPointerConfigRegistration,
   takePendingPointerConfig,
 } from "./pointer";
+export {
+  INPUT_CONTROLLER,
+  beginInputConfigurationRegistration,
+  commitInputConfigurationRegistration,
+  installInputDeviceChangeEmitter,
+  takePendingInputConfig,
+  updateInputState,
+} from "./input";
 export {
   PROCESS_CONTROLLER,
   beginProcessConfigRegistration,
@@ -476,6 +501,20 @@ export type {
   KeyBindingOptions,
   KeyBindingEventPhase,
   PointerController,
+  InputAccelProfile,
+  InputClickMethod,
+  InputConfigDraft,
+  InputConfigureContext,
+  InputConfigureFactory,
+  InputController,
+  InputDeviceConfig,
+  InputDeviceInfo,
+  InputDeviceKindFlags,
+  InputScrollMethod,
+  InputTapButtonMap,
+  KeyboardInputConfig,
+  PointerInputConfig,
+  TouchpadInputConfig,
   PreloadController,
   RuntimeController,
   DebugController,
@@ -554,6 +593,7 @@ export const WINDOW_MANAGER: WindowManagerDefinition = {
   process: PROCESS_CONTROLLER,
   key: KEY_BINDING_CONTROLLER,
   pointer: POINTER_CONTROLLER,
+  input: INPUT_CONTROLLER,
   runtime: RUNTIME_CONTROLLER,
   window: WINDOW_CONTROLLER,
   layer: LAYER_CONTROLLER,
@@ -562,6 +602,10 @@ export const WINDOW_MANAGER: WindowManagerDefinition = {
 
 installOutputChangeEmitter((event) => {
   WINDOW_MANAGER.event.emitOutputChange(event);
+});
+
+installInputDeviceChangeEmitter((event) => {
+  WINDOW_MANAGER.event.emitInputDeviceChange(event);
 });
 
 export function windowAction(action: WindowActionType): WindowActionDescriptor {

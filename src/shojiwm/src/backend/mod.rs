@@ -104,6 +104,7 @@ pub fn run_tty_udev() -> Result<(), Box<dyn std::error::Error>> {
         .insert_source(libinput_backend, |event, _, state| {
             state.record_event_source_wake("libinput");
             state.request_tty_maintenance("libinput");
+            state.handle_libinput_input_event(&event);
             state.process_input_event(event);
         })?;
 

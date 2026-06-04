@@ -23,6 +23,7 @@ pub mod input;
 pub mod presentation;
 pub mod protocols;
 pub mod runtime_debug;
+pub mod runtime_input;
 pub mod runtime_key_binding;
 pub mod runtime_pointer;
 pub mod runtime_process;
