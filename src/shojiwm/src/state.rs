@@ -35,7 +35,7 @@ use smithay::{
         wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDecorationMode,
         wayland_server::{
             Display, DisplayHandle, Resource,
-            backend::{ClientData, ClientId, DisconnectReason},
+            backend::{ClientData, ClientId, DisconnectReason, GlobalId},
             protocol::wl_surface::WlSurface,
         },
     },
@@ -299,6 +299,7 @@ pub struct ShojiWM {
     pub runtime_scheduler_kick_generation: u64,
     pub runtime_scheduler_kick_active: bool,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
+    pub runtime_output_globals: HashMap<String, GlobalId>,
     pub managed_window_animations: HashMap<String, BTreeMap<String, ActiveManagedWindowAnimation>>,
     pub managed_window_animation_sequence: u64,
     pub runtime_output_configs: std::collections::BTreeMap<String, RuntimeOutputConfig>,
@@ -803,6 +804,7 @@ impl ShojiWM {
             runtime_scheduler_kick_generation: 0,
             runtime_scheduler_kick_active: false,
             runtime_animation_outputs: Default::default(),
+            runtime_output_globals: Default::default(),
             managed_window_animations: Default::default(),
             managed_window_animation_sequence: 0,
             runtime_output_configs: Default::default(),
@@ -879,10 +881,12 @@ impl ShojiWM {
         state
     }
 
-    pub fn create_output_global(
-        &self,
-        output: &Output,
-    ) -> smithay::reexports::wayland_server::backend::GlobalId {
+    pub fn create_output_global(&mut self, output: &Output) -> GlobalId {
+        let output_name = output.name();
+        if let Some(global) = self.runtime_output_globals.get(&output_name) {
+            return global.clone();
+        }
+
         // Xwayland currently treats `wl_output.mode.refresh` more like process-global timing
         // input than per-surface/per-output state. On mixed-Hz setups this can make GLX/EGL X11
         // clients pace themselves to the wrong monitor even when the Wayland surface has entered
@@ -893,7 +897,7 @@ impl ShojiWM {
         // by ShojiWM's window placement/focus logic. Do not apply this to ordinary Wayland
         // clients; they must continue to see the real mode of every output.
         let refresh_override_mhz = self.xwayland_refresh_override_mhz.clone();
-        output.create_global_with_mode_refresh_override::<ShojiWM, _>(
+        let global = output.create_global_with_mode_refresh_override::<ShojiWM, _>(
             &self.display_handle,
             move |client| {
                 let is_builtin_xwayland = client
@@ -909,7 +913,17 @@ impl ShojiWM {
                 let refresh = refresh_override_mhz.load(Ordering::Acquire);
                 (refresh > 0).then_some(refresh)
             },
-        )
+        );
+        self.runtime_output_globals
+            .insert(output_name, global.clone());
+        global
+    }
+
+    pub(crate) fn remove_output_global(&mut self, output_name: &str) {
+        let Some(global) = self.runtime_output_globals.remove(output_name) else {
+            return;
+        };
+        self.display_handle.remove_global::<Self>(global);
     }
 
     pub fn seed_xwayland_refresh_override_from_output(
@@ -1781,6 +1795,13 @@ impl ShojiWM {
         for output in disabled_outputs {
             let name = output.name();
             self.space.unmap_output(&output);
+            self.remove_output_global(&name);
+            self.screencopy_state.remove_output(&output);
+            crate::backend::image_copy_capture_render::fail_pending_output_capture(
+                &mut self.image_copy_capture_pending,
+                &output,
+                smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown,
+            );
             self.output_capture_mirrors.remove(&name);
             self.runtime_animation_outputs.remove(&name);
             self.damage_blink_visible.remove(&name);
@@ -1811,6 +1832,7 @@ impl ShojiWM {
             }
 
             output.change_current_state(target_mode, None, target_scale, Some(target_position));
+            self.create_output_global(&output);
             self.space.map_output(&output, target_position);
         }
 
@@ -1847,6 +1869,7 @@ impl ShojiWM {
                 let _ = apply_tty_output_mode(self, &name, mode);
             }
             output.change_current_state(target_mode, None, target_scale, Some(source_position));
+            self.create_output_global(&output);
             self.space.map_output(&output, source_position);
         }
 

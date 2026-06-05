@@ -10,6 +10,7 @@ mod xwayland;
 use smithay::input::dnd::{DnDGrab, DndGrabHandler, GrabType, Source};
 use smithay::input::pointer::Focus;
 use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::output::Output;
 use smithay::desktop::{PopupKind, WindowSurfaceType, find_popup_root_surface, layer_map_for_output};
 use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::{
     Mode as KdeDecorationMode, OrgKdeKwinServerDecoration,
@@ -180,6 +181,14 @@ impl ImageCopyCaptureHandler for ShojiWM {
         let draw_cursor = session.draw_cursor();
         let source = session.source();
         if let Some(weak) = source.user_data().get::<WeakOutput>() {
+            let Some(output) = weak.upgrade() else {
+                frame.fail(CaptureFailureReason::Unknown);
+                return;
+            };
+            if !self.runtime_output_render_enabled(&output.name()) {
+                frame.fail(CaptureFailureReason::Unknown);
+                return;
+            }
             self.image_copy_capture_pending.push(PendingCapture {
                 frame,
                 target: CaptureTarget::Output(weak.clone()),
@@ -228,6 +237,9 @@ fn resolve_source_size(
     if let Some(weak) = source.user_data().get::<WeakOutput>()
         && let Some(output) = weak.upgrade()
     {
+        if !state.runtime_output_render_enabled(&output.name()) {
+            return None;
+        }
         let mode = output.current_mode()?;
         // Apply the output's transform so the captured buffer matches what
         // physically renders.
@@ -702,6 +714,10 @@ impl crate::protocols::screencopy::ScreencopyHandler for ShojiWM {
         // rendered, while with-damage requests wait until damage exists.
         self.screencopy_state.push(manager, screencopy);
         self.schedule_redraw();
+    }
+
+    fn screencopy_output_enabled(&self, output: &Output) -> bool {
+        self.runtime_output_render_enabled(&output.name())
     }
 
     fn screencopy_state(&mut self) -> &mut crate::protocols::screencopy::ScreencopyManagerState {

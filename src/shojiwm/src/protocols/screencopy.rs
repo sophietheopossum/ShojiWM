@@ -219,6 +219,12 @@ where
                     frame.failed();
                     return;
                 };
+                if !state.screencopy_output_enabled(&output) {
+                    trace!(output = %output.name(), "screencopy client requested disabled output");
+                    let frame = data_init.init(frame, ScreencopyFrameState::Failed);
+                    frame.failed();
+                    return;
+                }
 
                 let buffer_size = output.current_mode().unwrap().size;
                 let region_loc = Point::from((0, 0));
@@ -247,6 +253,12 @@ where
                     frame.failed();
                     return;
                 };
+                if !state.screencopy_output_enabled(&output) {
+                    trace!(output = %output.name(), "screencopy client requested disabled output");
+                    let frame = data_init.init(frame, ScreencopyFrameState::Failed);
+                    frame.failed();
+                    return;
+                }
 
                 let output_transform = output.current_transform();
                 let output_physical_size =
@@ -345,6 +357,8 @@ where
 pub trait ScreencopyHandler {
     fn frame(&mut self, manager: &ZwlrScreencopyManagerV1, screencopy: Screencopy);
 
+    fn screencopy_output_enabled(&self, output: &Output) -> bool;
+
     fn screencopy_state(&mut self) -> &mut ScreencopyManagerState;
 }
 
@@ -410,6 +424,20 @@ where
         else {
             return;
         };
+
+        if !state.screencopy_output_enabled(&info.output) {
+            trace!(output = %info.output.name(), "screencopy client copied disabled output");
+            frame.failed();
+            let state = state.screencopy_state();
+            let Some(queue) = state.queues.get_mut(manager) else {
+                return;
+            };
+            queue.remove_frame(frame);
+            if queue.is_empty() && !manager.is_alive() {
+                state.queues.remove(manager);
+            }
+            return;
+        }
 
         if copied.load(Ordering::SeqCst) {
             frame.post_error(

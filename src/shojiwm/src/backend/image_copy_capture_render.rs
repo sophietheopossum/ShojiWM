@@ -72,6 +72,25 @@ pub fn has_pending_output_capture(pending: &[PendingCapture], output: &Output) -
     })
 }
 
+pub fn fail_pending_output_capture(
+    pending: &mut Vec<PendingCapture>,
+    output: &Output,
+    reason: CaptureFailureReason,
+) {
+    let mut i = 0;
+    while i < pending.len() {
+        let matches = match &pending[i].target {
+            CaptureTarget::Output(weak) => weak.upgrade().is_some_and(|o| &o == output),
+            CaptureTarget::Toplevel(_) => false,
+        };
+        if !matches {
+            i += 1;
+            continue;
+        }
+        pending.remove(i).frame.fail(reason);
+    }
+}
+
 /// Render any queued image-copy-capture frames whose target is `output`.
 ///
 /// Consumes those entries from `pending`. Each handled frame either calls

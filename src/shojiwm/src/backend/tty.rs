@@ -9478,6 +9478,7 @@ fn connector_disconnected(
     };
     let output = surface.output;
     state.space.unmap_output(&output);
+    state.remove_output_global(&output_name);
     state.screencopy_state.remove_output(&output);
     state.output_capture_mirrors.remove(&output_name);
     state.runtime_output_configs.remove(&output_name);
