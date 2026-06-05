@@ -36,8 +36,6 @@ import {
   WINDOW_STATE_WORKSPACE_OPACITY,
 } from "./window-manager";
 
-const NOCTALIA_SHELL_PATH =
-  "/home/bea4dev/Documents/development/noctalia-shell-shojiwm";
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
 const HOT_RELOAD_WINDOW_MANAGER_STATE = "config.hybrid-window-manager";
 
@@ -111,42 +109,16 @@ WINDOW_MANAGER.onDisable(() => {
 });
 
 WINDOW_MANAGER.process.once("fcitx5", {
-  command: ["fcitx5", "-d"],
+  command: "fcitx5 -d",
   runPolicy: "once-per-session",
 });
 WINDOW_MANAGER.process.once("shell", {
-  command: ["qs", "--path", NOCTALIA_SHELL_PATH],
+  command: "cd ~/.config/shoji-bar-2 && ags run app.tsx",
   runPolicy: "once-per-session",
 });
 
 WINDOW_MANAGER.key.bind("terminal", "Super+T", () => {
   WINDOW_MANAGER.process.spawn({ command: ["kitty"] });
-});
-WINDOW_MANAGER.key.bind("launcher", "Super+A", () => {
-  WINDOW_MANAGER.process.spawn({
-    command: [
-      "qs",
-      "--path",
-      NOCTALIA_SHELL_PATH,
-      "ipc",
-      "call",
-      "launcher",
-      "toggle",
-    ],
-  });
-});
-WINDOW_MANAGER.key.bind("clipboard", "Super+V", () => {
-  WINDOW_MANAGER.process.spawn({
-    command: [
-      "qs",
-      "--path",
-      NOCTALIA_SHELL_PATH,
-      "ipc",
-      "call",
-      "launcher",
-      "clipboard",
-    ],
-  });
 });
 WINDOW_MANAGER.key.bind("screenshot", "Super+P", () => {
   WINDOW_MANAGER.process.spawn({
