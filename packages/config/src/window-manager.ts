@@ -980,7 +980,11 @@ export class HybridWindowManager {
    * inferred from the current index so the same vertical slide/fade transition
    * as keyboard/gesture switching plays (used by the IPC `workspaces.activate`).
    */
-  public switchWorkspaceTo(monitor: string, targetIndex: number) {
+  public switchWorkspaceTo(
+    monitor: string,
+    targetIndex: number,
+    options: { focusActiveAfter?: boolean } = {},
+  ) {
     this.workspaceGesture = null;
     this.syncWorkspaces();
     if (!monitor || targetIndex < 1) {
@@ -1023,7 +1027,12 @@ export class HybridWindowManager {
       toOpacity: 1,
       visibleAfter: true,
     });
-    toWorkspace.focusActiveWindow();
+    // Callers that explicitly want to focus a *different* window after the
+    // transition (e.g. dock activation) opt out of the implicit focus so the
+    // resulting onFocus callback chain does not stomp on their pan.
+    if (options.focusActiveAfter !== false) {
+      toWorkspace.focusActiveWindow();
+    }
     this.raiseTiledWorkspaceFloatingWindows(fromWorkspace);
     this.raiseTiledWorkspaceFloatingWindows(toWorkspace);
   }
@@ -1117,19 +1126,50 @@ export class HybridWindowManager {
   }
 
   /**
-   * Activate window by id with the same animation as a real activate request
-   * (focus + workspace switch). Returns true if the window existed.
+   * Activate window by id (dock-style "go to this window"). Plays a unified
+   * sequence: unminimize → switch workspace (if different) → pan within the
+   * workspace so the target is centered → focus. Doing the pan synchronously
+   * here (instead of relying on the onFocus → focusWindow callback) gives the
+   * same in-sync animation as `Super+Ctrl+Left/Right` and guarantees a visible
+   * pan even when the target is already in the viewport.
+   *
+   * Returns true if the window existed.
    */
   public activateWindowById(windowId: string): boolean {
     const window = this.findWindowById(windowId);
     if (!window) {
       return false;
     }
-    this.onWindowActivateRequest({
-      window,
-      source: "api",
-      timestamp: Date.now(),
+    const workspace = this.findWorkspaceForWindow(window);
+    if (!workspace) {
+      return false;
+    }
+
+    if (window.state[WINDOW_STATE_MINIMIZED]()) {
+      this.onWindowMinimizeRequest({
+        window,
+        minimized: false,
+        source: "api",
+        timestamp: Date.now(),
+      });
+    }
+
+    // Cross-workspace: switch first with the existing slide/fade. Skip the
+    // implicit focusActiveWindow — we explicitly focus the target below, and
+    // letting switchWorkspaceTo focus the previous active would queue an
+    // onFocus → focusWindow → applyLayout cycle that overrides our pan.
+    this.switchWorkspaceTo(workspace.monitor, workspace.index, {
+      focusActiveAfter: false,
     });
+
+    // Always pan to the target inside the workspace (force-center even if it
+    // is already on-screen). This is the "go to this window" gesture.
+    if (workspace.isTiled) {
+      workspace.panToWindow(window);
+    }
+
+    // Focus last so it overrides switchWorkspaceTo's focusActiveWindow().
+    window.focus();
     return true;
   }
 
@@ -2382,6 +2422,23 @@ export class Workspace {
     this.applyLayout();
   }
 
+  /**
+   * "Go to this window": center the target in the viewport (overriding the
+   * normal `scrollToWindow` which is a no-op when already visible) and animate
+   * the layout. Used by dock clicks and any other "jump to window" gesture.
+   */
+  public panToWindow(window: WaylandWindow) {
+    if (!this.isTiled) {
+      return;
+    }
+    if (!this.shouldTile(window)) {
+      return;
+    }
+    this.activeWindowId = window.id;
+    this.scrollToWindow(window, { force: true });
+    this.applyLayout();
+  }
+
   public focusWindowAtPoint(x: number, y: number): WaylandWindow | undefined {
     if (!this.isTiled) {
       return undefined;
@@ -2854,7 +2911,10 @@ export class Workspace {
     };
   }
 
-  private scrollToWindow(window: WaylandWindow) {
+  private scrollToWindow(
+    window: WaylandWindow,
+    options: { force?: boolean } = {},
+  ) {
     this.stopKineticScroll();
 
     const tileable = this.tileableWindows();
@@ -2869,7 +2929,10 @@ export class Workspace {
     const windowRight =
       windowLeft + this.tileWidthForWindow(window, viewportRect);
 
-    if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+    if (window.state[WINDOW_STATE_MAXIMIZED]() || options.force) {
+      // Center the window in the viewport. `force` is set by dock-style "go to
+      // this window" requests where we always want a visible pan, even when
+      // the target is already on-screen.
       this.scrollOffset =
         windowLeft + (windowRight - windowLeft) / 2 - viewportWidth / 2;
     } else if (windowLeft < this.scrollOffset) {
