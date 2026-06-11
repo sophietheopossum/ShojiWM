@@ -35,6 +35,7 @@ import {
   drainPendingProcessActions,
   hasActiveAnimations,
   type CompiledEffectHandle,
+  type LayerEffectAssignment,
   createReactiveLayer,
   createWindowAnimationControllerWithStore,
   createCompositionEvaluationCache,
@@ -717,7 +718,7 @@ interface RuntimeFailure {
 
 interface RuntimeLayerEffectAssignment {
   layerId: string;
-  effect: CompiledEffectHandle | null;
+  effects: LayerEffectAssignment | null;
 }
 
 interface RuntimeEffectConfig {
@@ -725,6 +726,7 @@ interface RuntimeEffectConfig {
   window?: (
     window: ReturnType<typeof createCompositionEvaluationCache>["window"],
   ) => WindowEffectAssignment | null;
+  layer?: (layer: WaylandLayer) => LayerEffectAssignment | null;
 }
 
 interface RuntimeProcessConfigEntry {
@@ -1372,6 +1374,7 @@ async function main() {
           } else if (request.kind === "evaluateLayerEffects") {
             const result = evaluateLayerEffects(
               events,
+              effectConfig,
               request.outputName,
               request.layers,
             );
@@ -2284,6 +2287,7 @@ function createRuntimeLayerEntry(
 
 function evaluateLayerEffects(
   events: WindowManagerEventController,
+  effectConfig: RuntimeEffectConfig,
   outputName: string,
   snapshots: WaylandLayerSnapshot[],
 ): {
@@ -2303,7 +2307,7 @@ function evaluateLayerEffects(
     }
     effects.push({
       layerId: snapshot.id,
-      effect: snapshotLayerEffect(entry.layer),
+      effects: evaluateLayerEffect(effectConfig, entry.layer),
     });
   }
 
@@ -2372,13 +2376,18 @@ function layerUsableAreaChanged(
   );
 }
 
-function snapshotLayerEffect(layer: WaylandLayer): CompiledEffectHandle | null {
+function evaluateLayerEffect(
+  effectConfig: RuntimeEffectConfig,
+  layer: WaylandLayer,
+): LayerEffectAssignment | null {
+  const evaluate = effectConfig.layer;
+  if (!evaluate) {
+    return null;
+  }
+
   enterLayerDependencyScope(layer.id);
   try {
-    if (layer.effect == null) {
-      return null;
-    }
-    return resolveSignals(layer.effect) as CompiledEffectHandle;
+    return resolveSignals(evaluate(layer)) as LayerEffectAssignment | null;
   } finally {
     leaveLayerDependencyScope();
   }
@@ -3139,6 +3148,7 @@ function resolveEffectConfig(
             effect?: {
               background_effect?: CompiledEffectHandle | null;
               window?: RuntimeEffectConfig["window"];
+              layer?: RuntimeEffectConfig["layer"];
             };
           }
         | undefined
@@ -3147,6 +3157,7 @@ function resolveEffectConfig(
   return {
     background_effect: maybeEffect?.background_effect ?? null,
     window: maybeEffect?.window,
+    layer: maybeEffect?.layer,
   };
 }
 

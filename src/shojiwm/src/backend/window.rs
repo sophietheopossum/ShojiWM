@@ -266,6 +266,89 @@ where
         .collect()
 }
 
+/// Render elements of a layer surface's own surface tree, *excluding* its
+/// xdg_popups. Counterpart of `layer_surface_elements` for callers that
+/// handle popups separately (per-popup effects).
+pub fn layer_surface_root_elements<R>(
+    renderer: &mut R,
+    output: &smithay::output::Output,
+    layer_surface: &LayerSurface,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Vec<WaylandSurfaceRenderElement<R>>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    let map = layer_map_for_output(output);
+    map.layer_geometry(layer_surface)
+        .map(|geo| (geo.loc - layer_surface.geometry().loc, layer_surface))
+        .into_iter()
+        .flat_map(|(loc, surface)| {
+            render_elements_from_surface_tree(
+                renderer,
+                surface.wl_surface(),
+                loc.to_physical_precise_round(scale),
+                scale,
+                alpha,
+                Kind::Unspecified,
+            )
+        })
+        .collect()
+}
+
+/// Per-popup element groups of a layer surface's xdg_popups, front-to-back in
+/// the same order `LayerSurface::render_elements` would have produced them.
+/// Each entry carries the popup's runtime id and its geometry box as an
+/// output-local logical rect (the rect popup effects apply to).
+pub fn layer_surface_popup_groups<R>(
+    renderer: &mut R,
+    output: &smithay::output::Output,
+    layer_surface: &LayerSurface,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Vec<(
+    String,
+    crate::ssd::LogicalRect,
+    Vec<WaylandSurfaceRenderElement<R>>,
+)>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    let map = layer_map_for_output(output);
+    let Some(geo) = map.layer_geometry(layer_surface) else {
+        return Vec::new();
+    };
+    let loc = geo.loc - layer_surface.geometry().loc;
+    PopupManager::popups_for_surface(layer_surface.wl_surface())
+        .map(|(popup, popup_offset)| {
+            let popup_geometry = popup.geometry();
+            let rect = crate::ssd::LogicalRect::new(
+                loc.x + popup_offset.x,
+                loc.y + popup_offset.y,
+                popup_geometry.size.w,
+                popup_geometry.size.h,
+            );
+            let render_origin =
+                (loc + popup_offset - popup_geometry.loc).to_physical_precise_round(scale);
+            let elements = render_elements_from_surface_tree(
+                renderer,
+                popup.wl_surface(),
+                render_origin,
+                scale,
+                alpha,
+                Kind::Unspecified,
+            );
+            (
+                crate::ssd::popup_runtime_id(popup.wl_surface()),
+                rect,
+                elements,
+            )
+        })
+        .collect()
+}
+
 pub fn surface_elements<R>(
     window: &Window,
     renderer: &mut R,

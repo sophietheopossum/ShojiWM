@@ -10,6 +10,7 @@ import {
   WindowBorder,
   backdropSource,
   compileEffect,
+  compileLayerEffect,
   dualKawaseBlur,
   type SSDStyle,
   type WaylandWindow,
@@ -17,9 +18,11 @@ import {
   useState,
   shaderStage,
   loadShader,
+  layerSource,
   ManagedWindow,
   read,
   type DisplayConfigDraft,
+  compilePopupEffect,
 } from "shoji_wm";
 import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
 import { createIpcServer } from "shoji_wm/ipc";
@@ -373,6 +376,56 @@ WINDOW_MANAGER.effect.background_effect = compileEffect({
   invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
   pipeline: [dualKawaseBlur({ radius: 4, passes: 2 })],
 });
+
+const LAYER_BLUR_MASK = compileLayerEffect({
+  input: backdropSource(),
+  invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
+  // The mask stage intentionally outputs transparency (the blur is clipped
+  // to the layer's own alpha), so the pipeline's alpha must survive the
+  // finish/display passes instead of being forced opaque.
+  alpha: "preserve",
+  pipeline: [
+    dualKawaseBlur({ radius: 4, passes: 2 }),
+    shaderStage(loadShader("./src/layer-blur-mask.frag"), {
+      textures: {
+        layer_mask: layerSource(),
+      },
+      uniforms: {
+        opacity_threshold: 0.25,
+        mask_feather: 0.04,
+      },
+    }),
+  ],
+});
+
+WINDOW_MANAGER.effect.layer = () => ({
+  behind: LAYER_BLUR_MASK,
+});
+
+const LAYER_POPUP_BLUR_MASK = compilePopupEffect({
+  input: backdropSource(),
+  invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
+  // The mask stage intentionally outputs transparency (the blur is clipped
+  // to the layer's own alpha), so the pipeline's alpha must survive the
+  // finish/display passes instead of being forced opaque.
+  alpha: "preserve",
+  pipeline: [
+    dualKawaseBlur({ radius: 4, passes: 2 }),
+    shaderStage(loadShader("./src/layer-blur-mask.frag"), {
+      textures: {
+        layer_mask: layerSource(),
+      },
+      uniforms: {
+        opacity_threshold: 0.25,
+        mask_feather: 0.04,
+      },
+    }),
+  ],
+});
+
+WINDOW_MANAGER.effect.popup = () => ({
+  behind: LAYER_POPUP_BLUR_MASK,
+})
 
 WINDOW_MANAGER.event.onOpen((window) => {
   HYBRID_WINDOW_MANAGER.onOpen(window);

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use smithay::{
     backend::{
         renderer::{
-            ImportEgl, ImportMemWl,
+            ImportEgl, ImportMemWl, Texture,
             damage::OutputDamageTracker,
             element::Element,
             element::solid::SolidColorRenderElement,
@@ -149,6 +149,449 @@ fn capture_snapshot_from_output_elements(
     )
 }
 
+fn layer_surface_logical_rect(
+    output: &Output,
+    layer_surface: &smithay::desktop::LayerSurface,
+) -> Option<crate::ssd::LogicalRect> {
+    let map = layer_map_for_output(output);
+    let geometry = map.layer_geometry(layer_surface)?;
+    let output_location = output.current_location();
+    Some(crate::ssd::LogicalRect::new(
+        output_location.x + geometry.loc.x,
+        output_location.y + geometry.loc.y,
+        geometry.size.w,
+        geometry.size.h,
+    ))
+}
+
+fn expand_effect_rect(
+    rect: crate::ssd::LogicalRect,
+    outsets: crate::ssd::EffectOutsets,
+) -> crate::ssd::LogicalRect {
+    crate::ssd::LogicalRect::new(
+        rect.x - outsets.left,
+        rect.y - outsets.top,
+        rect.width + outsets.left + outsets.right,
+        rect.height + outsets.top + outsets.bottom,
+    )
+}
+
+fn layer_source_effect_element(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    layer_id: &str,
+    placement: &'static str,
+    layer_rect: crate::ssd::LogicalRect,
+    effect: &crate::ssd::WindowEffectSlot,
+    source_elements: &[WinitRenderElements],
+    cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+) -> Vec<WinitRenderElements> {
+    if !matches!(effect.effect.input, crate::ssd::EffectInput::LayerSource(_))
+        || source_elements.is_empty()
+    {
+        return Vec::new();
+    }
+    let rect = expand_effect_rect(layer_rect, effect.outsets);
+    if rect.width <= 0 || rect.height <= 0 {
+        return Vec::new();
+    }
+    let logical = Rectangle::new(
+        Point::from((rect.x, rect.y)),
+        (rect.width, rect.height).into(),
+    );
+    if logical.intersection(output_geo).is_none() {
+        return Vec::new();
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    placement.hash(&mut hasher);
+    layer_id.hash(&mut hasher);
+    output.name().hash(&mut hasher);
+    format!("{:?}", effect).hash(&mut hasher);
+    scale.x.to_bits().hash(&mut hasher);
+    scale.y.to_bits().hash(&mut hasher);
+    crate::backend::snapshot::render_element_scene_signature(source_elements, scale)
+        .hash(&mut hasher);
+    let signature = hasher.finish();
+    let state = cache
+        .entry(format!("{}@{}@{}", layer_id, placement, output.name()))
+        .or_default();
+    if state.signature != signature {
+        state.signature = signature;
+        state.commit_counter.increment();
+    }
+
+    let mut tracker = OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
+    let Ok(Some(source)) = capture_snapshot_from_output_elements(
+        renderer,
+        output_geo,
+        rect,
+        scale,
+        None,
+        &mut tracker,
+        source_elements,
+    ) else {
+        return Vec::new();
+    };
+    let texture_size = source.texture.size();
+    let Ok(texture) = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
+        renderer,
+        format!(
+            "winit:layer-effect:{}:{}:{}",
+            output.name(),
+            layer_id,
+            placement
+        ),
+        source.texture,
+        None,
+        (texture_size.w, texture_size.h),
+        None,
+        Some((texture_size.w, texture_size.h)),
+        &effect.effect,
+    ) else {
+        return Vec::new();
+    };
+    let texture_size = texture.size();
+    let capture_origin: Point<i32, smithay::utils::Physical> = (Point::from((rect.x, rect.y))
+        - output_geo.loc)
+        .to_f64()
+        .to_physical_precise_round(scale);
+    let geometry = Rectangle::new(capture_origin, (texture_size.w, texture_size.h).into());
+    crate::backend::shader_effect::backdrop_shader_element_with_geometry(
+        renderer,
+        state.id.clone(),
+        state.commit_counter,
+        texture,
+        logical,
+        geometry,
+        logical,
+        logical,
+        &effect.effect,
+        1.0,
+        scale.x as f32,
+        [0.0, 0.0],
+        None,
+        0.0,
+        format!("layer-effect:{}:{}:{}", placement, output.name(), layer_id),
+    )
+    .ok()
+    .map(WinitRenderElements::Backdrop)
+    .into_iter()
+    .collect()
+}
+
+/// Popup counterpart of `layer_source_effect_element`: captures the popup's
+/// own elements and runs the slot's pipeline (popupSource input).
+fn popup_source_effect_element(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    popup_id: &str,
+    placement: &'static str,
+    popup_rect: crate::ssd::LogicalRect,
+    effect: &crate::ssd::WindowEffectSlot,
+    source_elements: &[WinitRenderElements],
+    cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+) -> Vec<WinitRenderElements> {
+    if !matches!(effect.effect.input, crate::ssd::EffectInput::PopupSource(_))
+        || source_elements.is_empty()
+    {
+        return Vec::new();
+    }
+    let rect = expand_effect_rect(popup_rect, effect.outsets);
+    if rect.width <= 0 || rect.height <= 0 {
+        return Vec::new();
+    }
+    let logical = Rectangle::new(
+        Point::from((rect.x, rect.y)),
+        (rect.width, rect.height).into(),
+    );
+    if logical.intersection(output_geo).is_none() {
+        return Vec::new();
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    placement.hash(&mut hasher);
+    popup_id.hash(&mut hasher);
+    output.name().hash(&mut hasher);
+    format!("{:?}", effect).hash(&mut hasher);
+    scale.x.to_bits().hash(&mut hasher);
+    scale.y.to_bits().hash(&mut hasher);
+    crate::backend::snapshot::render_element_scene_signature(source_elements, scale)
+        .hash(&mut hasher);
+    let signature = hasher.finish();
+    let state = cache
+        .entry(format!("{}@{}@{}", popup_id, placement, output.name()))
+        .or_default();
+    if state.signature != signature {
+        state.signature = signature;
+        state.commit_counter.increment();
+    }
+
+    let mut tracker = OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
+    let Ok(Some(source)) = capture_snapshot_from_output_elements(
+        renderer,
+        output_geo,
+        rect,
+        scale,
+        None,
+        &mut tracker,
+        source_elements,
+    ) else {
+        return Vec::new();
+    };
+    let texture_size = source.texture.size();
+    let Ok(texture) = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
+        renderer,
+        format!(
+            "winit:popup-effect:{}:{}:{}",
+            output.name(),
+            popup_id,
+            placement
+        ),
+        source.texture,
+        None,
+        (texture_size.w, texture_size.h),
+        None,
+        Some((texture_size.w, texture_size.h)),
+        &effect.effect,
+    ) else {
+        return Vec::new();
+    };
+    let texture_size = texture.size();
+    let capture_origin: Point<i32, smithay::utils::Physical> = (Point::from((rect.x, rect.y))
+        - output_geo.loc)
+        .to_f64()
+        .to_physical_precise_round(scale);
+    let geometry = Rectangle::new(capture_origin, (texture_size.w, texture_size.h).into());
+    crate::backend::shader_effect::backdrop_shader_element_with_geometry(
+        renderer,
+        state.id.clone(),
+        state.commit_counter,
+        texture,
+        logical,
+        geometry,
+        logical,
+        logical,
+        &effect.effect,
+        1.0,
+        scale.x as f32,
+        [0.0, 0.0],
+        None,
+        0.0,
+        format!("popup-effect:{}:{}:{}", placement, output.name(), popup_id),
+    )
+    .ok()
+    .map(WinitRenderElements::Backdrop)
+    .into_iter()
+    .collect()
+}
+
+fn compose_layer_source_effects(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    layer_id: &str,
+    layer_rect: crate::ssd::LogicalRect,
+    effects: &crate::ssd::WindowEffectConfig,
+    // Shown when no `replace` slot is active. Excludes the layer's popups:
+    // those are displayed (and effect-composed) separately.
+    display_elements: Vec<WinitRenderElements>,
+    // What layerSource() captures sample. Includes popups ("full" semantics).
+    capture_elements: &[WinitRenderElements],
+    cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+) -> Vec<WinitRenderElements> {
+    let mut render = |placement, effect| {
+        layer_source_effect_element(
+            renderer,
+            output,
+            output_geo,
+            scale,
+            layer_id,
+            placement,
+            layer_rect,
+            effect,
+            capture_elements,
+            cache,
+        )
+    };
+    let in_front = effects
+        .in_front
+        .as_ref()
+        .map(|effect| render("layer-in-front", effect))
+        .unwrap_or_default();
+    let replacement = effects
+        .replace
+        .as_ref()
+        .map(|effect| render("layer-replace", effect))
+        .unwrap_or_default();
+    let behind_root = effects
+        .behind_root_surface
+        .as_ref()
+        .map(|effect| render("layer-behind-root-surface", effect))
+        .unwrap_or_default();
+    let behind = effects
+        .behind
+        .as_ref()
+        .map(|effect| render("layer-behind", effect))
+        .unwrap_or_default();
+
+    let mut elements = Vec::new();
+    elements.extend(in_front);
+    if replacement.is_empty() {
+        elements.extend(display_elements);
+    } else {
+        elements.extend(replacement);
+    }
+    elements.extend(behind_root);
+    elements.extend(behind);
+    elements
+}
+
+/// Display elements for all popups of a layer surface, each composed with its
+/// configured popup effects. See the tty counterpart for details.
+fn composed_popup_scene_elements(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    layer_surface: &smithay::desktop::LayerSurface,
+    configured_popup_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
+    popup_effect_cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+    popup_framebuffer_effect_states: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::ShaderEffectElementState,
+    >,
+) -> Vec<WinitRenderElements> {
+    let groups =
+        window_render::layer_surface_popup_groups(renderer, output, layer_surface, scale, 1.0);
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let output_loc = output.current_location();
+    let mut elements = Vec::new();
+    for (popup_id, local_rect, raw_elements) in groups {
+        let popup_elements = raw_elements
+            .into_iter()
+            .map(WinitRenderElements::Window)
+            .collect::<Vec<_>>();
+        let Some(effects) = configured_popup_effects.get(&popup_id) else {
+            elements.extend(popup_elements);
+            continue;
+        };
+        let popup_rect = crate::ssd::LogicalRect::new(
+            output_loc.x + local_rect.x,
+            output_loc.y + local_rect.y,
+            local_rect.width,
+            local_rect.height,
+        );
+
+        let mut render_slot = |placement: &'static str,
+                               effect: &crate::ssd::WindowEffectSlot|
+         -> Vec<WinitRenderElements> {
+            if !matches!(effect.effect.input, crate::ssd::EffectInput::PopupSource(_)) {
+                return Vec::new();
+            }
+            popup_source_effect_element(
+                renderer,
+                output,
+                output_geo,
+                scale,
+                &popup_id,
+                placement,
+                popup_rect,
+                effect,
+                &popup_elements,
+                popup_effect_cache,
+            )
+        };
+
+        let in_front = effects
+            .in_front
+            .as_ref()
+            .map(|effect| render_slot("popup-in-front", effect))
+            .unwrap_or_default();
+        let replacement = effects
+            .replace
+            .as_ref()
+            .map(|effect| render_slot("popup-replace", effect))
+            .unwrap_or_default();
+        let behind_root = effects
+            .behind_root_surface
+            .as_ref()
+            .map(|effect| render_slot("popup-behind-root-surface", effect))
+            .unwrap_or_default();
+        let behind_popup_source = effects
+            .behind
+            .as_ref()
+            .filter(|effect| {
+                matches!(effect.effect.input, crate::ssd::EffectInput::PopupSource(_))
+            })
+            .map(|effect| render_slot("popup-behind", effect))
+            .unwrap_or_default();
+        // Backdrop-input behind effects resolve from the framebuffer below the
+        // popup at draw time (no offline capture path for popups).
+        let behind_backdrop = effects
+            .behind
+            .as_ref()
+            .filter(|effect| {
+                !matches!(effect.effect.input, crate::ssd::EffectInput::PopupSource(_))
+            })
+            .filter(|effect| effect.effect.supports_framebuffer_backdrop())
+            .and_then(|effect| {
+                let rect = expand_effect_rect(popup_rect, effect.outsets);
+                let stable_key =
+                    format!("{}@popup-behind-framebuffer@{}", popup_id, output.name());
+                crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rects(
+                    renderer,
+                    popup_framebuffer_effect_states
+                        .entry(stable_key)
+                        .or_default(),
+                    &[rect],
+                    effect.effect.clone(),
+                    output_geo,
+                    scale,
+                    1.0,
+                )
+                .ok()
+                .flatten()
+            })
+            .map(|element| {
+                vec![WinitRenderElements::Decoration(
+                    decoration::DecorationSceneElements::Backdrop(element),
+                )]
+            })
+            .unwrap_or_default();
+
+        elements.extend(in_front);
+        if replacement.is_empty() {
+            elements.extend(popup_elements);
+        } else {
+            elements.extend(replacement);
+        }
+        elements.extend(behind_root);
+        elements.extend(behind_popup_source);
+        elements.extend(behind_backdrop);
+    }
+    elements
+}
+
 pub fn init_winit(
     event_loop: &mut EventLoop<ShojiWM>,
     state: &mut ShojiWM,
@@ -219,6 +662,9 @@ pub fn init_winit(
                     let layer_effects_started_at = Instant::now();
                     if let Err(err) = state.refresh_layer_effects_for_output(output.name().as_str()) {
                         warn!(error = ?err, "failed to refresh layer effects for winit");
+                    }
+                    if let Err(err) = state.refresh_popup_effects_for_output(output.name().as_str()) {
+                        warn!(error = ?err, "failed to refresh popup effects for winit");
                     }
                     let layer_effects_elapsed_ms =
                         layer_effects_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -2436,34 +2882,86 @@ fn lower_layer_scene_elements(
     _windows_top_to_bottom: &[smithay::desktop::Window],
 ) -> Vec<WinitRenderElements> {
     let (_, lower_layers) = window_render::layer_surfaces_for_output(output);
-    let Some(config) = state.configured_background_effect.clone() else {
-        return lower_layers
-            .into_iter()
-            .flat_map(|layer_surface| {
-                window_render::layer_surface_elements(renderer, output, &layer_surface, scale, 1.0)
-                    .into_iter()
-                    .map(WinitRenderElements::Window)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-    };
 
     let mut elements = Vec::new();
     for (index, layer_surface) in lower_layers.iter().enumerate() {
-        let layer_id = layer_surface.wl_surface().id().protocol_id();
-        elements.extend(
-            window_render::layer_surface_elements(renderer, output, layer_surface, scale, 1.0)
-                .into_iter()
-                .map(WinitRenderElements::Window),
-        );
-        let rects = protocol_background_effect_rects_for_layer(output, layer_surface);
+        let layer_id = crate::ssd::layer_runtime_id(layer_surface);
+        // Popups draw above their layer; compose their effects per popup.
+        let configured_popup_effects = state.configured_popup_effects.clone();
+        elements.extend(composed_popup_scene_elements(
+            renderer,
+            output,
+            output_geo,
+            scale,
+            layer_surface,
+            &configured_popup_effects,
+            &mut state.popup_effect_cache,
+            &mut state.popup_framebuffer_effect_states,
+        ));
+        let root_elements = window_render::layer_surface_root_elements(
+            renderer,
+            output,
+            layer_surface,
+            scale,
+            1.0,
+        )
+        .into_iter()
+        .map(WinitRenderElements::Window)
+        .collect::<Vec<_>>();
+        let effects = state.configured_layer_effects.get(&layer_id).cloned();
+        if let (Some(effects), Some(layer_rect)) =
+            (effects, layer_surface_logical_rect(output, layer_surface))
+        {
+            let capture_elements =
+                window_render::layer_surface_elements(renderer, output, layer_surface, scale, 1.0)
+                    .into_iter()
+                    .map(WinitRenderElements::Window)
+                    .collect::<Vec<_>>();
+            elements.extend(compose_layer_source_effects(
+                renderer,
+                output,
+                output_geo,
+                scale,
+                &layer_id,
+                layer_rect,
+                &effects,
+                root_elements,
+                &capture_elements,
+                &mut state.layer_effect_cache,
+            ));
+        } else {
+            elements.extend(root_elements);
+        }
+        let custom_background = state
+            .configured_layer_effects
+            .get(&layer_id)
+            .and_then(|effects| effects.behind.as_ref())
+            .filter(|effect| effect.effect.is_backdrop())
+            .cloned();
+        let custom_config =
+            custom_background
+                .as_ref()
+                .map(|effect| crate::ssd::BackgroundEffectConfig {
+                    effect: effect.effect.clone(),
+                });
+        let config = custom_config.or_else(|| state.configured_background_effect.clone());
+        let Some(config) = config.as_ref() else {
+            continue;
+        };
+        let rects = if let Some(effect) = custom_background.as_ref() {
+            layer_surface_logical_rect(output, layer_surface)
+                .map(|rect| vec![expand_effect_rect(rect, effect.outsets)])
+                .unwrap_or_default()
+        } else {
+            protocol_background_effect_rects_for_layer(output, layer_surface)
+        };
         let Some(effect_rect) = crate::backend::window::bounding_box_for_rects(&rects) else {
             continue;
         };
         let stable_key = format!(
             "__layer_background_effect_{}_{}_{}_{}x{}",
             output.name(),
-            layer_id,
+            layer_surface.wl_surface().id().protocol_id(),
             index,
             effect_rect.width,
             effect_rect.height
@@ -2645,35 +3143,90 @@ fn lower_layer_scene_elements(
         } else {
             None
         };
-        let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
-            renderer,
-            format!("winit:layer-lower:{}", stable_key),
-            backdrop_texture
-                .clone()
-                .or_else(|| xray_texture.clone())
-                .unwrap_or(snapshot.texture),
-            xray_texture,
-            crate::backend::visual::logical_size_to_physical_buffer_size(
-                capture_geo.size.w,
-                capture_geo.size.h,
+        let layer_source_texture = config
+            .effect
+            .uses_layer_source_input()
+            .then(|| {
+                let layer_source_geo = Rectangle::new(
+                    smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
+                    (effect_rect.width, effect_rect.height).into(),
+                );
+                let layer_source_origin =
+                    crate::backend::visual::logical_point_to_physical_point_global_edges(
+                        layer_source_geo.loc,
+                        output_geo.loc,
+                        scale,
+                    );
+                let scene = layer_surface_scene_elements_for_capture(
+                    renderer,
+                    output,
+                    layer_source_geo,
+                    layer_source_origin,
+                    scale,
+                    layer_surface,
+                );
+                capture_scene_texture_for_effect(
+                    renderer,
+                    "winit-layer-lower-source",
+                    layer_source_geo,
+                    scale,
+                    &scene,
+                )
+            })
+            .flatten();
+        // Skip the effect this frame when the layer source could not be
+        // captured (empty scene / zero-sized geometry); running the pipeline
+        // without it would fail inside resolve_effect_input.
+        if config.effect.uses_layer_source_input() && layer_source_texture.is_none() {
+            continue;
+        }
+        let input_texture = backdrop_texture
+            .clone()
+            .or_else(|| xray_texture.clone())
+            .unwrap_or(snapshot.texture);
+        let input_size = crate::backend::visual::logical_size_to_physical_buffer_size(
+            capture_geo.size.w,
+            capture_geo.size.h,
+            scale,
+        );
+        let sample_region = Some(
+            crate::backend::visual::logical_rect_to_physical_buffer_rect_f64(
+                effect_rect,
+                capture_geo.loc,
                 scale,
             ),
-            Some(
-                crate::backend::visual::logical_rect_to_physical_buffer_rect_f64(
-                    effect_rect,
-                    capture_geo.loc,
-                    scale,
-                ),
+        );
+        let output_size = Some(
+            crate::backend::visual::logical_size_to_physical_buffer_size(
+                effect_rect.width,
+                effect_rect.height,
+                scale,
             ),
-            Some(
-                crate::backend::visual::logical_size_to_physical_buffer_size(
-                    effect_rect.width,
-                    effect_rect.height,
-                    scale,
-                ),
-            ),
-            &config.effect,
-        )
+        );
+        let texture = if let Some(layer_source_texture) = layer_source_texture {
+            crate::backend::shader_effect::apply_effect_pipeline_cached_for_key_with_layer_source(
+                renderer,
+                format!("winit:layer-lower:{}", stable_key),
+                input_texture,
+                xray_texture,
+                layer_source_texture,
+                input_size,
+                sample_region,
+                output_size,
+                &config.effect,
+            )
+        } else {
+            crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
+                renderer,
+                format!("winit:layer-lower:{}", stable_key),
+                input_texture,
+                xray_texture,
+                input_size,
+                sample_region,
+                output_size,
+                &config.effect,
+            )
+        }
         .ok();
         let Some(texture) = texture else {
             continue;
@@ -2770,17 +3323,22 @@ fn configured_background_effect_elements_for_layer(
     windows_top_to_bottom: &[smithay::desktop::Window],
     layer_surface: &smithay::desktop::LayerSurface,
     alpha: f32,
+    custom_background: Option<&crate::ssd::WindowEffectSlot>,
 ) -> Vec<WinitRenderElements> {
     let layer_id = crate::ssd::layer_runtime_id(layer_surface);
-    let Some(config) = state
-        .configured_layer_effects
-        .get(&layer_id)
-        .cloned()
-        .or_else(|| state.configured_background_effect.clone())
-    else {
+    let custom_config = custom_background.map(|effect| crate::ssd::BackgroundEffectConfig {
+        effect: effect.effect.clone(),
+    });
+    let Some(config) = custom_config.or_else(|| state.configured_background_effect.clone()) else {
         return Vec::new();
     };
-    let rects = protocol_background_effect_rects_for_layer(output, layer_surface);
+    let rects = if let Some(effect) = custom_background {
+        layer_surface_logical_rect(output, layer_surface)
+            .map(|rect| vec![expand_effect_rect(rect, effect.outsets)])
+            .unwrap_or_default()
+    } else {
+        protocol_background_effect_rects_for_layer(output, layer_surface)
+    };
     if rects.is_empty() {
         return Vec::new();
     }
@@ -2951,14 +3509,15 @@ fn configured_background_effect_elements_for_layer(
     )
         .hash(&mut hasher);
     let signature = hasher.finish();
-    let source_damage_hit = crate::backend::shader_effect::source_damage_intersects_rect(
-        &config.effect,
-        Rectangle::new(
-            smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
-            (effect_rect.width, effect_rect.height).into(),
-        ),
-        &relevant_source_damage,
-    );
+    let source_damage_hit = config.effect.uses_layer_source_input()
+        || crate::backend::shader_effect::source_damage_intersects_rect(
+            &config.effect,
+            Rectangle::new(
+                smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
+                (effect_rect.width, effect_rect.height).into(),
+            ),
+            &relevant_source_damage,
+        );
     let captured_local_rect = Rectangle::new(
         smithay::utils::Point::from((
             effect_rect.x - output_geo.loc.x,
@@ -3031,32 +3590,86 @@ fn configured_background_effect_elements_for_layer(
                 .collect();
         }
     }
-    let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
-        renderer,
-        format!("winit:layer-top:{}", stable_key),
-        input_texture,
-        xray_texture,
-        crate::backend::visual::logical_size_to_physical_buffer_size(
-            actual_capture_geo.size.w,
-            actual_capture_geo.size.h,
+    let layer_source_texture = config
+        .effect
+        .uses_layer_source_input()
+        .then(|| {
+            let layer_source_geo = Rectangle::new(
+                smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
+                (effect_rect.width, effect_rect.height).into(),
+            );
+            let layer_source_origin =
+                crate::backend::visual::logical_point_to_physical_point_global_edges(
+                    layer_source_geo.loc,
+                    output_geo.loc,
+                    scale,
+                );
+            let scene = layer_surface_scene_elements_for_capture(
+                renderer,
+                output,
+                layer_source_geo,
+                layer_source_origin,
+                scale,
+                layer_surface,
+            );
+            capture_scene_texture_for_effect(
+                renderer,
+                "winit-layer-top-source",
+                layer_source_geo,
+                scale,
+                &scene,
+            )
+        })
+        .flatten();
+    // Skip the effect this frame when the layer source could not be captured
+    // (empty scene / zero-sized geometry); running the pipeline without it
+    // would fail inside resolve_effect_input.
+    if config.effect.uses_layer_source_input() && layer_source_texture.is_none() {
+        return Vec::new();
+    }
+    let input_size = crate::backend::visual::logical_size_to_physical_buffer_size(
+        actual_capture_geo.size.w,
+        actual_capture_geo.size.h,
+        scale,
+    );
+    let sample_region = Some(
+        crate::backend::visual::logical_rect_to_physical_buffer_rect_f64(
+            effect_rect,
+            actual_capture_geo.loc,
             scale,
         ),
-        Some(
-            crate::backend::visual::logical_rect_to_physical_buffer_rect_f64(
-                effect_rect,
-                actual_capture_geo.loc,
-                scale,
-            ),
+    );
+    let output_size = Some(
+        crate::backend::visual::logical_size_to_physical_buffer_size(
+            effect_rect.width,
+            effect_rect.height,
+            scale,
         ),
-        Some(
-            crate::backend::visual::logical_size_to_physical_buffer_size(
-                effect_rect.width,
-                effect_rect.height,
-                scale,
-            ),
-        ),
-        &config.effect,
-    )
+    );
+    let texture = if let Some(layer_source_texture) = layer_source_texture {
+        crate::backend::shader_effect::apply_effect_pipeline_cached_for_key_with_layer_source(
+            renderer,
+            format!("winit:layer-top:{}", stable_key),
+            input_texture,
+            xray_texture,
+            layer_source_texture,
+            input_size,
+            sample_region,
+            output_size,
+            &config.effect,
+        )
+    } else {
+        crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
+            renderer,
+            format!("winit:layer-top:{}", stable_key),
+            input_texture,
+            xray_texture,
+            input_size,
+            sample_region,
+            output_size,
+            &config.effect,
+        )
+    }
     .ok();
     let Some(texture) = texture else {
         return Vec::new();
@@ -3202,19 +3815,68 @@ fn upper_layer_scene_elements(
 
     let mut elements = Vec::new();
     for layer_surface in upper_layers {
-        elements.extend(
-            window_render::layer_surface_elements(renderer, output, &layer_surface, scale, 1.0)
-                .into_iter()
-                .map(WinitRenderElements::Window),
-        );
         let layer_id = crate::ssd::layer_runtime_id(&layer_surface);
-        let effect_config = state
+        // Popups draw above their layer; compose their effects per popup.
+        let configured_popup_effects = state.configured_popup_effects.clone();
+        elements.extend(composed_popup_scene_elements(
+            renderer,
+            output,
+            output_geo,
+            scale,
+            &layer_surface,
+            &configured_popup_effects,
+            &mut state.popup_effect_cache,
+            &mut state.popup_framebuffer_effect_states,
+        ));
+        let root_elements = window_render::layer_surface_root_elements(
+            renderer,
+            output,
+            &layer_surface,
+            scale,
+            1.0,
+        )
+        .into_iter()
+        .map(WinitRenderElements::Window)
+        .collect::<Vec<_>>();
+        let effects = state.configured_layer_effects.get(&layer_id).cloned();
+        if let (Some(effects), Some(layer_rect)) =
+            (effects, layer_surface_logical_rect(output, &layer_surface))
+        {
+            let capture_elements = window_render::layer_surface_elements(
+                renderer,
+                output,
+                &layer_surface,
+                scale,
+                1.0,
+            )
+            .into_iter()
+            .map(WinitRenderElements::Window)
+            .collect::<Vec<_>>();
+            elements.extend(compose_layer_source_effects(
+                renderer,
+                output,
+                output_geo,
+                scale,
+                &layer_id,
+                layer_rect,
+                &effects,
+                root_elements,
+                &capture_elements,
+                &mut state.layer_effect_cache,
+            ));
+        } else {
+            elements.extend(root_elements);
+        }
+        let custom_background = state
             .configured_layer_effects
             .get(&layer_id)
-            .cloned()
-            .or_else(|| state.configured_background_effect.clone());
-        if let Some(effect_config) =
-            effect_config.filter(|config| config.effect.supports_framebuffer_backdrop())
+            .and_then(|effects| effects.behind.as_ref())
+            .filter(|effect| effect.effect.is_backdrop())
+            .cloned();
+        let effect_config = state.configured_background_effect.clone();
+        if custom_background.is_none()
+            && let Some(effect_config) =
+                effect_config.filter(|config| config.effect.supports_framebuffer_backdrop())
         {
             elements.extend(configured_background_framebuffer_effect_elements_for_layer(
                 renderer,
@@ -3236,6 +3898,7 @@ fn upper_layer_scene_elements(
                 windows_top_to_bottom,
                 &layer_surface,
                 1.0,
+                custom_background.as_ref(),
             ));
         }
     }

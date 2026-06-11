@@ -24,6 +24,7 @@ use super::{
     ComputedDecorationTree, DecorationCachedEvaluationResult, DecorationEvaluationError,
     DecorationEvaluationResult, DecorationEvaluator, DecorationHandlerInvocation,
     DecorationHitTestResult, DecorationSchedulerTick, DecorationTree, LayerEffectEvaluationResult,
+    PopupEffectEvaluationResult,
     LogicalPoint, LogicalRect, StaticDecorationEvaluator, WaylandLayerSnapshot,
     WaylandWindowSnapshot, WindowPositionSnapshot, WindowTransform, reapply_tree_preserving_layout,
     window_model::{
@@ -656,6 +657,18 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         match self {
             Self::Static(_) => Ok(LayerEffectEvaluationResult::default()),
             Self::Node(evaluator) => evaluator.evaluate_layer_effects(output_name, layers, now_ms),
+        }
+    }
+
+    fn evaluate_popup_effects(
+        &self,
+        output_name: &str,
+        popups: &[crate::ssd::WaylandPopupSnapshot],
+        now_ms: u64,
+    ) -> Result<PopupEffectEvaluationResult, DecorationEvaluationError> {
+        match self {
+            Self::Static(_) => Ok(PopupEffectEvaluationResult::default()),
+            Self::Node(evaluator) => evaluator.evaluate_popup_effects(output_name, popups, now_ms),
         }
     }
 }
@@ -1986,11 +1999,20 @@ impl ShojiWM {
         let effect_count = evaluation.effects.len();
         let next_poll_in_ms = evaluation.next_poll_in_ms;
         for assignment in evaluation.effects {
-            if let Some(effect) = assignment.effect {
+            if let Some(effects) = assignment.effects {
                 self.configured_layer_effects
-                    .insert(assignment.layer_id, effect);
+                    .insert(assignment.layer_id, effects);
             }
         }
+        let live_layer_prefixes = snapshots
+            .iter()
+            .map(|snapshot| format!("{}@", snapshot.id))
+            .collect::<Vec<_>>();
+        self.layer_effect_cache.retain(|key, _| {
+            live_layer_prefixes
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+        });
         let apply_elapsed_ms = apply_started_at.elapsed().as_secs_f64() * 1000.0;
         let elapsed_ms = refresh_started_at.elapsed().as_secs_f64() * 1000.0;
 
@@ -2012,6 +2034,63 @@ impl ShojiWM {
                 "animation timing: layer effects spike"
             );
         }
+
+        Ok(())
+    }
+
+    /// Re-evaluate `WINDOW_MANAGER.effect.popup` assignments for all popups on
+    /// the given output. Mirrors `refresh_layer_effects_for_output`: called
+    /// once per rendered frame, with the runtime returning the full effect set
+    /// for the currently mapped popups.
+    pub fn refresh_popup_effects_for_output(
+        &mut self,
+        output_name: &str,
+    ) -> Result<(), DecorationEvaluationError> {
+        let snapshots = self.snapshot_popups();
+        let output_popup_ids = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.output_name == output_name)
+            .map(|snapshot| snapshot.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let now_ms = Duration::from(self.clock.now()).as_millis() as u64;
+        self.sync_runtime_display_state();
+        let evaluation = self
+            .decoration_evaluator
+            .evaluate_popup_effects(output_name, &snapshots, now_ms)?;
+        self.consume_runtime_display_config(evaluation.display_config.clone());
+        self.consume_runtime_key_binding_config(evaluation.key_binding_config.clone());
+        self.consume_runtime_pointer_config(evaluation.pointer_config.clone());
+        self.consume_runtime_input_config(evaluation.input_config.clone());
+        self.consume_runtime_event_config(evaluation.event_config.clone());
+        self.consume_runtime_process_config(evaluation.process_config.clone());
+        if !evaluation.process_actions.is_empty() {
+            self.apply_runtime_process_actions(evaluation.process_actions.clone());
+        }
+
+        for popup_id in &output_popup_ids {
+            self.configured_popup_effects.remove(popup_id);
+        }
+        for assignment in evaluation.effects {
+            if let Some(effects) = assignment.effects {
+                self.configured_popup_effects
+                    .insert(assignment.popup_id, effects);
+            }
+        }
+        // Drop element-state cache entries for popups that no longer exist.
+        let live_popup_prefixes = snapshots
+            .iter()
+            .map(|snapshot| format!("{}@", snapshot.id))
+            .collect::<Vec<_>>();
+        self.popup_effect_cache.retain(|key, _| {
+            live_popup_prefixes
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+        });
+        self.popup_framebuffer_effect_states.retain(|key, _| {
+            live_popup_prefixes
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+        });
 
         Ok(())
     }

@@ -17,8 +17,15 @@ import type {
   ImageSourceHandle,
   NamedTextureHandle,
   ShaderUniformMap,
+  EffectAlphaMode,
   EffectInvalidationPolicyHandle,
   EffectOutsets,
+  LayerEffectHandle,
+  LayerEffectInputHandle,
+  LayerSourceHandle,
+  PopupEffectHandle,
+  PopupEffectInputHandle,
+  PopupSourceHandle,
   WindowEffectHandle,
   WindowSourceHandle,
 } from "./types";
@@ -36,6 +43,16 @@ export interface CompileEffectOptions {
     | BlendStageHandle
     | UnitStageHandle
   >;
+  /**
+   * Output alpha handling. Defaults to `"opaque"`, which forces the result
+   * to full opacity to hide capture/blur alpha noise at the edges — the
+   * right choice for plain backdrop blurs. Declare `"preserve"` when the
+   * pipeline intentionally produces transparency (e.g. masking the blur
+   * against a layer's own alpha); the pipeline is then responsible for the
+   * alpha of every pixel, including the blur edge regions.
+   * See {@link EffectAlphaMode}.
+   */
+  alpha?: EffectAlphaMode;
 }
 
 export interface CompileWindowEffectOptions extends CompileEffectOptions {
@@ -43,11 +60,18 @@ export interface CompileWindowEffectOptions extends CompileEffectOptions {
   outsets?: EffectOutsets;
 }
 
+export interface CompileLayerEffectOptions extends CompileEffectOptions {
+  input: LayerEffectInputHandle;
+  outsets?: EffectOutsets;
+}
+
 // Base directory for relative asset paths (shaders, images, fonts). Callers
 // pass the already-resolved config package root - typically the directory
 // containing the nearest ancestor package.json of the entry config file.
 export function installAssetResolverBridge(configRoot: string): void {
-  assetBaseDir = normalizePath(isAbsolutePath(configRoot) ? configRoot : resolvePath("/", configRoot));
+  assetBaseDir = normalizePath(
+    isAbsolutePath(configRoot) ? configRoot : resolvePath("/", configRoot),
+  );
 }
 
 export function installShaderResolverBridge(configPath: string): void {
@@ -73,9 +97,30 @@ export function xrayBackdropSource(): XrayBackdropSourceHandle {
   return { kind: "xray-backdrop-source" };
 }
 
-export function windowSource(options: { include?: "full" | "root-surface" } = {}): WindowSourceHandle {
+export function windowSource(
+  options: { include?: "full" | "root-surface" } = {},
+): WindowSourceHandle {
   return {
     kind: "window-source",
+    include: options.include ?? "full",
+  };
+}
+
+export function layerSource(
+  options: { include?: "full" | "root-surface" } = {},
+): LayerSourceHandle {
+  return {
+    kind: "layer-source",
+    include: options.include ?? "full",
+  };
+}
+
+/** The popup's own rendered content as an effect input. */
+export function popupSource(
+  options: { include?: "full" | "root-surface" } = {},
+): PopupSourceHandle {
+  return {
+    kind: "popup-source",
     include: options.include ?? "full",
   };
 }
@@ -96,27 +141,37 @@ export function get(name: string): NamedTextureHandle {
 
 export function shaderStage(
   shader: string | ShaderModuleHandle,
-  options: { uniforms?: ShaderUniformMap } = {},
+  options: {
+    uniforms?: ShaderUniformMap;
+    textures?: Record<string, EffectInputHandle>;
+  } = {},
 ): ShaderStageHandle {
   return {
     kind: "shader-stage",
     shader: typeof shader === "string" ? loadShader(shader) : shader,
     uniforms: options.uniforms,
+    textures: options.textures,
   };
 }
 
 export function shaderInput(
   shader: string | ShaderModuleHandle,
-  options: { uniforms?: ShaderUniformMap } = {},
+  options: {
+    uniforms?: ShaderUniformMap;
+    textures?: Record<string, EffectInputHandle>;
+  } = {},
 ): ShaderInputHandle {
   return {
     kind: "shader-input",
     shader: typeof shader === "string" ? loadShader(shader) : shader,
     uniforms: options.uniforms,
+    textures: options.textures,
   };
 }
 
-export function noise(options: { kind?: NoiseKind; amount?: number } = {}): NoiseStageHandle {
+export function noise(
+  options: { kind?: NoiseKind; amount?: number } = {},
+): NoiseStageHandle {
   return {
     kind: "noise",
     noiseKind: options.kind ?? "salt",
@@ -124,7 +179,9 @@ export function noise(options: { kind?: NoiseKind; amount?: number } = {}): Nois
   };
 }
 
-export function dualKawaseBlur(options: BackdropBlurOptions = {}): DualKawaseBlurStageHandle {
+export function dualKawaseBlur(
+  options: BackdropBlurOptions = {},
+): DualKawaseBlurStageHandle {
   return {
     kind: "dual-kawase-blur",
     radius: options.radius,
@@ -177,7 +234,9 @@ function resolvePath(...paths: string[]): string {
 
 function normalizePath(path: string): string {
   const absolute = path.startsWith("/");
-  const parts = path.split("/").filter((part) => part.length > 0 && part !== ".");
+  const parts = path
+    .split("/")
+    .filter((part) => part.length > 0 && part !== ".");
   const stack: string[] = [];
 
   for (const part of parts) {
@@ -197,7 +256,9 @@ function normalizePath(path: string): string {
   return joined || ".";
 }
 
-export function compileEffect(options: CompileEffectOptions): CompiledEffectHandle {
+export function compileEffect(
+  options: CompileEffectOptions,
+): CompiledEffectHandle {
   return {
     kind: "compiled-effect",
     input: options.input,
@@ -206,12 +267,40 @@ export function compileEffect(options: CompileEffectOptions): CompiledEffectHand
       antiArtifactMargin: 0,
     },
     pipeline: options.pipeline,
+    alpha: options.alpha ?? "opaque",
   };
 }
 
-export function compileWindowEffect(options: CompileWindowEffectOptions): WindowEffectHandle {
+export function compileWindowEffect(
+  options: CompileWindowEffectOptions,
+): WindowEffectHandle {
   return {
     kind: "window-effect",
+    effect: compileEffect(options),
+    outsets: options.outsets,
+  };
+}
+
+export function compileLayerEffect(
+  options: CompileLayerEffectOptions,
+): LayerEffectHandle {
+  return {
+    kind: "layer-effect",
+    effect: compileEffect(options),
+    outsets: options.outsets,
+  };
+}
+
+export interface CompilePopupEffectOptions extends CompileEffectOptions {
+  input: PopupEffectInputHandle;
+  outsets?: EffectOutsets;
+}
+
+export function compilePopupEffect(
+  options: CompilePopupEffectOptions,
+): PopupEffectHandle {
+  return {
+    kind: "popup-effect",
     effect: compileEffect(options),
     outsets: options.outsets,
   };

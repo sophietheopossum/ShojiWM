@@ -29,8 +29,9 @@ pub use evaluator::{
     DecorationPointerMoveAsyncInvocation, DecorationRuntimeAsyncInvocation,
     DecorationSchedulerTick, DecorationWindowMoveInvocation, DecorationWindowResizeInvocation,
     DecorationWindowStateRequestInvocation, LayerEffectEvaluationResult, NodeDecorationEvaluator,
-    RuntimeEventConfigUpdate, RuntimeLayerEffectAssignment, RuntimeWindowAction,
-    StaticDecorationEvaluator, evaluate_dynamic_decoration,
+    PopupEffectEvaluationResult, RuntimeEventConfigUpdate, RuntimeLayerEffectAssignment,
+    RuntimePopupEffectAssignment, RuntimeWindowAction, StaticDecorationEvaluator,
+    evaluate_dynamic_decoration,
 };
 pub use integration::{
     CachedDecorationBuffer, ContentClip, DecorationRuntimeEvaluator, WindowDecorationState,
@@ -43,14 +44,15 @@ pub use window_model::{
     ManagedWindowPointSnapshot, ManagedWindowRectAnimationSnapshot, ManagedWindowRectSnapshot,
     ManagedWindowScalarAnimationSnapshot, ManagedWindowState, OutputModeSnapshot,
     OutputPositionSnapshot, PointerHitTargetSnapshot, PointerModifierStateSnapshot,
-    PointerMoveEventSnapshot, PointerMovePointSnapshot, TransformOrigin, WaylandLayerSnapshot,
-    WaylandOutputSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
-    WindowActivateRequestEventSnapshot, WindowActivateRequestSourceSnapshot, WindowIconSnapshot,
-    WindowMaximizeRequestEventSnapshot, WindowMinimizeRequestEventSnapshot,
-    WindowMoveEventSnapshot, WindowMovePhaseSnapshot, WindowMoveSourceSnapshot,
-    WindowPositionSnapshot, WindowResizeEdgesSnapshot, WindowResizeEventSnapshot,
-    WindowResizePhaseSnapshot, WindowResizePointSnapshot, WindowResizeSourceSnapshot,
-    WindowStateRequestSourceSnapshot, WindowTransform, layer_runtime_id,
+    PointerMoveEventSnapshot, PointerMovePointSnapshot, PopupParentKindSnapshot, TransformOrigin,
+    WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandPopupSnapshot, WaylandWindowAction,
+    WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
+    WindowActivateRequestSourceSnapshot, WindowIconSnapshot, WindowMaximizeRequestEventSnapshot,
+    WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowMovePhaseSnapshot,
+    WindowMoveSourceSnapshot, WindowPositionSnapshot, WindowResizeEdgesSnapshot,
+    WindowResizeEventSnapshot, WindowResizePhaseSnapshot, WindowResizePointSnapshot,
+    WindowResizeSourceSnapshot, WindowStateRequestSourceSnapshot, WindowTransform,
+    layer_runtime_id, popup_runtime_id,
 };
 
 /// Top-level decoration tree.
@@ -654,6 +656,7 @@ pub enum ShaderUniformValue {
 pub struct ShaderStage {
     pub shader: ShaderModule,
     pub uniforms: std::collections::BTreeMap<String, ShaderUniformValue>,
+    pub textures: std::collections::BTreeMap<String, EffectInput>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -661,9 +664,53 @@ pub enum EffectInput {
     Backdrop,
     XrayBackdrop,
     WindowSource(WindowSourceInclude),
+    LayerSource(WindowSourceInclude),
+    PopupSource(WindowSourceInclude),
     Shader(ShaderStage),
     Image(String),
     Named(String),
+}
+
+impl EffectInput {
+    fn uses_backdrop(&self) -> bool {
+        match self {
+            Self::Backdrop => true,
+            Self::Shader(shader) => shader.textures.values().any(Self::uses_backdrop),
+            _ => false,
+        }
+    }
+
+    fn uses_xray_backdrop(&self) -> bool {
+        match self {
+            Self::XrayBackdrop => true,
+            Self::Shader(shader) => shader.textures.values().any(Self::uses_xray_backdrop),
+            _ => false,
+        }
+    }
+
+    fn uses_window_source(&self) -> bool {
+        match self {
+            Self::WindowSource(_) => true,
+            Self::Shader(shader) => shader.textures.values().any(Self::uses_window_source),
+            _ => false,
+        }
+    }
+
+    fn uses_layer_source(&self) -> bool {
+        match self {
+            Self::LayerSource(_) => true,
+            Self::Shader(shader) => shader.textures.values().any(Self::uses_layer_source),
+            _ => false,
+        }
+    }
+
+    fn uses_popup_source(&self) -> bool {
+        match self {
+            Self::PopupSource(_) => true,
+            Self::Shader(shader) => shader.textures.values().any(Self::uses_popup_source),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -717,11 +764,41 @@ pub enum EffectStage {
     Unit(Box<CompiledEffect>),
 }
 
+/// How the alpha channel of an effect's output is treated when the pipeline
+/// result is materialized and composited onto the screen.
+///
+/// Backdrop captures are rendered into an FBO cleared to transparent black,
+/// and any part of the effect rect not covered by scene elements (outsets,
+/// anti-artifact margins, screen edges, gaps between elements) keeps alpha 0.
+/// The dual-kawase blur chain then smears those border texels inward, so the
+/// alpha of a plain backdrop pipeline is *noise*, not signal — compositing it
+/// as-is would show dark halos and see-through fringes at the blur edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EffectAlphaMode {
+    /// Force alpha to 1.0 at the end of the pipeline. Correct for the common
+    /// "frosted glass" case: the backdrop is by definition already-composited
+    /// screen content, which has no meaningful transparency. This hides the
+    /// capture/blur alpha noise described above. Default.
+    #[default]
+    Opaque,
+    /// Keep the pipeline's alpha output intact through the finish pass and
+    /// the final composite. For pipelines that intentionally produce
+    /// transparency (e.g. masking the blur against a layer's own alpha).
+    /// Opting in means the pipeline itself is responsible for producing
+    /// meaningful alpha everywhere, including the blur edge regions.
+    Preserve,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledEffect {
     pub input: EffectInput,
     pub invalidate: EffectInvalidationPolicy,
     pub pipeline: Vec<EffectStage>,
+    /// Declared explicitly by the config (`compileEffect({ alpha: ... })`).
+    /// Deliberately *not* inferred from pipeline contents (e.g. whether a
+    /// layer source is referenced): implicit switching would silently change
+    /// edge-artifact handling the moment a texture input is added.
+    pub alpha: EffectAlphaMode,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -771,35 +848,70 @@ impl CompiledEffect {
             EffectInput::Backdrop
                 | EffectInput::XrayBackdrop
                 | EffectInput::WindowSource(_)
+                | EffectInput::LayerSource(_)
+                | EffectInput::PopupSource(_)
                 | EffectInput::Shader(_)
         )
     }
 
     pub fn uses_backdrop_input(&self) -> bool {
-        self.input == EffectInput::Backdrop
+        self.input.uses_backdrop()
             || self.pipeline.iter().any(|stage| match stage {
-                EffectStage::Blend { input, .. } => *input == EffectInput::Backdrop,
+                EffectStage::Blend { input, .. } => input.uses_backdrop(),
+                EffectStage::Shader(shader) => {
+                    shader.textures.values().any(EffectInput::uses_backdrop)
+                }
                 EffectStage::Unit(effect) => effect.uses_backdrop_input(),
                 _ => false,
             })
     }
 
     pub fn uses_xray_backdrop_input(&self) -> bool {
-        self.input == EffectInput::XrayBackdrop
+        self.input.uses_xray_backdrop()
             || self.pipeline.iter().any(|stage| match stage {
-                EffectStage::Blend { input, .. } => *input == EffectInput::XrayBackdrop,
+                EffectStage::Blend { input, .. } => input.uses_xray_backdrop(),
+                EffectStage::Shader(shader) => shader
+                    .textures
+                    .values()
+                    .any(EffectInput::uses_xray_backdrop),
                 EffectStage::Unit(effect) => effect.uses_xray_backdrop_input(),
                 _ => false,
             })
     }
 
     pub fn uses_window_source_input(&self) -> bool {
-        matches!(self.input, EffectInput::WindowSource(_))
+        self.input.uses_window_source()
             || self.pipeline.iter().any(|stage| match stage {
-                EffectStage::Blend { input, .. } => {
-                    matches!(input, EffectInput::WindowSource(_))
-                }
+                EffectStage::Blend { input, .. } => input.uses_window_source(),
+                EffectStage::Shader(shader) => shader
+                    .textures
+                    .values()
+                    .any(EffectInput::uses_window_source),
                 EffectStage::Unit(effect) => effect.uses_window_source_input(),
+                _ => false,
+            })
+    }
+
+    pub fn uses_layer_source_input(&self) -> bool {
+        self.input.uses_layer_source()
+            || self.pipeline.iter().any(|stage| match stage {
+                EffectStage::Blend { input, .. } => input.uses_layer_source(),
+                EffectStage::Shader(shader) => {
+                    shader.textures.values().any(EffectInput::uses_layer_source)
+                }
+                EffectStage::Unit(effect) => effect.uses_layer_source_input(),
+                _ => false,
+            })
+    }
+
+    pub fn uses_popup_source_input(&self) -> bool {
+        self.input.uses_popup_source()
+            || self.pipeline.iter().any(|stage| match stage {
+                EffectStage::Blend { input, .. } => input.uses_popup_source(),
+                EffectStage::Shader(shader) => {
+                    shader.textures.values().any(EffectInput::uses_popup_source)
+                }
+                EffectStage::Unit(effect) => effect.uses_popup_source_input(),
                 _ => false,
             })
     }
@@ -810,6 +922,8 @@ impl CompiledEffect {
         self.uses_backdrop_input()
             && !self.uses_xray_backdrop_input()
             && !self.uses_window_source_input()
+            && !self.uses_layer_source_input()
+            && !self.uses_popup_source_input()
     }
 
     pub fn blur_stage(&self) -> Option<BackdropBlur> {
@@ -3459,6 +3573,7 @@ mod tests {
                 input: EffectInput::Backdrop,
                 invalidate: EffectInvalidationPolicy::Always,
                 pipeline: Vec::new(),
+                alpha: EffectAlphaMode::Opaque,
             },
         }))
         .with_style(DecorationStyle {
@@ -3565,6 +3680,7 @@ mod tests {
                 input: EffectInput::Backdrop,
                 invalidate: EffectInvalidationPolicy::Always,
                 pipeline: Vec::new(),
+                alpha: EffectAlphaMode::Opaque,
             },
         }))
         .with_style(DecorationStyle {
@@ -4611,6 +4727,7 @@ mod tests {
                 input: EffectInput::Backdrop,
                 invalidate: EffectInvalidationPolicy::Always,
                 pipeline: Vec::new(),
+                alpha: EffectAlphaMode::Opaque,
             },
             direction: LayoutDirection::Row,
         }))
@@ -4696,6 +4813,7 @@ mod tests {
                     alpha: 0.5,
                 },
             ],
+            alpha: EffectAlphaMode::Opaque,
         };
         assert!(backdrop.supports_framebuffer_backdrop());
 
@@ -4706,7 +4824,9 @@ mod tests {
                 input: EffectInput::XrayBackdrop,
                 invalidate: EffectInvalidationPolicy::Always,
                 pipeline: Vec::new(),
+                alpha: EffectAlphaMode::Opaque,
             }))],
+            alpha: EffectAlphaMode::Opaque,
         };
         assert!(!xray.supports_framebuffer_backdrop());
 
@@ -4718,7 +4838,27 @@ mod tests {
                 mode: BlendMode::Normal,
                 alpha: 1.0,
             }],
+            alpha: EffectAlphaMode::Opaque,
         };
         assert!(!window_source.supports_framebuffer_backdrop());
+
+        let layer_mask = CompiledEffect {
+            input: EffectInput::Backdrop,
+            invalidate: EffectInvalidationPolicy::Always,
+            pipeline: vec![EffectStage::Shader(ShaderStage {
+                shader: ShaderModule {
+                    path: "mask.frag".into(),
+                },
+                uniforms: std::collections::BTreeMap::new(),
+                textures: std::collections::BTreeMap::from([(
+                    "layer_mask".into(),
+                    EffectInput::LayerSource(WindowSourceInclude::Full),
+                )]),
+            })],
+            alpha: EffectAlphaMode::Opaque,
+        };
+        assert!(layer_mask.uses_backdrop_input());
+        assert!(layer_mask.uses_layer_source_input());
+        assert!(!layer_mask.supports_framebuffer_backdrop());
     }
 }

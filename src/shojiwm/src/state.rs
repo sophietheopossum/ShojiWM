@@ -328,10 +328,17 @@ pub struct ShojiWM {
     pub suggested_window_offset: Option<(i32, i32)>,
     pub async_asset_dirty: bool,
     pub configured_background_effect: Option<BackgroundEffectConfig>,
-    pub configured_layer_effects: HashMap<String, BackgroundEffectConfig>,
+    pub configured_layer_effects: HashMap<String, crate::ssd::WindowEffectConfig>,
+    pub configured_popup_effects: HashMap<String, crate::ssd::WindowEffectConfig>,
     pub config_error_report: Option<crate::config_error::ConfigErrorReport>,
     pub layer_backdrop_cache: HashMap<String, crate::backend::shader_effect::CachedBackdropTexture>,
     pub layer_framebuffer_effect_states:
+        HashMap<String, crate::backend::shader_effect::ShaderEffectElementState>,
+    pub layer_effect_cache:
+        HashMap<String, crate::backend::shader_effect::WindowEffectElementState>,
+    pub popup_effect_cache:
+        HashMap<String, crate::backend::shader_effect::WindowEffectElementState>,
+    pub popup_framebuffer_effect_states:
         HashMap<String, crate::backend::shader_effect::ShaderEffectElementState>,
     pub output_capture_mirrors: HashMap<String, crate::backend::tty::OutputCaptureMirror>,
     pub pointer_contents: PointerContents,
@@ -844,9 +851,13 @@ impl ShojiWM {
             async_asset_dirty: false,
             configured_background_effect: None,
             configured_layer_effects: HashMap::new(),
+            configured_popup_effects: HashMap::new(),
             config_error_report,
             layer_backdrop_cache: HashMap::new(),
             layer_framebuffer_effect_states: HashMap::new(),
+            layer_effect_cache: HashMap::new(),
+            popup_effect_cache: HashMap::new(),
+            popup_framebuffer_effect_states: HashMap::new(),
             output_capture_mirrors: HashMap::new(),
             pointer_contents: PointerContents::default(),
             decoration_hover_target: None,
@@ -1531,6 +1542,7 @@ impl ShojiWM {
             .collect::<Vec<_>>();
         self.runtime_dirty_window_ids.extend(live_window_ids);
         self.configured_layer_effects.clear();
+        self.configured_popup_effects.clear();
         self.request_tty_maintenance("config-hot-reload");
         self.schedule_redraw();
         info!("hot reloaded TypeScript config");

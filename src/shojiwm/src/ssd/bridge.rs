@@ -3,8 +3,9 @@ use serde::Deserialize;
 use super::{
     AlignItems, BackdropBlur, BackgroundEffectConfig, BlendMode, BorderFit, BorderStyle, BoxNode,
     ButtonNode, Color, CompiledEffect, DecorationInteractionHandlers, DecorationNode,
-    DecorationNodeKind, DecorationStateChangeHandler, DecorationStyle, Edges, EffectInput,
-    EffectInvalidationPolicy, EffectOutsets, EffectStage, ImageNode, JustifyContent, LabelNode,
+    DecorationNodeKind, DecorationStateChangeHandler, DecorationStyle, Edges, EffectAlphaMode,
+    EffectInput, EffectInvalidationPolicy, EffectOutsets, EffectStage, ImageNode, JustifyContent,
+    LabelNode,
     LayoutDirection, NodeTransform, NoiseKind, NoiseStage, Overflow, PointerEvents,
     PositionOffsets, ShaderEffectNode, ShaderModule, ShaderStage, ShaderUniformValue,
     StylePosition, WindowAction, WindowEffectConfig, WindowEffectSlot, WindowSourceInclude,
@@ -58,6 +59,8 @@ pub struct WireShaderStageFields {
     pub shader: WireShaderModule,
     #[serde(default)]
     pub uniforms: std::collections::BTreeMap<String, WireShaderUniformValue>,
+    #[serde(default)]
+    pub textures: std::collections::BTreeMap<String, WireEffectInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -93,6 +96,10 @@ pub struct WireCompiledEffect {
     pub invalidate: Option<WireEffectInvalidationPolicy>,
     #[serde(default)]
     pub pipeline: Vec<WireEffectStage>,
+    /// Output alpha handling: "opaque" (default) or "preserve".
+    /// See `EffectAlphaMode` for the semantics.
+    #[serde(default)]
+    pub alpha: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -129,6 +136,8 @@ pub enum WireEffectInput {
     BackdropSource,
     XrayBackdropSource,
     WindowSource { include: Option<String> },
+    LayerSource { include: Option<String> },
+    PopupSource { include: Option<String> },
     ShaderInput(WireShaderStageFields),
     ImageSource { path: String },
     NamedTexture { name: String },
@@ -423,6 +432,18 @@ impl TryFrom<WireCompiledEffect> for CompiledEffect {
                     if stage.shader.kind != "shader-module" || stage.shader.path.is_empty() {
                         return Err(DecorationBridgeError::InvalidShaderDescriptor);
                     }
+                    if stage.textures.len() > 7
+                        || stage
+                            .textures
+                            .keys()
+                            .any(|name| name == "tex" || name == "rect_size" || name.is_empty())
+                        || stage
+                            .textures
+                            .keys()
+                            .any(|name| stage.uniforms.contains_key(name))
+                    {
+                        return Err(DecorationBridgeError::InvalidShaderDescriptor);
+                    }
                     let mut uniforms = std::collections::BTreeMap::new();
                     for (name, value) in stage.uniforms {
                         let value = match value {
@@ -438,11 +459,17 @@ impl TryFrom<WireCompiledEffect> for CompiledEffect {
                         };
                         uniforms.insert(name, value);
                     }
+                    let textures = stage
+                        .textures
+                        .into_iter()
+                        .map(|(name, input)| Ok((name, decode_effect_input(input)?)))
+                        .collect::<Result<_, DecorationBridgeError>>()?;
                     stages.push(EffectStage::Shader(ShaderStage {
                         shader: ShaderModule {
                             path: stage.shader.path,
                         },
                         uniforms,
+                        textures,
                     }));
                 }
                 WireEffectStage::DualKawaseBlur(stage) => {
@@ -521,10 +548,17 @@ impl TryFrom<WireCompiledEffect> for CompiledEffect {
                 }
             };
 
+        let alpha = match value.alpha.as_deref() {
+            None | Some("opaque") => EffectAlphaMode::Opaque,
+            Some("preserve") => EffectAlphaMode::Preserve,
+            Some(_) => return Err(DecorationBridgeError::InvalidShaderDescriptor),
+        };
+
         Ok(CompiledEffect {
             input,
             invalidate,
             pipeline: stages,
+            alpha,
         })
     }
 }
@@ -559,7 +593,8 @@ impl TryFrom<WireWindowEffectSlot> for WindowEffectSlot {
     type Error = DecorationBridgeError;
 
     fn try_from(value: WireWindowEffectSlot) -> Result<Self, Self::Error> {
-        if value.kind != "window-effect" {
+        if value.kind != "window-effect" && value.kind != "layer-effect" && value.kind != "popup-effect"
+        {
             return Err(DecorationBridgeError::InvalidShaderDescriptor);
         }
 
@@ -608,8 +643,36 @@ fn decode_effect_input(value: WireEffectInput) -> Result<EffectInput, Decoration
             };
             EffectInput::WindowSource(include)
         }
+        WireEffectInput::LayerSource { include } => {
+            let include = match include.as_deref().unwrap_or("full") {
+                "full" => WindowSourceInclude::Full,
+                "root-surface" => WindowSourceInclude::RootSurface,
+                _ => return Err(DecorationBridgeError::InvalidEffectInput),
+            };
+            EffectInput::LayerSource(include)
+        }
+        WireEffectInput::PopupSource { include } => {
+            let include = match include.as_deref().unwrap_or("full") {
+                "full" => WindowSourceInclude::Full,
+                "root-surface" => WindowSourceInclude::RootSurface,
+                _ => return Err(DecorationBridgeError::InvalidEffectInput),
+            };
+            EffectInput::PopupSource(include)
+        }
         WireEffectInput::ShaderInput(stage) => {
             if stage.shader.kind != "shader-module" || stage.shader.path.is_empty() {
+                return Err(DecorationBridgeError::InvalidEffectInput);
+            }
+            if stage.textures.len() > 7
+                || stage
+                    .textures
+                    .keys()
+                    .any(|name| name == "tex" || name == "rect_size" || name.is_empty())
+                || stage
+                    .textures
+                    .keys()
+                    .any(|name| stage.uniforms.contains_key(name))
+            {
                 return Err(DecorationBridgeError::InvalidEffectInput);
             }
             let mut uniforms = std::collections::BTreeMap::new();
@@ -630,6 +693,11 @@ fn decode_effect_input(value: WireEffectInput) -> Result<EffectInput, Decoration
                     path: stage.shader.path,
                 },
                 uniforms,
+                textures: stage
+                    .textures
+                    .into_iter()
+                    .map(|(name, input)| Ok((name, decode_effect_input(input)?)))
+                    .collect::<Result<_, DecorationBridgeError>>()?,
             })
         }
         WireEffectInput::ImageSource { path } => {
@@ -1089,6 +1157,77 @@ mod tests {
                 src,
                 fit: crate::ssd::ImageFit::Cover,
             }) if src == "/tmp/icon.svg"
+        ));
+    }
+
+    #[test]
+    fn decode_layer_effect_assignment_with_invalidation_and_outsets() {
+        let wire: WireWindowEffectConfig = serde_json::from_str(
+            r#"{
+                "behind": {
+                    "kind": "layer-effect",
+                    "effect": {
+                        "kind": "compiled-effect",
+                        "input": { "kind": "layer-source", "include": "full" },
+                        "invalidate": {
+                            "kind": "on-source-damage-box",
+                            "antiArtifactMargin": 12
+                        },
+                        "pipeline": [{ "kind": "noise", "noiseKind": "salt", "amount": 0.1 }]
+                    },
+                    "outsets": { "left": 4, "right": 8, "top": 2, "bottom": 6 }
+                }
+            }"#,
+        )
+        .expect("layer effect assignment should deserialize");
+
+        let effects: WindowEffectConfig = wire.try_into().expect("layer effect should decode");
+        let behind = effects.behind.expect("behind effect should exist");
+        assert!(matches!(
+            behind.effect.input,
+            EffectInput::LayerSource(WindowSourceInclude::Full)
+        ));
+        assert!(matches!(
+            behind.effect.invalidate,
+            EffectInvalidationPolicy::OnSourceDamageBox {
+                anti_artifact_margin: 12
+            }
+        ));
+        assert_eq!(
+            behind.outsets,
+            EffectOutsets {
+                left: 4,
+                right: 8,
+                top: 2,
+                bottom: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_shader_stage_named_texture_input() {
+        let wire: WireCompiledEffect = serde_json::from_str(
+            r#"{
+                "kind": "compiled-effect",
+                "input": { "kind": "backdrop-source" },
+                "pipeline": [{
+                    "kind": "shader-stage",
+                    "shader": { "kind": "shader-module", "path": "/tmp/mask.frag" },
+                    "textures": {
+                        "layer_mask": { "kind": "layer-source", "include": "full" }
+                    }
+                }]
+            }"#,
+        )
+        .expect("named texture effect should deserialize");
+
+        let effect: CompiledEffect = wire.try_into().expect("named texture effect should decode");
+        let EffectStage::Shader(stage) = &effect.pipeline[0] else {
+            panic!("expected shader stage");
+        };
+        assert!(matches!(
+            stage.textures.get("layer_mask"),
+            Some(EffectInput::LayerSource(WindowSourceInclude::Full))
         ));
     }
 }

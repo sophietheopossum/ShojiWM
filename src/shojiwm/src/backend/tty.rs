@@ -1301,6 +1301,7 @@ fn render_surface(
         decoration_refresh_started_at.elapsed().as_secs_f64() * 1000.0;
     let layer_effects_started_at = Instant::now();
     state.refresh_layer_effects_for_output(output.name().as_str())?;
+    state.refresh_popup_effects_for_output(output.name().as_str())?;
     let layer_effects_elapsed_ms = layer_effects_started_at.elapsed().as_secs_f64() * 1000.0;
 
     let redraw_state = state
@@ -1576,6 +1577,7 @@ fn render_surface(
             &state.lower_layer_source_damage,
             state.lower_layer_scene_generation,
             &state.configured_layer_effects,
+            &state.configured_popup_effects,
             state.configured_background_effect.as_ref(),
             &output,
             output_geo,
@@ -1583,6 +1585,9 @@ fn render_surface(
             &windows_top_to_bottom,
             &mut state.layer_backdrop_cache,
             &mut state.layer_framebuffer_effect_states,
+            &mut state.layer_effect_cache,
+            &mut state.popup_effect_cache,
+            &mut state.popup_framebuffer_effect_states,
         )?);
         let upper_layers_elapsed_ms = upper_layers_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.upper_layers_elapsed_ms = upper_layers_elapsed_ms;
@@ -4119,6 +4124,11 @@ fn render_surface(
             &state.lower_layer_source_damage,
             state.lower_layer_scene_generation,
             &mut state.layer_backdrop_cache,
+            &state.configured_layer_effects,
+            &mut state.layer_effect_cache,
+            &state.configured_popup_effects,
+            &mut state.popup_effect_cache,
+            &mut state.popup_framebuffer_effect_states,
         )?);
         let lower_layers_elapsed_ms = lower_layers_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.lower_layers_elapsed_ms = lower_layers_elapsed_ms;
@@ -5941,6 +5951,25 @@ fn window_effect_element_state(
     (state.id.clone(), state.commit_counter)
 }
 
+fn layer_effect_element_state(
+    cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+    cache_key: String,
+    signature: u64,
+) -> (
+    smithay::backend::renderer::element::Id,
+    smithay::backend::renderer::utils::CommitCounter,
+) {
+    let state = cache.entry(cache_key).or_default();
+    if state.signature != signature {
+        state.signature = signature;
+        state.commit_counter.increment();
+    }
+    (state.id.clone(), state.commit_counter)
+}
+
 fn restore_presented_window_surface_primary_outputs(
     space: &smithay::desktop::Space<smithay::desktop::Window>,
     output: &Output,
@@ -6161,6 +6190,262 @@ fn window_effect_elements(
         );
     }
     Ok(vec![TtyRenderElements::Backdrop(element)])
+}
+
+fn layer_surface_logical_rect(
+    output: &Output,
+    layer_surface: &smithay::desktop::LayerSurface,
+) -> Option<crate::ssd::LogicalRect> {
+    let map = layer_map_for_output(output);
+    let geometry = map.layer_geometry(layer_surface)?;
+    let output_location = output.current_location();
+    Some(crate::ssd::LogicalRect::new(
+        output_location.x + geometry.loc.x,
+        output_location.y + geometry.loc.y,
+        geometry.size.w,
+        geometry.size.h,
+    ))
+}
+
+fn layer_source_effect_elements(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    layer_id: &str,
+    layer_rect: crate::ssd::LogicalRect,
+    effects: &crate::ssd::WindowEffectConfig,
+    // What gets shown when no `replace` slot is active. Excludes the layer's
+    // popups: those are displayed (and effect-composed) separately so popup
+    // effects don't double-render them.
+    display_elements: Vec<TtyRenderElements>,
+    // What layerSource() captures sample. Includes popups ("full" semantics).
+    capture_elements: &[TtyRenderElements],
+    cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+) -> Vec<TtyRenderElements> {
+    let mut render_slot = |placement: &'static str,
+                           effect: &crate::ssd::WindowEffectSlot|
+     -> Vec<TtyRenderElements> {
+        if !matches!(effect.effect.input, EffectInput::LayerSource(_)) {
+            return Vec::new();
+        }
+        let signature =
+            window_effect_signature(placement, layer_rect, effect, scale, capture_elements);
+        let (element_id, commit_counter) = layer_effect_element_state(
+            cache,
+            format!("{}@{}@{}", layer_id, placement, output.name()),
+            signature,
+        );
+        window_effect_elements(
+            renderer,
+            output,
+            output_geo,
+            scale,
+            layer_id,
+            placement,
+            element_id,
+            commit_counter,
+            layer_rect,
+            effect,
+            capture_elements,
+        )
+        .inspect_err(|error| {
+            warn!(
+                layer_id,
+                placement,
+                ?error,
+                "failed to build layer source effect"
+            );
+        })
+        .unwrap_or_default()
+    };
+
+    let in_front = effects
+        .in_front
+        .as_ref()
+        .map(|effect| render_slot("layer-in-front", effect))
+        .unwrap_or_default();
+    let replacement = effects
+        .replace
+        .as_ref()
+        .map(|effect| render_slot("layer-replace", effect))
+        .unwrap_or_default();
+    let behind_root = effects
+        .behind_root_surface
+        .as_ref()
+        .map(|effect| render_slot("layer-behind-root-surface", effect))
+        .unwrap_or_default();
+    let behind = effects
+        .behind
+        .as_ref()
+        .map(|effect| render_slot("layer-behind", effect))
+        .unwrap_or_default();
+
+    let mut elements = Vec::new();
+    elements.extend(in_front);
+    if replacement.is_empty() {
+        elements.extend(display_elements);
+    } else {
+        elements.extend(replacement);
+    }
+    elements.extend(behind_root);
+    elements.extend(behind);
+    elements
+}
+
+/// Display elements for all popups of a layer surface, each composed with its
+/// configured popup effects (`WINDOW_MANAGER.effect.popup`). Popups without
+/// an assignment pass through unchanged. Returned front-to-back, in the same
+/// order the popups would have rendered inside `layer_surface_elements`.
+fn composed_popup_scene_elements(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    layer_surface: &smithay::desktop::LayerSurface,
+    configured_popup_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
+    popup_effect_cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+    popup_framebuffer_effect_states: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::ShaderEffectElementState,
+    >,
+) -> Vec<TtyRenderElements> {
+    let groups =
+        window_render::layer_surface_popup_groups(renderer, output, layer_surface, scale, 1.0);
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let output_loc = output.current_location();
+    let mut elements = Vec::new();
+    for (popup_id, local_rect, raw_elements) in groups {
+        let popup_elements = raw_elements
+            .into_iter()
+            .map(TtyRenderElements::Window)
+            .collect::<Vec<_>>();
+        let Some(effects) = configured_popup_effects.get(&popup_id) else {
+            elements.extend(popup_elements);
+            continue;
+        };
+        let popup_rect = crate::ssd::LogicalRect::new(
+            output_loc.x + local_rect.x,
+            output_loc.y + local_rect.y,
+            local_rect.width,
+            local_rect.height,
+        );
+
+        let mut render_slot = |placement: &'static str,
+                               effect: &crate::ssd::WindowEffectSlot|
+         -> Vec<TtyRenderElements> {
+            if !matches!(effect.effect.input, EffectInput::PopupSource(_)) {
+                return Vec::new();
+            }
+            let signature =
+                window_effect_signature(placement, popup_rect, effect, scale, &popup_elements);
+            let (element_id, commit_counter) = layer_effect_element_state(
+                popup_effect_cache,
+                format!("{}@{}@{}", popup_id, placement, output.name()),
+                signature,
+            );
+            window_effect_elements(
+                renderer,
+                output,
+                output_geo,
+                scale,
+                &popup_id,
+                placement,
+                element_id,
+                commit_counter,
+                popup_rect,
+                effect,
+                &popup_elements,
+            )
+            .inspect_err(|error| {
+                warn!(
+                    popup_id,
+                    placement,
+                    ?error,
+                    "failed to build popup source effect"
+                );
+            })
+            .unwrap_or_default()
+        };
+
+        let in_front = effects
+            .in_front
+            .as_ref()
+            .map(|effect| render_slot("popup-in-front", effect))
+            .unwrap_or_default();
+        let replacement = effects
+            .replace
+            .as_ref()
+            .map(|effect| render_slot("popup-replace", effect))
+            .unwrap_or_default();
+        let behind_root = effects
+            .behind_root_surface
+            .as_ref()
+            .map(|effect| render_slot("popup-behind-root-surface", effect))
+            .unwrap_or_default();
+        let behind_popup_source = effects
+            .behind
+            .as_ref()
+            .filter(|effect| matches!(effect.effect.input, EffectInput::PopupSource(_)))
+            .map(|effect| render_slot("popup-behind", effect))
+            .unwrap_or_default();
+        // `behind` with a backdrop input: popups render inline with their
+        // parent's element stream, so there is no offline "scene below the
+        // popup" capture. Framebuffer-resolvable effects sample whatever has
+        // already been drawn below them at draw time, which is exactly the
+        // content behind the popup (including its parent).
+        let behind_backdrop = effects
+            .behind
+            .as_ref()
+            .filter(|effect| !matches!(effect.effect.input, EffectInput::PopupSource(_)))
+            .filter(|effect| effect.effect.supports_framebuffer_backdrop())
+            .and_then(|effect| {
+                let rect = expand_logical_rect(popup_rect, effect.outsets);
+                let stable_key =
+                    format!("{}@popup-behind-framebuffer@{}", popup_id, output.name());
+                crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rects(
+                    renderer,
+                    popup_framebuffer_effect_states
+                        .entry(stable_key)
+                        .or_default(),
+                    &[rect],
+                    effect.effect.clone(),
+                    output_geo,
+                    scale,
+                    1.0,
+                )
+                .inspect_err(|error| {
+                    warn!(popup_id, ?error, "failed to build popup behind effect");
+                })
+                .ok()
+                .flatten()
+            })
+            .map(|element| {
+                vec![TtyRenderElements::Decoration(
+                    decoration::DecorationSceneElements::Backdrop(element),
+                )]
+            })
+            .unwrap_or_default();
+
+        elements.extend(in_front);
+        if replacement.is_empty() {
+            elements.extend(popup_elements);
+        } else {
+            elements.extend(replacement);
+        }
+        elements.extend(behind_root);
+        elements.extend(behind_popup_source);
+        elements.extend(behind_backdrop);
+    }
+    elements
 }
 
 fn expand_logical_rect(
@@ -7275,20 +7560,24 @@ fn configured_background_effect_elements_for_layer(
         String,
         crate::backend::shader_effect::CachedBackdropTexture,
     >,
-    configured_layer_effects: &std::collections::HashMap<
-        String,
-        crate::ssd::BackgroundEffectConfig,
-    >,
     configured_background_effect: Option<&crate::ssd::BackgroundEffectConfig>,
+    custom_background: Option<&crate::ssd::WindowEffectSlot>,
 ) -> Result<Vec<TtyRenderElements>, Box<dyn std::error::Error>> {
     let layer_id = crate::ssd::layer_runtime_id(layer_surface);
-    let Some(effect_config) = configured_layer_effects
-        .get(&layer_id)
-        .or(configured_background_effect)
-    else {
+    let custom_config = custom_background.map(|effect| crate::ssd::BackgroundEffectConfig {
+        effect: effect.effect.clone(),
+    });
+    let selected_effect_config = custom_config.or_else(|| configured_background_effect.cloned());
+    let Some(effect_config) = selected_effect_config.as_ref() else {
         return Ok(Vec::new());
     };
-    let rects = protocol_background_effect_rects_for_layer(output, layer_surface);
+    let rects = if let Some(effect) = custom_background {
+        layer_surface_logical_rect(output, layer_surface)
+            .map(|rect| vec![expand_logical_rect(rect, effect.outsets)])
+            .unwrap_or_default()
+    } else {
+        protocol_background_effect_rects_for_layer(output, layer_surface)
+    };
     if rects.is_empty() {
         return Ok(Vec::new());
     }
@@ -7426,38 +7715,92 @@ fn configured_background_effect_elements_for_layer(
     else {
         return Ok(Vec::new());
     };
-    let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
-        renderer,
-        format!(
-            "tty:layer-top:{}:{}:{}x{}",
-            output.name(),
-            layer_id,
-            effect_rect.width,
-            effect_rect.height
-        ),
-        input_texture,
-        xray_texture,
-        crate::backend::visual::logical_size_to_physical_buffer_size(
-            actual_capture_geo.size.w,
-            actual_capture_geo.size.h,
+    let layer_source_texture = if effect_config.effect.uses_layer_source_input() {
+        let layer_source_geo = smithay::utils::Rectangle::new(
+            smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
+            (effect_rect.width, effect_rect.height).into(),
+        );
+        let layer_source_origin =
+            crate::backend::visual::logical_point_to_physical_point_global_edges(
+                layer_source_geo.loc,
+                output_geo.loc,
+                scale,
+            );
+        let scene = layer_surface_scene_elements_for_capture(
+            renderer,
+            output,
+            layer_source_geo,
+            layer_source_origin,
+            scale,
+            layer_surface,
+        )?;
+        capture_scene_texture_for_effect(
+            renderer,
+            "tty-layer-top-source",
+            layer_source_geo,
+            scale,
+            &scene,
+        )
+    } else {
+        None
+    };
+    // Layer source capture can legitimately come up empty (first frame after
+    // the surface maps, zero-sized geometry during animations, capture
+    // failure). Running the pipeline without it would fail inside
+    // resolve_effect_input, so skip the effect for this frame instead.
+    if effect_config.effect.uses_layer_source_input() && layer_source_texture.is_none() {
+        return Ok(Vec::new());
+    }
+    let cache_key = format!(
+        "tty:layer-top:{}:{}:{}x{}",
+        output.name(),
+        layer_id,
+        effect_rect.width,
+        effect_rect.height
+    );
+    let input_size = crate::backend::visual::logical_size_to_physical_buffer_size(
+        actual_capture_geo.size.w,
+        actual_capture_geo.size.h,
+        scale,
+    );
+    let sample_region = Some(
+        crate::backend::visual::logical_rect_to_physical_buffer_rect_f64(
+            effect_rect,
+            actual_capture_geo.loc,
             scale,
         ),
-        Some(
-            crate::backend::visual::logical_rect_to_physical_buffer_rect_f64(
-                effect_rect,
-                actual_capture_geo.loc,
-                scale,
-            ),
+    );
+    let output_size = Some(
+        crate::backend::visual::logical_size_to_physical_buffer_size(
+            effect_rect.width,
+            effect_rect.height,
+            scale,
         ),
-        Some(
-            crate::backend::visual::logical_size_to_physical_buffer_size(
-                effect_rect.width,
-                effect_rect.height,
-                scale,
-            ),
-        ),
-        &effect_config.effect,
-    )?;
+    );
+    let texture = if let Some(layer_source_texture) = layer_source_texture {
+        crate::backend::shader_effect::apply_effect_pipeline_cached_for_key_with_layer_source(
+            renderer,
+            cache_key,
+            input_texture,
+            xray_texture,
+            layer_source_texture,
+            input_size,
+            sample_region,
+            output_size,
+            &effect_config.effect,
+        )?
+    } else {
+        crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
+            renderer,
+            cache_key,
+            input_texture,
+            xray_texture,
+            input_size,
+            sample_region,
+            output_size,
+            &effect_config.effect,
+        )?
+    };
     if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
         tracing::info!(
             layer_surface = ?layer_surface.wl_surface().id(),
@@ -7531,14 +7874,15 @@ fn configured_background_effect_elements_for_layer(
     )
         .hash(&mut hasher);
     let signature = hasher.finish();
-    let source_damage_hit = crate::backend::shader_effect::source_damage_intersects_rect(
-        &effect_config.effect,
-        smithay::utils::Rectangle::new(
-            smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
-            (effect_rect.width, effect_rect.height).into(),
-        ),
-        &relevant_source_damage,
-    );
+    let source_damage_hit = effect_config.effect.uses_layer_source_input()
+        || crate::backend::shader_effect::source_damage_intersects_rect(
+            &effect_config.effect,
+            smithay::utils::Rectangle::new(
+                smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
+                (effect_rect.width, effect_rect.height).into(),
+            ),
+            &relevant_source_damage,
+        );
     let captured_local_rect = smithay::utils::Rectangle::new(
         smithay::utils::Point::from((
             effect_rect.x - output_geo.loc.x,
@@ -7704,20 +8048,92 @@ fn lower_layer_scene_elements(
         String,
         crate::backend::shader_effect::CachedBackdropTexture,
     >,
+    configured_layer_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
+    layer_effect_cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+    configured_popup_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
+    popup_effect_cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+    popup_framebuffer_effect_states: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::ShaderEffectElementState,
+    >,
 ) -> Result<Vec<TtyRenderElements>, Box<dyn std::error::Error>> {
     let (_, lower_layers) = window_render::layer_surfaces_for_output(output);
     let mut elements = Vec::new();
     for (index, layer_surface) in lower_layers.iter().enumerate() {
-        let layer_id = layer_surface.wl_surface().id().protocol_id();
-        elements.extend(
-            window_render::layer_surface_elements(renderer, output, layer_surface, scale, 1.0)
-                .into_iter()
-                .map(TtyRenderElements::Window),
-        );
-        let Some(effect_config) = effect_config else {
+        let layer_id = crate::ssd::layer_runtime_id(layer_surface);
+        // Popups draw above their layer; compose their effects per popup.
+        elements.extend(composed_popup_scene_elements(
+            renderer,
+            output,
+            output_geo,
+            scale,
+            layer_surface,
+            configured_popup_effects,
+            popup_effect_cache,
+            popup_framebuffer_effect_states,
+        ));
+        let root_elements = window_render::layer_surface_root_elements(
+            renderer,
+            output,
+            layer_surface,
+            scale,
+            1.0,
+        )
+        .into_iter()
+        .map(TtyRenderElements::Window)
+        .collect::<Vec<_>>();
+        if let (Some(effects), Some(layer_rect)) = (
+            configured_layer_effects.get(&layer_id),
+            layer_surface_logical_rect(output, layer_surface),
+        ) {
+            let capture_elements =
+                window_render::layer_surface_elements(renderer, output, layer_surface, scale, 1.0)
+                    .into_iter()
+                    .map(TtyRenderElements::Window)
+                    .collect::<Vec<_>>();
+            elements.extend(layer_source_effect_elements(
+                renderer,
+                output,
+                output_geo,
+                scale,
+                &layer_id,
+                layer_rect,
+                effects,
+                root_elements,
+                &capture_elements,
+                layer_effect_cache,
+            ));
+        } else {
+            elements.extend(root_elements);
+        }
+        let custom_background = configured_layer_effects
+            .get(&layer_id)
+            .and_then(|effects| effects.behind.as_ref())
+            .filter(|effect| effect.effect.is_backdrop())
+            .cloned();
+        let custom_config =
+            custom_background
+                .as_ref()
+                .map(|effect| crate::ssd::BackgroundEffectConfig {
+                    effect: effect.effect.clone(),
+                });
+        let selected_effect_config = custom_config.or_else(|| effect_config.cloned());
+        let Some(effect_config) = selected_effect_config.as_ref() else {
             continue;
         };
-        let rects = protocol_background_effect_rects_for_layer(output, layer_surface);
+        let rects = if let Some(effect) = custom_background.as_ref() {
+            layer_surface_logical_rect(output, layer_surface)
+                .map(|rect| vec![expand_logical_rect(rect, effect.outsets)])
+                .unwrap_or_default()
+        } else {
+            protocol_background_effect_rects_for_layer(output, layer_surface)
+        };
         let Some(effect_rect) = crate::backend::window::bounding_box_for_rects(&rects) else {
             continue;
         };
@@ -7907,35 +8323,88 @@ fn lower_layer_scene_elements(
             } else {
                 None
             };
-            let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
-                renderer,
-                format!("tty:layer-lower:{}", stable_key),
-                backdrop_texture
-                    .clone()
-                    .or_else(|| xray_texture.clone())
-                    .ok_or("missing backdrop snapshot")?,
-                xray_texture,
-                crate::backend::visual::logical_size_to_physical_buffer_size(
-                    actual_capture_geo.size.w,
-                    actual_capture_geo.size.h,
+            let layer_source_texture = if effect_config.effect.uses_layer_source_input() {
+                let layer_source_geo = smithay::utils::Rectangle::new(
+                    smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
+                    (effect_rect.width, effect_rect.height).into(),
+                );
+                let layer_source_origin =
+                    crate::backend::visual::logical_point_to_physical_point_global_edges(
+                        layer_source_geo.loc,
+                        output_geo.loc,
+                        scale,
+                    );
+                let scene = layer_surface_scene_elements_for_capture(
+                    renderer,
+                    output,
+                    layer_source_geo,
+                    layer_source_origin,
+                    scale,
+                    layer_surface,
+                )?;
+                capture_scene_texture_for_effect(
+                    renderer,
+                    "tty-layer-lower-source",
+                    layer_source_geo,
+                    scale,
+                    &scene,
+                )
+            } else {
+                None
+            };
+            // Skip the effect this frame when the layer source could not be
+            // captured (empty scene / zero-sized geometry); running the
+            // pipeline without it would fail inside resolve_effect_input.
+            if effect_config.effect.uses_layer_source_input() && layer_source_texture.is_none() {
+                continue;
+            }
+            let input_texture = backdrop_texture
+                .clone()
+                .or_else(|| xray_texture.clone())
+                .ok_or("missing backdrop snapshot")?;
+            let input_size = crate::backend::visual::logical_size_to_physical_buffer_size(
+                actual_capture_geo.size.w,
+                actual_capture_geo.size.h,
+                scale,
+            );
+            let sample_region = Some(
+                crate::backend::visual::logical_rect_to_physical_buffer_rect_f64(
+                    effect_rect,
+                    actual_capture_geo.loc,
                     scale,
                 ),
-                Some(
-                    crate::backend::visual::logical_rect_to_physical_buffer_rect_f64(
-                        effect_rect,
-                        actual_capture_geo.loc,
-                        scale,
-                    ),
+            );
+            let output_size = Some(
+                crate::backend::visual::logical_size_to_physical_buffer_size(
+                    effect_rect.width,
+                    effect_rect.height,
+                    scale,
                 ),
-                Some(
-                    crate::backend::visual::logical_size_to_physical_buffer_size(
-                        effect_rect.width,
-                        effect_rect.height,
-                        scale,
-                    ),
-                ),
-                &effect_config.effect,
-            )?;
+            );
+            let texture = if let Some(layer_source_texture) = layer_source_texture {
+                crate::backend::shader_effect::apply_effect_pipeline_cached_for_key_with_layer_source(
+                    renderer,
+                    format!("tty:layer-lower:{}", stable_key),
+                    input_texture,
+                    xray_texture,
+                    layer_source_texture,
+                    input_size,
+                    sample_region,
+                    output_size,
+                    &effect_config.effect,
+                )?
+            } else {
+                crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
+                    renderer,
+                    format!("tty:layer-lower:{}", stable_key),
+                    input_texture,
+                    xray_texture,
+                    input_size,
+                    sample_region,
+                    output_size,
+                    &effect_config.effect,
+                )?
+            };
             let mut sub_elements = layer_backdrop_cache
                 .get(&stable_key)
                 .map(|existing| existing.sub_elements.clone())
@@ -8024,10 +8493,8 @@ fn upper_layer_scene_elements(
     window_source_damage: &[crate::state::OwnedDamageRect],
     lower_layer_source_damage: &[crate::state::OwnedDamageRect],
     lower_layer_scene_generation: u64,
-    configured_layer_effects: &std::collections::HashMap<
-        String,
-        crate::ssd::BackgroundEffectConfig,
-    >,
+    configured_layer_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
+    configured_popup_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
     configured_background_effect: Option<&crate::ssd::BackgroundEffectConfig>,
     output: &Output,
     output_geo: smithay::utils::Rectangle<i32, Logical>,
@@ -8038,6 +8505,18 @@ fn upper_layer_scene_elements(
         crate::backend::shader_effect::CachedBackdropTexture,
     >,
     layer_framebuffer_effect_states: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::ShaderEffectElementState,
+    >,
+    layer_effect_cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+    popup_effect_cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+    popup_framebuffer_effect_states: &mut std::collections::HashMap<
         String,
         crate::backend::shader_effect::ShaderEffectElementState,
     >,
@@ -8054,17 +8533,64 @@ fn upper_layer_scene_elements(
 
     let mut elements = Vec::new();
     for layer_surface in upper_layers {
-        elements.extend(
-            window_render::layer_surface_elements(renderer, output, &layer_surface, scale, 1.0)
-                .into_iter()
-                .map(TtyRenderElements::Window),
-        );
+        // Popups draw above their layer; compose their effects per popup.
+        elements.extend(composed_popup_scene_elements(
+            renderer,
+            output,
+            output_geo,
+            scale,
+            &layer_surface,
+            configured_popup_effects,
+            popup_effect_cache,
+            popup_framebuffer_effect_states,
+        ));
+        let root_elements = window_render::layer_surface_root_elements(
+            renderer,
+            output,
+            &layer_surface,
+            scale,
+            1.0,
+        )
+        .into_iter()
+        .map(TtyRenderElements::Window)
+        .collect::<Vec<_>>();
         let layer_id = crate::ssd::layer_runtime_id(&layer_surface);
-        let effect_config = configured_layer_effects
+        if let (Some(effects), Some(layer_rect)) = (
+            configured_layer_effects.get(&layer_id),
+            layer_surface_logical_rect(output, &layer_surface),
+        ) {
+            // layerSource() "full" captures keep seeing popups, so build the
+            // capture scene with them included (display passthrough stays
+            // root-only — popups are already displayed above).
+            let capture_elements =
+                window_render::layer_surface_elements(renderer, output, &layer_surface, scale, 1.0)
+                    .into_iter()
+                    .map(TtyRenderElements::Window)
+                    .collect::<Vec<_>>();
+            elements.extend(layer_source_effect_elements(
+                renderer,
+                output,
+                output_geo,
+                scale,
+                &layer_id,
+                layer_rect,
+                effects,
+                root_elements,
+                &capture_elements,
+                layer_effect_cache,
+            ));
+        } else {
+            elements.extend(root_elements);
+        }
+        let custom_background = configured_layer_effects
             .get(&layer_id)
-            .or(configured_background_effect);
-        if let Some(effect_config) =
-            effect_config.filter(|config| config.effect.supports_framebuffer_backdrop())
+            .and_then(|effects| effects.behind.as_ref())
+            .filter(|effect| effect.effect.is_backdrop())
+            .cloned();
+        let effect_config = configured_background_effect;
+        if custom_background.is_none()
+            && let Some(effect_config) =
+                effect_config.filter(|config| config.effect.supports_framebuffer_backdrop())
         {
             elements.extend(configured_background_framebuffer_effect_elements_for_layer(
                 renderer,
@@ -8091,8 +8617,8 @@ fn upper_layer_scene_elements(
                 &layer_surface,
                 1.0,
                 layer_backdrop_cache,
-                configured_layer_effects,
                 configured_background_effect,
+                custom_background.as_ref(),
             )?);
         }
     }

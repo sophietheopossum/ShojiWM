@@ -1,9 +1,11 @@
 import { markLayerDirty } from "./runtime-hooks";
 import { signal, type Signal } from "./signals";
-import { createAnimationController, type AnimationController } from "./animation";
+import {
+  createAnimationController,
+  type AnimationController,
+} from "./animation";
 import { shallowEqual } from "./reconcile";
 import type {
-  CompiledEffectHandle,
   LayerPosition,
   ReactiveWaylandLayer,
   ReactiveWaylandLayerHandle,
@@ -36,7 +38,9 @@ interface MutableLayerSignals {
 
 export function createReactiveLayer(
   snapshot: WaylandLayerSnapshot,
-  animation: AnimationController = createAnimationController(() => markLayerDirty(snapshot.id)),
+  animation: AnimationController = createAnimationController(() =>
+    markLayerDirty(snapshot.id),
+  ),
 ): ReactiveWaylandLayerHandle {
   const signals: MutableLayerSignals = {
     id: signal(snapshot.id),
@@ -54,8 +58,6 @@ export function createReactiveLayer(
     keyboardInteractivity: signal(snapshot.keyboardInteractivity),
     desiredSize: signal(snapshot.desiredSize),
   };
-
-  let effect: CompiledEffectHandle | null = null;
 
   const position: LayerPosition = {
     get x() {
@@ -89,13 +91,6 @@ export function createReactiveLayer(
     keyboardInteractivity: signals.keyboardInteractivity,
     desiredSize: signals.desiredSize,
     animation,
-    get effect() {
-      return effect;
-    },
-    set effect(value) {
-      effect = value;
-      markLayerDirty(signals.id.peek());
-    },
     signals,
   };
 
@@ -117,7 +112,9 @@ export function createReactiveLayer(
       if (!shallowEqual(signals.anchor.peek(), nextSnapshot.anchor)) {
         signals.anchor.value = nextSnapshot.anchor;
       }
-      if (!shallowEqual(signals.exclusiveZone.peek(), nextSnapshot.exclusiveZone)) {
+      if (
+        !shallowEqual(signals.exclusiveZone.peek(), nextSnapshot.exclusiveZone)
+      ) {
         signals.exclusiveZone.value = nextSnapshot.exclusiveZone;
       }
       signals.exclusiveEdge.value = nextSnapshot.exclusiveEdge;

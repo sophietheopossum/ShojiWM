@@ -129,7 +129,6 @@ export interface WaylandLayer {
   readonly keyboardInteractivity: import("./signals").ReadonlySignal<WaylandLayerKeyboardInteractivity>;
   readonly desiredSize: import("./signals").ReadonlySignal<WaylandLayerDesiredSize>;
   readonly animation: import("./animation").AnimationController;
-  effect: CompiledEffectHandle | null;
 }
 
 export interface WindowPosition {
@@ -358,12 +357,16 @@ export interface ShaderStageHandle {
   kind: "shader-stage";
   shader: ShaderModuleHandle;
   uniforms?: ShaderUniformMap;
+  /** Additional sampler2D uniforms, keyed by their GLSL uniform names. */
+  textures?: Record<string, EffectInputHandle>;
 }
 
 export interface ShaderInputHandle {
   kind: "shader-input";
   shader: ShaderModuleHandle;
   uniforms?: ShaderUniformMap;
+  /** Additional sampler2D uniforms, keyed by their GLSL uniform names. */
+  textures?: Record<string, EffectInputHandle>;
 }
 
 export interface BackdropSourceHandle {
@@ -419,7 +422,9 @@ export type EffectInputHandle =
   | ShaderInputHandle
   | ImageSourceHandle
   | NamedTextureHandle
-  | WindowSourceHandle;
+  | WindowSourceHandle
+  | LayerSourceHandle
+  | PopupSourceHandle;
 
 export type EffectStageHandle =
   | ShaderStageHandle
@@ -429,17 +434,66 @@ export type EffectStageHandle =
   | BlendStageHandle
   | UnitStageHandle;
 
+/**
+ * How the alpha channel of the effect's output is treated when the result is
+ * composited onto the screen.
+ *
+ * - `"opaque"` (default): force alpha to 1.0 at the end of the pipeline.
+ *   Backdrop captures are cleared to transparent black and the blur chain
+ *   smears uncovered border texels inward, so the alpha of a plain backdrop
+ *   pipeline is noise rather than signal; forcing it opaque hides dark halos
+ *   and see-through fringes at the blur edges. Correct for the common
+ *   "frosted glass" case where the backdrop is already-composited screen
+ *   content.
+ * - `"preserve"`: keep the pipeline's alpha output intact. For pipelines
+ *   that intentionally produce transparency (e.g. masking the blur against a
+ *   layer's own alpha). Opting in makes the pipeline responsible for
+ *   producing meaningful alpha everywhere, including the blur edge regions.
+ *
+ * This is an explicit declaration; the compositor never infers it from the
+ * pipeline contents (such as whether a layer source is referenced), so adding
+ * a texture input never silently changes edge-artifact handling.
+ */
+export type EffectAlphaMode = "opaque" | "preserve";
+
 export interface CompiledEffectHandle {
   kind: "compiled-effect";
   input: EffectInputHandle;
   invalidate: EffectInvalidationPolicyHandle;
   pipeline: EffectStageHandle[];
+  /** Output alpha handling. Defaults to `"opaque"`. See {@link EffectAlphaMode}. */
+  alpha?: EffectAlphaMode;
 }
 
 export interface WindowSourceHandle {
   kind: "window-source";
   include: "full" | "root-surface";
 }
+
+export interface LayerSourceHandle {
+  kind: "layer-source";
+  include: "full" | "root-surface";
+}
+
+export type LayerEffectInputHandle =
+  | LayerSourceHandle
+  | BackdropSourceHandle
+  | XrayBackdropSourceHandle;
+
+/** The popup's own rendered content as an effect input. */
+export interface PopupSourceHandle {
+  kind: "popup-source";
+  include: "full" | "root-surface";
+}
+
+/**
+ * Inputs allowed for popup effects. Note that a backdrop input on the
+ * `behind` slot must be resolvable from the framebuffer at draw time (plain
+ * blur etc. — no xray/window/layer sources): popups render inline with their
+ * parent's element stream, so there is no offline "scene below the popup"
+ * capture path.
+ */
+export type PopupEffectInputHandle = PopupSourceHandle | BackdropSourceHandle;
 
 export type EffectOutsets =
   | number
@@ -463,9 +517,61 @@ export interface WindowEffectAssignment {
   replace?: WindowEffectHandle | null;
 }
 
+export interface LayerEffectHandle {
+  kind: "layer-effect";
+  effect: CompiledEffectHandle;
+  outsets?: EffectOutsets;
+}
+
+export interface LayerEffectAssignment {
+  /** Backdrop inputs are supported in this slot for per-layer background effects. */
+  behind?: LayerEffectHandle | null;
+  behindRootSurface?: LayerEffectHandle | null;
+  inFront?: LayerEffectHandle | null;
+  replace?: LayerEffectHandle | null;
+}
+
+export interface PopupEffectHandle {
+  kind: "popup-effect";
+  effect: CompiledEffectHandle;
+  outsets?: EffectOutsets;
+}
+
+export interface PopupEffectAssignment {
+  /**
+   * Drawn between the popup and the content below it. Accepts popupSource()
+   * inputs (e.g. a drop shadow derived from the popup's own alpha) or a
+   * framebuffer-resolvable backdrop effect (e.g. plain blur behind the popup).
+   */
+  behind?: PopupEffectHandle | null;
+  behindRootSurface?: PopupEffectHandle | null;
+  /** Drawn on top of the popup. popupSource() inputs only. */
+  inFront?: PopupEffectHandle | null;
+  /** Replaces the popup's own rendering. popupSource() inputs only. */
+  replace?: PopupEffectHandle | null;
+}
+
+/**
+ * A mapped xdg_popup, delivered to `WINDOW_MANAGER.effect.popup` so effects
+ * can be assigned per popup. Currently only popups attached to layer-shell
+ * surfaces are delivered (`parentKind: "layer"`); popups of toplevel windows
+ * will follow with `parentKind: "window"`.
+ */
+export interface WaylandPopup {
+  readonly id: string;
+  /** Runtime id of the root surface this popup belongs to. */
+  readonly parentId: string;
+  readonly parentKind: "layer" | "window";
+  readonly outputName: string;
+  /** Output-local logical rect of the popup's geometry box. */
+  readonly position: { x: number; y: number; width: number; height: number };
+}
+
 export interface WindowManagerEffectConfig {
   background_effect: CompiledEffectHandle | null;
   window?: (window: WaylandWindow) => WindowEffectAssignment | null;
+  layer?: (layer: WaylandLayer) => LayerEffectAssignment | null;
+  popup?: (popup: WaylandPopup) => PopupEffectAssignment | null;
 }
 
 export interface OutputMode {

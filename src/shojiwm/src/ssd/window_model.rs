@@ -469,6 +469,28 @@ pub struct LayerPositionSnapshot {
     pub height: i32,
 }
 
+/// What kind of surface an xdg_popup is (transitively) attached to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PopupParentKindSnapshot {
+    Layer,
+    Window,
+}
+
+/// TypeScript-facing snapshot of a mapped xdg_popup, used to evaluate
+/// per-popup effects (`WINDOW_MANAGER.effect.popup`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaylandPopupSnapshot {
+    pub id: String,
+    /// Runtime id of the root surface this popup belongs to.
+    pub parent_id: String,
+    pub parent_kind: PopupParentKindSnapshot,
+    pub output_name: String,
+    /// Output-local logical rect of the popup's geometry box.
+    pub position: LayerPositionSnapshot,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LayerKindSnapshot {
@@ -848,6 +870,48 @@ impl ShojiWM {
         }
         layers
     }
+
+    /// TypeScript-facing snapshots of all xdg_popups currently mapped on
+    /// layer surfaces. `position` is output-local logical, consistent with
+    /// `WaylandLayerSnapshot::position` (the popup's geometry box, i.e. the
+    /// rect a popup-level effect applies to).
+    ///
+    /// Popups attached to toplevel windows are not snapshotted yet: their
+    /// render path folds popups into the parent window's (potentially
+    /// transformed) element stream, so per-popup effects there need a
+    /// separate integration. `parent_kind` exists in the schema so they can
+    /// be added without breaking the wire format.
+    pub fn snapshot_popups(&self) -> Vec<WaylandPopupSnapshot> {
+        let mut popups = Vec::new();
+        for output in self.space.outputs() {
+            let output_name = output.name().to_string();
+            let map = layer_map_for_output(output);
+            for layer in map.layers() {
+                let Some(geometry) = map.layer_geometry(layer) else {
+                    continue;
+                };
+                let parent_id = layer_runtime_id(layer);
+                for (popup, popup_offset) in
+                    smithay::desktop::PopupManager::popups_for_surface(layer.wl_surface())
+                {
+                    let popup_geometry = popup.geometry();
+                    popups.push(WaylandPopupSnapshot {
+                        id: popup_runtime_id(popup.wl_surface()),
+                        parent_id: parent_id.clone(),
+                        parent_kind: PopupParentKindSnapshot::Layer,
+                        output_name: output_name.clone(),
+                        position: LayerPositionSnapshot {
+                            x: geometry.loc.x + popup_offset.x,
+                            y: geometry.loc.y + popup_offset.y,
+                            width: popup_geometry.size.w,
+                            height: popup_geometry.size.h,
+                        },
+                    });
+                }
+            }
+        }
+        popups
+    }
 }
 
 fn window_size_constraints(
@@ -896,6 +960,19 @@ fn runtime_id_for_x11_window(surface: &smithay::xwayland::X11Surface) -> String 
 
 pub fn layer_runtime_id(layer: &LayerSurface) -> String {
     let surface = layer.wl_surface();
+    let protocol_id = surface.id().protocol_id();
+    let client_id = surface
+        .client()
+        .map(|client| format!("{:?}", client.id()))
+        .unwrap_or_else(|| "unknown-client".to_string());
+    format!("{client_id}:{protocol_id}")
+}
+
+/// Stable runtime id for an xdg_popup surface (same client:protocol scheme as
+/// windows and layers, so it is unique among all runtime ids).
+pub fn popup_runtime_id(
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) -> String {
     let protocol_id = surface.id().protocol_id();
     let client_id = surface
         .client()

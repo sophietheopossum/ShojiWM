@@ -15,13 +15,13 @@ use tracing::{debug, error, info, warn};
 use super::window_model::{
     GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, ManagedWindowAnimationSnapshot,
     ManagedWindowState, PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandOutputSnapshot,
-    WaylandWindowAction, WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
-    WindowMaximizeRequestEventSnapshot, WindowMinimizeRequestEventSnapshot,
-    WindowMoveEventSnapshot, WindowResizeEventSnapshot,
+    WaylandPopupSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
+    WindowActivateRequestEventSnapshot, WindowMaximizeRequestEventSnapshot,
+    WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
 };
 use super::{
     BackgroundEffectConfig, DecorationBridgeError, DecorationLayoutError, DecorationNode,
-    DecorationTree, WindowEffectConfig, WindowTransform, WireCompiledEffect,
+    DecorationTree, EffectInput, WindowEffectConfig, WindowTransform, WireCompiledEffect,
     WireWindowEffectConfig, decode_tree_json,
 };
 use crate::{
@@ -163,6 +163,15 @@ pub trait DecorationEvaluator {
         _now_ms: u64,
     ) -> Result<LayerEffectEvaluationResult, DecorationEvaluationError> {
         Ok(LayerEffectEvaluationResult::default())
+    }
+
+    fn evaluate_popup_effects(
+        &self,
+        _output_name: &str,
+        _popups: &[WaylandPopupSnapshot],
+        _now_ms: u64,
+    ) -> Result<PopupEffectEvaluationResult, DecorationEvaluationError> {
+        Ok(PopupEffectEvaluationResult::default())
     }
 }
 
@@ -398,7 +407,84 @@ pub struct LayerEffectEvaluationResult {
 #[derive(Debug, Clone)]
 pub struct RuntimeLayerEffectAssignment {
     pub layer_id: String,
-    pub effect: Option<BackgroundEffectConfig>,
+    pub effects: Option<WindowEffectConfig>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PopupEffectEvaluationResult {
+    pub effects: Vec<RuntimePopupEffectAssignment>,
+    pub next_poll_in_ms: Option<u64>,
+    pub display_config: Option<RuntimeDisplayConfigUpdate>,
+    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
+    pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
+    pub process_config: Option<RuntimeProcessConfigUpdate>,
+    pub process_actions: Vec<RuntimeProcessAction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimePopupEffectAssignment {
+    pub popup_id: String,
+    pub effects: Option<WindowEffectConfig>,
+}
+
+fn validate_popup_effect_config(
+    effects: WindowEffectConfig,
+) -> Result<WindowEffectConfig, DecorationBridgeError> {
+    let is_popup_source =
+        |slot: &super::WindowEffectSlot| matches!(slot.effect.input, EffectInput::PopupSource(_));
+    // `behind` additionally accepts backdrop inputs, but only ones that can be
+    // resolved from the framebuffer at draw time: popups render inline with
+    // their parent's element stream, so there is no offline "scene below the
+    // popup" capture path (unlike layers).
+    if effects
+        .behind
+        .as_ref()
+        .is_some_and(|slot| !is_popup_source(slot) && !slot.effect.supports_framebuffer_backdrop())
+        || effects
+            .behind_root_surface
+            .as_ref()
+            .is_some_and(|slot| !is_popup_source(slot))
+        || effects
+            .in_front
+            .as_ref()
+            .is_some_and(|slot| !is_popup_source(slot))
+        || effects
+            .replace
+            .as_ref()
+            .is_some_and(|slot| !is_popup_source(slot))
+    {
+        return Err(DecorationBridgeError::InvalidEffectInput);
+    }
+    Ok(effects)
+}
+
+fn validate_layer_effect_config(
+    effects: WindowEffectConfig,
+) -> Result<WindowEffectConfig, DecorationBridgeError> {
+    let is_layer_source =
+        |slot: &super::WindowEffectSlot| matches!(slot.effect.input, EffectInput::LayerSource(_));
+    if effects
+        .behind
+        .as_ref()
+        .is_some_and(|slot| !is_layer_source(slot) && !slot.effect.is_backdrop())
+        || effects
+            .behind_root_surface
+            .as_ref()
+            .is_some_and(|slot| !is_layer_source(slot))
+        || effects
+            .in_front
+            .as_ref()
+            .is_some_and(|slot| !is_layer_source(slot))
+        || effects
+            .replace
+            .as_ref()
+            .is_some_and(|slot| !is_layer_source(slot))
+    {
+        return Err(DecorationBridgeError::InvalidEffectInput);
+    }
+    Ok(effects)
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -812,6 +898,19 @@ enum RuntimeRequest<'a> {
         #[serde(rename = "inputState")]
         input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     },
+    EvaluatePopupEffects {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        #[serde(rename = "outputName")]
+        output_name: &'a str,
+        popups: &'a [WaylandPopupSnapshot],
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState")]
+        display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
+    },
     LifecycleEnable {
         #[serde(rename = "requestId")]
         request_id: u64,
@@ -1036,7 +1135,40 @@ struct RuntimeEffectConfigResponse {
 struct RuntimeLayerEffectAssignmentResponse {
     #[serde(rename = "layerId")]
     layer_id: String,
-    effect: Option<WireCompiledEffect>,
+    effects: Option<WireWindowEffectConfig>,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimePopupEffectAssignmentResponse {
+    #[serde(rename = "popupId")]
+    popup_id: String,
+    effects: Option<WireWindowEffectConfig>,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimePopupEffectsResponse {
+    #[serde(rename = "requestId")]
+    request_id: u64,
+    kind: String,
+    ok: bool,
+    effects: Option<Vec<RuntimePopupEffectAssignmentResponse>>,
+    #[serde(rename = "nextPollInMs")]
+    next_poll_in_ms: Option<u64>,
+    #[serde(rename = "displayConfig")]
+    display_config: Option<RuntimeDisplayConfigUpdate>,
+    #[serde(rename = "keyBindingConfig")]
+    key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
+    #[serde(rename = "pointerConfig")]
+    pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "inputConfig")]
+    input_config: Option<RuntimeInputConfigUpdate>,
+    #[serde(rename = "eventConfig")]
+    event_config: Option<RuntimeEventConfigUpdate>,
+    #[serde(rename = "processConfig")]
+    process_config: Option<RuntimeProcessConfigUpdate>,
+    #[serde(rename = "processActions")]
+    process_actions: Option<Vec<RuntimeProcessAction>>,
+    error: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -3603,7 +3735,115 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
                 .map(|assignment| {
                     Ok(RuntimeLayerEffectAssignment {
                         layer_id: assignment.layer_id,
-                        effect: assignment.effect.map(TryInto::try_into).transpose()?,
+                        effects: assignment
+                            .effects
+                            .map(TryInto::try_into)
+                            .transpose()?
+                            .map(validate_layer_effect_config)
+                            .transpose()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, DecorationBridgeError>>()
+                .map_err(DecorationEvaluationError::Bridge)?,
+            next_poll_in_ms: response.next_poll_in_ms,
+            display_config: response.display_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+        })
+    }
+
+    fn evaluate_popup_effects(
+        &self,
+        output_name: &str,
+        popups: &[WaylandPopupSnapshot],
+        now_ms: u64,
+    ) -> Result<PopupEffectEvaluationResult, DecorationEvaluationError> {
+        let mut runtime_guard = self.runtime.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+        })?;
+        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        let request_id = runtime.next_request_id;
+        runtime.next_request_id += 1;
+        let display_state = self
+            .display_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        let request = serde_json::to_string(&RuntimeRequest::EvaluatePopupEffects {
+            request_id,
+            output_name,
+            popups,
+            now_ms,
+            display_state: &display_state,
+            input_state: &input_state,
+        })
+        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
+        runtime.write_request(&request)?;
+
+        let response: RuntimePopupEffectsResponse =
+            if let Some(response) = runtime.read_response()? {
+                response
+            } else {
+                let status = runtime
+                    .child
+                    .try_wait()?
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let stderr = runtime
+                    .stderr_log
+                    .lock()
+                    .map(|stderr| stderr.clone())
+                    .unwrap_or_default();
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            };
+        if response.request_id != request_id {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response id: expected {request_id}, got {}",
+                response.request_id
+            )));
+        }
+        if response.kind != "evaluatePopupEffects" {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response kind for evaluatePopupEffects: {}",
+                response.kind
+            )));
+        }
+        if !response.ok {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                response
+                    .error
+                    .unwrap_or_else(|| "runtime returned failure".into()),
+            ));
+        }
+
+        Ok(PopupEffectEvaluationResult {
+            effects: response
+                .effects
+                .unwrap_or_default()
+                .into_iter()
+                .map(|assignment| {
+                    Ok(RuntimePopupEffectAssignment {
+                        popup_id: assignment.popup_id,
+                        effects: assignment
+                            .effects
+                            .map(TryInto::try_into)
+                            .transpose()?
+                            .map(validate_popup_effect_config)
+                            .transpose()?,
                     })
                 })
                 .collect::<Result<Vec<_>, DecorationBridgeError>>()
