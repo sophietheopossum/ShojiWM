@@ -94,11 +94,26 @@ pub struct PointerMovePointSnapshot {
     pub y: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PointerHitTargetSnapshot {
+    None,
+    Window {
+        #[serde(rename = "windowId")]
+        window_id: String,
+    },
+    Layer {
+        #[serde(rename = "layerId")]
+        layer_id: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PointerMoveEventSnapshot {
     pub position: PointerMovePointSnapshot,
     pub delta: PointerMovePointSnapshot,
+    pub target: PointerHitTargetSnapshot,
     pub output_name: Option<String>,
     pub modifiers: PointerModifierStateSnapshot,
     pub timestamp: u64,
@@ -905,7 +920,29 @@ fn anchor_to_edge_snapshot(anchor: WlrAnchor) -> Option<LayerEdgeSnapshot> {
 
 #[cfg(test)]
 mod tests {
-    use super::WaylandWindowAction;
+    use super::{PointerHitTargetSnapshot, WaylandWindowAction};
+
+    #[test]
+    fn pointer_hit_targets_serialize_for_runtime_events() {
+        assert_eq!(
+            serde_json::to_value(PointerHitTargetSnapshot::None).expect("serialize none"),
+            serde_json::json!({ "kind": "none" }),
+        );
+        assert_eq!(
+            serde_json::to_value(PointerHitTargetSnapshot::Window {
+                window_id: "window-1".into(),
+            })
+            .expect("serialize window"),
+            serde_json::json!({ "kind": "window", "windowId": "window-1" }),
+        );
+        assert_eq!(
+            serde_json::to_value(PointerHitTargetSnapshot::Layer {
+                layer_id: "layer-1".into(),
+            })
+            .expect("serialize layer"),
+            serde_json::json!({ "kind": "layer", "layerId": "layer-1" }),
+        );
+    }
 
     #[test]
     fn wayland_window_actions_serialize_to_camel_case_strings() {

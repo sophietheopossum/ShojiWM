@@ -693,7 +693,6 @@ impl DecorationRuntimeEvaluator {
         }
     }
 
-
     pub fn as_node(&self) -> Option<&super::NodeDecorationEvaluator> {
         match self {
             Self::Node(evaluator) => Some(evaluator),

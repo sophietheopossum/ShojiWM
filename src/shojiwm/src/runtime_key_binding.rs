@@ -203,8 +203,10 @@ fn parse_runtime_key_shortcut(
 
     let Some(keysym) = keysym else {
         // Modifier-only shortcut ("tap"): require exactly one modifier.
-        let modifier_count =
-            [ctrl, alt, shift, logo].into_iter().filter(|set| *set).count();
+        let modifier_count = [ctrl, alt, shift, logo]
+            .into_iter()
+            .filter(|set| *set)
+            .count();
         if modifier_count != 1 {
             return Err(RuntimeKeyBindingParseError::ModifierOnlyMultipleModifiers(
                 shortcut.to_string(),
@@ -294,7 +296,9 @@ mod tests {
             Some(ModifierClass::Alt),
         );
         assert_eq!(
-            parse_runtime_key_shortcut("Shift").unwrap().modifier_class(),
+            parse_runtime_key_shortcut("Shift")
+                .unwrap()
+                .modifier_class(),
             Some(ModifierClass::Shift),
         );
     }
@@ -303,7 +307,9 @@ mod tests {
     fn modifier_only_requires_single_modifier() {
         assert!(matches!(
             parse_runtime_key_shortcut("Super+Shift"),
-            Err(RuntimeKeyBindingParseError::ModifierOnlyMultipleModifiers(_)),
+            Err(RuntimeKeyBindingParseError::ModifierOnlyMultipleModifiers(
+                _
+            )),
         ));
     }
 
@@ -313,15 +319,19 @@ mod tests {
             entry("Super", RuntimeKeyBindingPhase::Press).compile(),
             Err(RuntimeKeyBindingParseError::ModifierOnlyRequiresRelease(_)),
         ));
-        assert!(entry("Super", RuntimeKeyBindingPhase::Release)
-            .compile()
-            .is_ok());
+        assert!(
+            entry("Super", RuntimeKeyBindingPhase::Release)
+                .compile()
+                .is_ok()
+        );
     }
 
     #[test]
     fn combo_allows_press_phase() {
-        assert!(entry("Super+A", RuntimeKeyBindingPhase::Press)
-            .compile()
-            .is_ok());
+        assert!(
+            entry("Super+A", RuntimeKeyBindingPhase::Press)
+                .compile()
+                .is_ok()
+        );
     }
 }

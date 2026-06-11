@@ -201,9 +201,15 @@ export interface PointerModifierState {
   shift: boolean;
 }
 
+export type PointerHitTarget =
+  | { kind: "none" }
+  | { kind: "window"; windowId: string }
+  | { kind: "layer"; layerId: string };
+
 export interface PointerMoveEvent {
   position: PointerMovePoint;
   delta: PointerMovePoint;
+  target: PointerHitTarget;
   outputName?: string;
   modifiers: PointerModifierState;
   timestamp: number;

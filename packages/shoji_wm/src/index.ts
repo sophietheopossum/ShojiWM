@@ -249,6 +249,7 @@ export {
   type RuntimeWindowMinimizeRequestEvent,
   type RuntimeWindowActivateRequestEvent,
   type PointerModifierState,
+  type PointerHitTarget,
   type PointerMoveAsyncListener,
   type GestureSwipeAsyncListener,
   type GestureSwipeEvent,

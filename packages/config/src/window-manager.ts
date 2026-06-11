@@ -343,6 +343,7 @@ export class HybridWindowManager {
   private workspaceScrollGestureRectAnimationsCancelled = false;
   private workspaceGestureSpeed = { ...DEFAULT_WORKSPACE_GESTURE_SPEED };
   private lastPointerPosition: PointerMoveEvent["position"] | null = null;
+  private lastPointerTarget: PointerMoveEvent["target"] = { kind: "none" };
   // Broadcasts the active snap-zone preview rect to external clients (the bar).
   private snapPreviewBroadcaster: SnapPreviewBroadcaster | null = null;
   // Pending Windows-style snap decision for the in-flight floating drag.
@@ -390,7 +391,8 @@ export class HybridWindowManager {
     this.syncWorkspaces();
     this.currentMonitor = event.outputName ?? this.currentMonitor;
     this.lastPointerPosition = event.position;
-    this.focusTiledWindowAtPointer(event.position, event.outputName);
+    this.lastPointerTarget = event.target;
+    this.focusWindowAtPointerTarget(event.target, event.outputName);
   }
 
   public onGestureSwipe(event: GestureSwipeEvent) {
@@ -429,7 +431,7 @@ export class HybridWindowManager {
       this.workspaceGesture = null;
       this.finishWorkspaceScrollGesture(event);
       this.workspaceScrollGestureRectAnimationsCancelled = false;
-      this.focusTiledWindowAtPointer(
+      this.focusWindowAtPointerPosition(
         event.position ?? this.lastPointerPosition,
         event.outputName,
       );
@@ -1407,7 +1409,7 @@ export class HybridWindowManager {
     if (scrolled && shouldCancelRectAnimations) {
       this.workspaceScrollGestureRectAnimationsCancelled = true;
     }
-    this.focusTiledWindowAtPointer(
+    this.focusWindowAtPointerPosition(
       event.position ?? this.lastPointerPosition,
       monitor,
     );
@@ -1429,7 +1431,7 @@ export class HybridWindowManager {
       -event.velocityX *
         this.workspaceGestureSpeed.workspaceScrollKineticFactor,
       () => {
-        this.focusTiledWindowAtPointer(
+        this.focusWindowAtPointerPosition(
           event.position ?? this.lastPointerPosition,
           monitor,
         );
@@ -1589,11 +1591,42 @@ export class HybridWindowManager {
     this.applyWorkspaceStackPolicy(gesture.fromWorkspace);
   }
 
-  private focusTiledWindowAtPointer(
+  private focusWindowAtPointerTarget(
+    target: PointerMoveEvent["target"],
+    monitorHint?: string,
+  ) {
+    if (target.kind !== "window") {
+      return;
+    }
+
+    const workspace = Array.from(this.workspaces.values()).find((workspace) =>
+      workspace.findWindowById(target.windowId),
+    );
+    const window = workspace?.findWindowById(target.windowId);
+    if (!workspace || !window) {
+      return;
+    }
+
+    if (!workspace.isTiled || !workspace.isActive()) {
+      return;
+    }
+
+    const focused = workspace.focusWindowUnderPointer(window);
+    if (!focused) {
+      return;
+    }
+
+    this.currentMonitor =
+      monitorHint && WINDOW_MANAGER.output.list.includes(monitorHint)
+        ? monitorHint
+        : workspace.monitor;
+  }
+
+  private focusWindowAtPointerPosition(
     position: PointerMoveEvent["position"] | null | undefined,
     monitorHint?: string,
   ) {
-    if (!position) {
+    if (!position || this.lastPointerTarget.kind === "layer") {
       return;
     }
 
@@ -1606,13 +1639,27 @@ export class HybridWindowManager {
       return;
     }
 
-    const focused = workspace.focusWindowAtPoint(position.x, position.y);
-    if (!focused) {
+    const window = workspace
+      .listWindows()
+      .filter(
+        (window) =>
+          !window.state[WINDOW_STATE_MINIMIZED]() &&
+          this.windowStack.has(window) &&
+          managedRectContainsPoint(
+            window.state[WINDOW_STATE_RECT](),
+            position.x,
+            position.y -
+              window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y](),
+          ),
+      )
+      .sort(
+        (a, b) =>
+          this.windowStack.zIndexValue(b) - this.windowStack.zIndexValue(a),
+      )[0];
+    if (!window || !workspace.focusWindowUnderPointer(window)) {
       return;
     }
-
     this.currentMonitor = monitor;
-    this.applyWorkspaceStackPolicy(workspace);
   }
 
   private availableWorkspaceIndex(monitor: string, preferredIndex: number) {
@@ -2805,26 +2852,27 @@ export class Workspace {
     this.applyLayout();
   }
 
-  public focusWindowAtPoint(x: number, y: number): WaylandWindow | undefined {
-    if (!this.isTiled) {
+  public focusWindowUnderPointer(window: WaylandWindow): WaylandWindow | undefined {
+    if (
+      !this.isTiled ||
+      !this.hasWindow(window) ||
+      window.state[WINDOW_STATE_MINIMIZED]()
+    ) {
       return undefined;
     }
 
-    const window = this.tileableWindowAtPoint(x, y);
-    if (!window) {
+    if (read(window.isFocused)) {
       return undefined;
     }
 
-    if (this.activeWindowId === window.id && read(window.isFocused)) {
-      return undefined;
+    if (this.shouldTile(window)) {
+      const previousActiveWindowId = this.activeWindowId;
+      this.activeWindowId = window.id;
+      if (previousActiveWindowId !== window.id) {
+        this.reapplyStaticManagedLayout();
+      }
     }
-
-    const previousActiveWindowId = this.activeWindowId;
-    this.activeWindowId = window.id;
     window.focus();
-    if (previousActiveWindowId !== window.id) {
-      this.reapplyStaticManagedLayout();
-    }
     return window;
   }
 
@@ -3095,21 +3143,6 @@ export class Workspace {
 
   private activeWindow(windows = this.windows): WaylandWindow | undefined {
     return windows.find((window) => window.id === this.activeWindowId);
-  }
-
-  private tileableWindowAtPoint(
-    x: number,
-    y: number,
-  ): WaylandWindow | undefined {
-    return this.tileableWindows().find((window) => {
-      const rect = window.state[WINDOW_STATE_RECT]();
-      const left = read(rect.x);
-      const top =
-        read(rect.y) + window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y]();
-      const right = left + read(rect.width);
-      const bottom = top + read(rect.height);
-      return x >= left && x < right && y >= top && y < bottom;
-    });
   }
 
   private tileInsertionIndexForPointer(
@@ -3519,6 +3552,21 @@ function resizeOriginForAxis(
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+function managedRectContainsPoint(
+  rect: ManagedWindowRect,
+  x: number,
+  y: number,
+): boolean {
+  const left = read(rect.x);
+  const top = read(rect.y);
+  return (
+    x >= left &&
+    x < left + read(rect.width) &&
+    y >= top &&
+    y < top + read(rect.height)
+  );
 }
 
 function insetRect(

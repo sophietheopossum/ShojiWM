@@ -48,9 +48,7 @@ fn pointer_button_debug_enabled() -> bool {
 
 /// Classify a raw keysym as a modifier key (for modifier-tap detection),
 /// independent of the left/right physical key.
-fn modifier_class_of_keysym(
-    keysym: u32,
-) -> Option<crate::runtime_key_binding::ModifierClass> {
+fn modifier_class_of_keysym(keysym: u32) -> Option<crate::runtime_key_binding::ModifierClass> {
     use crate::runtime_key_binding::ModifierClass;
     match keysym {
         keysyms::KEY_Super_L | keysyms::KEY_Super_R | keysyms::KEY_Meta_L => {
@@ -140,6 +138,7 @@ impl ShojiWM {
                 x: delta.x,
                 y: delta.y,
             },
+            target: self.pointer_hit_target_snapshot(pos),
             output_name,
             modifiers: PointerModifierStateSnapshot {
                 logo: self.current_keyboard_modifiers.logo,
@@ -151,6 +150,39 @@ impl ShojiWM {
         };
         let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
         self.decoration_evaluator.pointer_move_async(event, now_ms);
+    }
+
+    fn pointer_hit_target_snapshot(
+        &self,
+        pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) -> crate::ssd::PointerHitTargetSnapshot {
+        if let Some(layer) = self.pointer_contents.layer.as_ref() {
+            return crate::ssd::PointerHitTargetSnapshot::Layer {
+                layer_id: crate::ssd::layer_runtime_id(layer),
+            };
+        }
+
+        let surface_window = self
+            .pointer_contents
+            .surface
+            .as_ref()
+            .and_then(|(surface, _)| self.window_for_pointer_surface(surface));
+        let logical_pos = LogicalPoint::new(pos.x.floor() as i32, pos.y.floor() as i32);
+        let window = surface_window
+            .or_else(|| {
+                self.window_under_transformed(logical_pos)
+                    .map(|(window, _)| window.clone())
+            })
+            .or_else(|| {
+                self.raw_window_under(logical_pos)
+                    .map(|(window, _)| window.clone())
+            });
+
+        window.map_or(crate::ssd::PointerHitTargetSnapshot::None, |window| {
+            crate::ssd::PointerHitTargetSnapshot::Window {
+                window_id: self.snapshot_window(&window).id,
+            }
+        })
     }
 
     fn dispatch_gesture_swipe_async_event(&mut self, event: GestureSwipeEventSnapshot) {
@@ -1430,6 +1462,35 @@ impl ShojiWM {
         let mut root = surface.clone();
         while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
             root = parent;
+        }
+
+        self.space
+            .elements()
+            .find(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|toplevel| toplevel.wl_surface() == &root)
+                    || window
+                        .x11_surface()
+                        .and_then(|x11| x11.wl_surface())
+                        .as_ref()
+                        == Some(&root)
+            })
+            .cloned()
+    }
+
+    fn window_for_pointer_surface(
+        &self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) -> Option<smithay::desktop::Window> {
+        let mut root = Self::surface_root(surface);
+        if let Some(popup_root) = self
+            .popups
+            .find_popup(surface)
+            .or_else(|| self.popups.find_popup(&root))
+            .and_then(|popup| smithay::desktop::find_popup_root_surface(&popup).ok())
+        {
+            root = popup_root;
         }
 
         self.space
