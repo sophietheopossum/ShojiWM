@@ -554,9 +554,12 @@ export interface PopupEffectAssignment {
 
 /**
  * A mapped xdg_popup, delivered to `WINDOW_MANAGER.effect.popup` so effects
- * can be assigned per popup. Currently only popups attached to layer-shell
- * surfaces are delivered (`parentKind: "layer"`); popups of toplevel windows
- * will follow with `parentKind: "window"`.
+ * can be assigned per popup. Covers popups attached to layer-shell surfaces
+ * (`parentKind: "layer"`) and to toplevel windows (`parentKind: "window"`);
+ * use `parentKind` to discriminate if an effect should only apply to one
+ * of them. For window popups, effects are composited while the parent
+ * window's visual transform is identity — during window animations the popup
+ * temporarily falls back to its raw rendering.
  */
 export interface WaylandPopup {
   readonly id: string;

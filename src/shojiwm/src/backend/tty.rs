@@ -3409,19 +3409,37 @@ fn render_surface(
                 client_phase_started_at.elapsed().as_secs_f64() * 1000.0;
             let mut current_window_elements: Vec<TtyRenderElements> = Vec::new();
             let popup_phase_started_at = Instant::now();
-            let popup_elements = transform_window_elements(
-                window_render::popup_elements(
-                    window,
+            if is_identity_visual_geometry(visual_state) {
+                // Steady state: compose per-popup effects. Effect elements
+                // cannot ride the window animation transform, so this path is
+                // only taken when the visual transform is identity.
+                current_window_elements.extend(composed_window_popup_scene_elements(
                     &mut backend.renderer,
-                    physical_location,
+                    &output,
+                    output_geo,
                     scale,
+                    window,
+                    physical_location,
                     visual_state.opacity,
-                ),
-                visual_state,
-                TtyRenderElements::Window,
-                TtyRenderElements::TransformedWindow,
-            );
-            current_window_elements.extend(popup_elements);
+                    &state.configured_popup_effects,
+                    &mut state.popup_effect_cache,
+                    &mut state.popup_framebuffer_effect_states,
+                ));
+            } else {
+                let popup_elements = transform_window_elements(
+                    window_render::popup_elements(
+                        window,
+                        &mut backend.renderer,
+                        physical_location,
+                        scale,
+                        visual_state.opacity,
+                    ),
+                    visual_state,
+                    TtyRenderElements::Window,
+                    TtyRenderElements::TransformedWindow,
+                );
+                current_window_elements.extend(popup_elements);
+            }
             if use_full_window_snapshot {
                 current_window_elements.extend(non_root_surface_elements_for_window(
                     window,
@@ -6338,7 +6356,99 @@ fn composed_popup_scene_elements(
             local_rect.width,
             local_rect.height,
         );
+        elements.extend(compose_one_popup_elements(
+            renderer,
+            output,
+            output_geo,
+            scale,
+            &popup_id,
+            popup_rect,
+            effects,
+            popup_elements,
+            popup_effect_cache,
+            popup_framebuffer_effect_states,
+        ));
+    }
+    elements
+}
 
+/// Display elements for all popups of a toplevel window, each composed with
+/// its configured popup effects. `location` is the window's output-local
+/// physical render location (same as `popup_elements` receives). Used only
+/// while the window's visual transform is identity: effect elements cannot
+/// ride the window animation transform, so animating windows fall back to the
+/// raw popup pass-through.
+fn composed_window_popup_scene_elements(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    window: &smithay::desktop::Window,
+    location: Point<i32, smithay::utils::Physical>,
+    alpha: f32,
+    configured_popup_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
+    popup_effect_cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+    popup_framebuffer_effect_states: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::ShaderEffectElementState,
+    >,
+) -> Vec<TtyRenderElements> {
+    let groups = window_render::window_popup_groups(
+        window, renderer, location, output_geo, scale, alpha,
+    );
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let mut elements = Vec::new();
+    for (popup_id, popup_rect, raw_elements) in groups {
+        let popup_elements = raw_elements
+            .into_iter()
+            .map(TtyRenderElements::Window)
+            .collect::<Vec<_>>();
+        let Some(effects) = configured_popup_effects.get(&popup_id) else {
+            elements.extend(popup_elements);
+            continue;
+        };
+        elements.extend(compose_one_popup_elements(
+            renderer,
+            output,
+            output_geo,
+            scale,
+            &popup_id,
+            popup_rect,
+            effects,
+            popup_elements,
+            popup_effect_cache,
+            popup_framebuffer_effect_states,
+        ));
+    }
+    elements
+}
+
+/// Compose a single popup's display elements with its assigned effects.
+/// Shared by the layer-popup and window-popup paths.
+fn compose_one_popup_elements(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    popup_id: &str,
+    popup_rect: crate::ssd::LogicalRect,
+    effects: &crate::ssd::WindowEffectConfig,
+    popup_elements: Vec<TtyRenderElements>,
+    popup_effect_cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+    popup_framebuffer_effect_states: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::ShaderEffectElementState,
+    >,
+) -> Vec<TtyRenderElements> {
+    {
         let mut render_slot = |placement: &'static str,
                                effect: &crate::ssd::WindowEffectSlot|
          -> Vec<TtyRenderElements> {
@@ -6357,7 +6467,7 @@ fn composed_popup_scene_elements(
                 output,
                 output_geo,
                 scale,
-                &popup_id,
+                popup_id,
                 placement,
                 element_id,
                 commit_counter,
@@ -6461,6 +6571,7 @@ fn composed_popup_scene_elements(
             })
             .unwrap_or_default();
 
+        let mut elements = Vec::new();
         elements.extend(in_front);
         if replacement.is_empty() {
             elements.extend(popup_elements);
@@ -6470,8 +6581,8 @@ fn composed_popup_scene_elements(
         elements.extend(behind_root);
         elements.extend(behind_popup_source);
         elements.extend(behind_backdrop);
+        elements
     }
-    elements
 }
 
 fn expand_logical_rect(

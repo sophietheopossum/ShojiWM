@@ -501,7 +501,96 @@ fn composed_popup_scene_elements(
             local_rect.width,
             local_rect.height,
         );
+        elements.extend(compose_one_popup_elements(
+            renderer,
+            output,
+            output_geo,
+            scale,
+            &popup_id,
+            popup_rect,
+            effects,
+            popup_elements,
+            popup_effect_cache,
+            popup_framebuffer_effect_states,
+        ));
+    }
+    elements
+}
 
+/// Display elements for all popups of a toplevel window, each composed with
+/// its configured popup effects. Only used while the window's visual
+/// transform is identity (see the tty counterpart).
+fn composed_window_popup_scene_elements(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    window: &smithay::desktop::Window,
+    location: Point<i32, smithay::utils::Physical>,
+    alpha: f32,
+    configured_popup_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
+    popup_effect_cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+    popup_framebuffer_effect_states: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::ShaderEffectElementState,
+    >,
+) -> Vec<WinitRenderElements> {
+    let groups = window_render::window_popup_groups(
+        window, renderer, location, output_geo, scale, alpha,
+    );
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let mut elements = Vec::new();
+    for (popup_id, popup_rect, raw_elements) in groups {
+        let popup_elements = raw_elements
+            .into_iter()
+            .map(WinitRenderElements::Window)
+            .collect::<Vec<_>>();
+        let Some(effects) = configured_popup_effects.get(&popup_id) else {
+            elements.extend(popup_elements);
+            continue;
+        };
+        elements.extend(compose_one_popup_elements(
+            renderer,
+            output,
+            output_geo,
+            scale,
+            &popup_id,
+            popup_rect,
+            effects,
+            popup_elements,
+            popup_effect_cache,
+            popup_framebuffer_effect_states,
+        ));
+    }
+    elements
+}
+
+/// Compose a single popup's display elements with its assigned effects.
+/// Shared by the layer-popup and window-popup paths.
+fn compose_one_popup_elements(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    popup_id: &str,
+    popup_rect: crate::ssd::LogicalRect,
+    effects: &crate::ssd::WindowEffectConfig,
+    popup_elements: Vec<WinitRenderElements>,
+    popup_effect_cache: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::WindowEffectElementState,
+    >,
+    popup_framebuffer_effect_states: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::ShaderEffectElementState,
+    >,
+) -> Vec<WinitRenderElements> {
+    {
         let mut render_slot = |placement: &'static str,
                                effect: &crate::ssd::WindowEffectSlot|
          -> Vec<WinitRenderElements> {
@@ -513,7 +602,7 @@ fn composed_popup_scene_elements(
                 output,
                 output_geo,
                 scale,
-                &popup_id,
+                popup_id,
                 placement,
                 popup_rect,
                 effect,
@@ -598,6 +687,7 @@ fn composed_popup_scene_elements(
             })
             .unwrap_or_default();
 
+        let mut elements = Vec::new();
         elements.extend(in_front);
         if replacement.is_empty() {
             elements.extend(popup_elements);
@@ -607,8 +697,8 @@ fn composed_popup_scene_elements(
         elements.extend(behind_root);
         elements.extend(behind_popup_source);
         elements.extend(behind_backdrop);
+        elements
     }
-    elements
 }
 
 pub fn init_winit(
@@ -1426,7 +1516,29 @@ pub fn init_winit(
                                     scene_elements.push(element);
                                 }
                             } else {
-                                scene_elements.extend(popup_elements.into_iter());
+                                if is_identity_visual_geometry(composition_visual) {
+                                    // Steady state: replace the raw popup
+                                    // pass-through with per-popup effect
+                                    // composition (effect elements cannot ride
+                                    // the window animation transform).
+                                    drop(popup_elements);
+                                    let configured_popup_effects =
+                                        state.configured_popup_effects.clone();
+                                    scene_elements.extend(composed_window_popup_scene_elements(
+                                        renderer,
+                                        &output,
+                                        output_geo,
+                                        scale,
+                                        window,
+                                        physical_location,
+                                        visual_state.opacity,
+                                        &configured_popup_effects,
+                                        &mut state.popup_effect_cache,
+                                        &mut state.popup_framebuffer_effect_states,
+                                    ));
+                                } else {
+                                    scene_elements.extend(popup_elements.into_iter());
+                                }
                                 scene_elements.extend(client_elements.into_iter());
                                 scene_elements.extend(
                                     ordered_ui_elements.into_iter().map(|(_, element)| element),

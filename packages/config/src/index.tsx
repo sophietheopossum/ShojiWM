@@ -424,9 +424,15 @@ const POPUP_BLUR = compilePopupEffect({
   ],
 });
 
-WINDOW_MANAGER.effect.popup = () => ({
-  behind: POPUP_BLUR,
-});
+WINDOW_MANAGER.effect.popup = (popup) => {
+  if (popup.parentKind === "window") {
+    return {};
+  }
+
+  return {
+    behind: POPUP_BLUR,
+  };
+};
 
 WINDOW_MANAGER.event.onOpen((window) => {
   HYBRID_WINDOW_MANAGER.onOpen(window);

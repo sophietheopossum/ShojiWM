@@ -608,6 +608,70 @@ where
     }
 }
 
+/// Per-popup element groups of a toplevel window's xdg_popups, front-to-back
+/// in the same order `popup_elements` would have produced them. Each entry
+/// carries the popup's runtime id and its geometry box as a *global* logical
+/// rect (the rect popup effects apply to).
+///
+/// `location` is the window's output-local physical render location (the same
+/// value `popup_elements` receives); `output_geo` converts back to global
+/// logical coordinates.
+pub fn window_popup_groups<R>(
+    window: &Window,
+    renderer: &mut R,
+    location: Point<i32, Physical>,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Vec<(
+    String,
+    crate::ssd::LogicalRect,
+    Vec<WaylandSurfaceRenderElement<R>>,
+)>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    let WindowSurface::Wayland(surface) = window.underlying_surface() else {
+        return Vec::new();
+    };
+    let surface = surface.wl_surface();
+    let render_origin = location - window.geometry().loc.to_physical_precise_round(scale);
+    let location_logical: Point<i32, Logical> = Point::from((
+        (location.x as f64 / scale.x).round() as i32,
+        (location.y as f64 / scale.y).round() as i32,
+    ));
+    PopupManager::popups_for_surface(surface)
+        .map(|(popup, popup_offset)| {
+            let popup_geometry = popup.geometry();
+            let offset = (window.geometry().loc + popup_offset - popup_geometry.loc)
+                .to_physical_precise_round(scale);
+            let elements = render_elements_from_surface_tree(
+                renderer,
+                popup.wl_surface(),
+                render_origin + offset,
+                scale,
+                alpha,
+                Kind::Unspecified,
+            );
+            // Geometry box in global logical coords: the buffer origin lands
+            // at location + (popup_offset - popup_geometry.loc), so the
+            // geometry box sits at location + popup_offset.
+            let rect = crate::ssd::LogicalRect::new(
+                output_geo.loc.x + location_logical.x + popup_offset.x,
+                output_geo.loc.y + location_logical.y + popup_offset.y,
+                popup_geometry.size.w,
+                popup_geometry.size.h,
+            );
+            (
+                crate::ssd::popup_runtime_id(popup.wl_surface()),
+                rect,
+                elements,
+            )
+        })
+        .collect()
+}
+
 pub fn clipped_surface_elements(
     window: &Window,
     renderer: &mut GlesRenderer,

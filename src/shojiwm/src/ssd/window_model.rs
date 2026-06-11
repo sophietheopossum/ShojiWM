@@ -872,15 +872,9 @@ impl ShojiWM {
     }
 
     /// TypeScript-facing snapshots of all xdg_popups currently mapped on
-    /// layer surfaces. `position` is output-local logical, consistent with
-    /// `WaylandLayerSnapshot::position` (the popup's geometry box, i.e. the
-    /// rect a popup-level effect applies to).
-    ///
-    /// Popups attached to toplevel windows are not snapshotted yet: their
-    /// render path folds popups into the parent window's (potentially
-    /// transformed) element stream, so per-popup effects there need a
-    /// separate integration. `parent_kind` exists in the schema so they can
-    /// be added without breaking the wire format.
+    /// layer surfaces and toplevel windows. `position` is output-local
+    /// logical, consistent with `WaylandLayerSnapshot::position` (the popup's
+    /// geometry box, i.e. the rect a popup-level effect applies to).
     pub fn snapshot_popups(&self) -> Vec<WaylandPopupSnapshot> {
         let mut popups = Vec::new();
         for output in self.space.outputs() {
@@ -908,6 +902,66 @@ impl ShojiWM {
                         },
                     });
                 }
+            }
+        }
+
+        // Toplevel window popups. The popup geometry box sits at the window's
+        // space location + the popup's offset (relative to the parent's
+        // geometry origin); assign each popup to the output containing it.
+        for window in self.space.elements() {
+            let Some(toplevel) = window.toplevel() else {
+                continue;
+            };
+            let window_popups: Vec<_> =
+                smithay::desktop::PopupManager::popups_for_surface(toplevel.wl_surface())
+                    .collect();
+            if window_popups.is_empty() {
+                continue;
+            }
+            let Some(window_location) = self.space.element_location(window) else {
+                continue;
+            };
+            let parent_id = self
+                .window_decorations
+                .get(window)
+                .map(|decoration| decoration.snapshot.id.clone())
+                .unwrap_or_else(|| self.snapshot_window(window).id);
+            for (popup, popup_offset) in window_popups {
+                let popup_geometry = popup.geometry();
+                let global = smithay::utils::Point::<i32, smithay::utils::Logical>::from((
+                    window_location.x + popup_offset.x,
+                    window_location.y + popup_offset.y,
+                ));
+                let Some((output_name, output_loc)) = self
+                    .space
+                    .outputs()
+                    .find_map(|output| {
+                        let geometry = self.space.output_geometry(output)?;
+                        geometry
+                            .contains(global)
+                            .then(|| (output.name().to_string(), geometry.loc))
+                    })
+                    .or_else(|| {
+                        self.space.outputs().next().and_then(|output| {
+                            let geometry = self.space.output_geometry(output)?;
+                            Some((output.name().to_string(), geometry.loc))
+                        })
+                    })
+                else {
+                    continue;
+                };
+                popups.push(WaylandPopupSnapshot {
+                    id: popup_runtime_id(popup.wl_surface()),
+                    parent_id: parent_id.clone(),
+                    parent_kind: PopupParentKindSnapshot::Window,
+                    output_name,
+                    position: LayerPositionSnapshot {
+                        x: global.x - output_loc.x,
+                        y: global.y - output_loc.y,
+                        width: popup_geometry.size.w,
+                        height: popup_geometry.size.h,
+                    },
+                });
             }
         }
         popups
