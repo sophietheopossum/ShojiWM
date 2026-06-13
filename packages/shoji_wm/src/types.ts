@@ -109,6 +109,8 @@ export interface WaylandWindow {
   maximize(): void;
   unmaximize(): void;
   minimize(): void;
+  fullscreen(): void;
+  unfullscreen(): void;
   focus(): void;
   scheduleAnimation(options: ManagedWindowScheduleAnimationOptions): void;
   cancelAnimation(channel?: string): void;
@@ -1175,6 +1177,8 @@ export interface WaylandWindowActions {
   maximize(): void;
   unmaximize(): void;
   minimize(): void;
+  fullscreen(): void;
+  unfullscreen(): void;
   focus(): void;
   scheduleAnimation(options: ManagedWindowScheduleAnimationOptions): void;
   cancelAnimation(channel?: string): void;
@@ -1215,7 +1219,13 @@ export interface ReactiveWaylandLayerHandle {
   update(snapshot: WaylandLayerSnapshot): void;
 }
 
-export type WindowActionType = "close" | "maximize" | "unmaximize" | "minimize";
+export type WindowActionType =
+  | "close"
+  | "maximize"
+  | "unmaximize"
+  | "minimize"
+  | "fullscreen"
+  | "unfullscreen";
 
 export interface WindowActionDescriptor {
   kind: "window-action";

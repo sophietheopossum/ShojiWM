@@ -2393,6 +2393,27 @@ impl ShojiWM {
         }))
     }
 
+    /// True when the topmost window on `output` is in the committed xdg
+    /// Fullscreen state. Mirrors the renderer's fullscreen fast path so
+    /// hit-testing follows the same stacking: a fullscreen window sits above
+    /// the Top layer (only Overlay stays in front of it). `with_committed_state`
+    /// (client-acked) means this flips on only once the client has actually
+    /// committed its fullscreen buffer, matching what is on screen.
+    fn output_has_topmost_fullscreen_window(&self, output: &Output) -> bool {
+        self.windows_for_output_top_to_bottom(output)
+            .first()
+            .and_then(|window| window.toplevel())
+            .is_some_and(|toplevel| {
+                toplevel.with_committed_state(|state| {
+                    state.is_some_and(|state| {
+                        state.states.contains(
+                            smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen,
+                        )
+                    })
+                })
+            })
+    }
+
     pub fn surface_under(
         &self,
         pos: Point<f64, Logical>,
@@ -2405,20 +2426,33 @@ impl ShojiWM {
         let output_geo = self.space.output_geometry(output).unwrap();
         let layers = layer_map_for_output(output);
 
-        if let Some(focus) = self
-            .layer_surface_under_with_policy(
-                &layers,
-                &output_geo,
-                pos,
-                &[WlrLayer::Overlay, WlrLayer::Top],
-                true,
+        // When a fullscreen window owns the output, the Top layer drops behind
+        // it (Hyprland-style stacking): only Overlay is hit-tested before the
+        // window, and Top falls to the lower set — where the fullscreen window,
+        // covering the whole output, intercepts every hit first. This makes the
+        // Top layer effectively non-interactive while fullscreen, matching what
+        // is rendered.
+        let fullscreen_active = self.output_has_topmost_fullscreen_window(output);
+        let (upper_layers, lower_layers): (&[WlrLayer], &[WlrLayer]) = if fullscreen_active {
+            (
+                &[WlrLayer::Overlay],
+                &[WlrLayer::Top, WlrLayer::Bottom, WlrLayer::Background],
             )
+        } else {
+            (
+                &[WlrLayer::Overlay, WlrLayer::Top],
+                &[WlrLayer::Bottom, WlrLayer::Background],
+            )
+        };
+
+        if let Some(focus) = self
+            .layer_surface_under_with_policy(&layers, &output_geo, pos, upper_layers, true)
             .or_else(|| {
                 self.layer_surface_under_with_policy(
                     &layers,
                     &output_geo,
                     pos,
-                    &[WlrLayer::Overlay, WlrLayer::Top],
+                    upper_layers,
                     false,
                 )
             })
@@ -2473,13 +2507,7 @@ impl ShojiWM {
                 .map(|(surface, loc)| (surface, loc.to_f64() + location.to_f64()));
         }
 
-        self.layer_surface_under_with_policy(
-            &layers,
-            &output_geo,
-            pos,
-            &[WlrLayer::Bottom, WlrLayer::Background],
-            false,
-        )
+        self.layer_surface_under_with_policy(&layers, &output_geo, pos, lower_layers, false)
     }
 
     fn surface_has_popup_ancestor_for_hit_test(&self, surface: &WlSurface) -> bool {

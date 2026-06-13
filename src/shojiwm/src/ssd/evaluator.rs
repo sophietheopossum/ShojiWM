@@ -16,8 +16,9 @@ use super::window_model::{
     GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, ManagedWindowAnimationSnapshot,
     ManagedWindowState, PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandOutputSnapshot,
     WaylandPopupSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
-    WindowActivateRequestEventSnapshot, WindowMaximizeRequestEventSnapshot,
-    WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
+    WindowActivateRequestEventSnapshot, WindowFullscreenRequestEventSnapshot,
+    WindowMaximizeRequestEventSnapshot, WindowMinimizeRequestEventSnapshot,
+    WindowMoveEventSnapshot, WindowResizeEventSnapshot,
 };
 use super::{
     BackgroundEffectConfig, DecorationBridgeError, DecorationLayoutError, DecorationNode,
@@ -138,6 +139,15 @@ pub trait DecorationEvaluator {
         &self,
         _snapshot: &WaylandWindowSnapshot,
         _event: &WindowMinimizeRequestEventSnapshot,
+        _now_ms: u64,
+    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        Ok(DecorationWindowStateRequestInvocation::default())
+    }
+
+    fn window_fullscreen_request(
+        &self,
+        _snapshot: &WaylandWindowSnapshot,
+        _event: &WindowFullscreenRequestEventSnapshot,
         _now_ms: u64,
     ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
         Ok(DecorationWindowStateRequestInvocation::default())
@@ -804,6 +814,20 @@ enum RuntimeRequest<'a> {
         window_id: &'a str,
         snapshot: &'a WaylandWindowSnapshot,
         event: &'a WindowMinimizeRequestEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState")]
+        display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
+    },
+    WindowFullscreenRequest {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        #[serde(rename = "windowId")]
+        window_id: &'a str,
+        snapshot: &'a WaylandWindowSnapshot,
+        event: &'a WindowFullscreenRequestEventSnapshot,
         #[serde(rename = "nowMs")]
         now_ms: u64,
         #[serde(rename = "displayState")]
@@ -3408,6 +3432,101 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             *runtime_guard = None;
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response kind for windowMinimizeRequest: {}",
+                response.kind
+            )));
+        }
+        if !response.ok {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                response
+                    .error
+                    .unwrap_or_else(|| "runtime returned failure".into()),
+            ));
+        }
+
+        Ok(DecorationWindowStateRequestInvocation {
+            invoked: response.invoked.unwrap_or(false),
+            dirty: response.dirty.unwrap_or(false),
+            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
+            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
+            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
+            actions: response.actions.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
+            display_config: response.display_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+        })
+    }
+
+    fn window_fullscreen_request(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &WindowFullscreenRequestEventSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        let mut runtime_guard = self.runtime.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+        })?;
+
+        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        let request_id = runtime.next_request_id;
+        runtime.next_request_id += 1;
+        let display_state = self
+            .display_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        let request = serde_json::to_string(&RuntimeRequest::WindowFullscreenRequest {
+            request_id,
+            window_id: &snapshot.id,
+            snapshot,
+            event,
+            now_ms,
+            display_state: &display_state,
+            input_state: &input_state,
+        })
+        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
+        runtime.write_request(&request)?;
+
+        let response: RuntimeWindowStateRequestResponse =
+            if let Some(response) = runtime.read_response()? {
+                response
+            } else {
+                let status = runtime
+                    .child
+                    .try_wait()?
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let stderr = runtime
+                    .stderr_log
+                    .lock()
+                    .map(|stderr| stderr.clone())
+                    .unwrap_or_default();
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            };
+        if response.request_id != request_id {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response id: expected {request_id}, got {}",
+                response.request_id
+            )));
+        }
+        if response.kind != "windowFullscreenRequest" {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response kind for windowFullscreenRequest: {}",
                 response.kind
             )));
         }

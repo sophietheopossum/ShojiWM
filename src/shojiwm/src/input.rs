@@ -1269,6 +1269,22 @@ impl ShojiWM {
                         crate::ssd::WindowStateRequestSourceSnapshot::Api,
                     );
                 }
+                crate::ssd::WaylandWindowAction::Fullscreen => {
+                    self.request_window_fullscreen(
+                        &window,
+                        true,
+                        None,
+                        crate::ssd::WindowStateRequestSourceSnapshot::Api,
+                    );
+                }
+                crate::ssd::WaylandWindowAction::Unfullscreen => {
+                    self.request_window_fullscreen(
+                        &window,
+                        false,
+                        None,
+                        crate::ssd::WindowStateRequestSourceSnapshot::Api,
+                    );
+                }
             }
         }
     }
@@ -1336,6 +1352,77 @@ impl ShojiWM {
             // the configure containing both the TS-selected size and this Maximized state. Sending
             // an immediate state-only configure would let clients observe "maximized at old size",
             // which can make Chromium/Electron stretch an old buffer for one configure cycle.
+            if !self.runtime_poll_dirty {
+                self.pending_xdg_state_configure_window_ids
+                    .remove(window_id);
+                toplevel.send_pending_configure();
+            }
+            self.schedule_redraw();
+        }
+    }
+
+    pub(crate) fn request_window_fullscreen(
+        &mut self,
+        window: &smithay::desktop::Window,
+        fullscreen: bool,
+        output_name: Option<String>,
+        source: crate::ssd::WindowStateRequestSourceSnapshot,
+    ) -> bool {
+        let snapshot = self.snapshot_window(window);
+        let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
+        let event = crate::ssd::WindowFullscreenRequestEventSnapshot {
+            fullscreen,
+            output_name,
+            source,
+            timestamp: now_ms,
+        };
+        tracing::info!(
+            window_id = %snapshot.id,
+            title = %snapshot.title,
+            app_id = ?snapshot.app_id,
+            fullscreen,
+            source = ?source,
+            "runtime window fullscreen request dispatch"
+        );
+        let invoked = self.invoke_window_fullscreen_request_event(&snapshot, &event, now_ms);
+        if invoked {
+            self.set_xdg_fullscreen_hint(window, &snapshot.id, fullscreen);
+        }
+        tracing::info!(
+            window_id = %snapshot.id,
+            invoked,
+            "runtime window fullscreen request result"
+        );
+        invoked
+    }
+
+    fn set_xdg_fullscreen_hint(
+        &mut self,
+        window: &smithay::desktop::Window,
+        window_id: &str,
+        fullscreen: bool,
+    ) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+
+        let changed = toplevel.with_pending_state(|state| {
+            let was_fullscreen = state.states.contains(xdg_toplevel::State::Fullscreen);
+            if fullscreen {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+            } else {
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+            }
+            was_fullscreen != fullscreen
+        });
+
+        if changed {
+            self.pending_xdg_state_configure_window_ids
+                .insert(window_id.to_string());
+            // Same deal as set_xdg_maximized_hint: ManagedWindow stays the
+            // geometry source of truth, so the Fullscreen state ships together
+            // with the TS-selected rect in apply_managed_window_rects instead
+            // of an immediate state-only configure.
             if !self.runtime_poll_dirty {
                 self.pending_xdg_state_configure_window_ids
                     .remove(window_id);

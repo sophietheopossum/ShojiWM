@@ -16,6 +16,7 @@ import {
   type ReadonlySignal,
   type WaylandWindow,
   type WindowActivateRequestEvent,
+  type WindowFullscreenRequestEvent,
   type WindowMaximizeRequestEvent,
   type WindowMinimizeRequestEvent,
   type WindowMoveEvent,
@@ -44,6 +45,19 @@ export const WINDOW_STATE_MINIMIZE_VISUAL_IDLE = createWindowState<boolean>(
 export const WINDOW_STATE_MAXIMIZED = createWindowState<boolean>("maximized", {
   default: false,
 });
+export const WINDOW_STATE_FULLSCREEN = createWindowState<boolean>(
+  "fullscreen",
+  {
+    default: false,
+  },
+);
+// Pre-fullscreen rect, kept separate from WINDOW_STATE_RESTORE_RECT so a
+// window that was maximized before going fullscreen restores back to its
+// maximized rect (and the maximize restore rect underneath stays intact).
+export const WINDOW_STATE_FULLSCREEN_RESTORE_RECT =
+  createWindowState<ManagedWindowRect | null>("fullscreenRestoreRect", {
+    default: null,
+  });
 export const WINDOW_STATE_WORKSPACE_VISIBLE = createWindowState<boolean>(
   "workspaceVisible",
   {
@@ -1891,6 +1905,94 @@ export class HybridWindowManager {
       );
     }
     return rect;
+  }
+
+  // Fullscreen covers the entire output: unlike maximize it ignores the
+  // usable area (exclusive-zone bars) and applies no padding, so the client
+  // surface spans edge to edge. This is also what lets the tty backend
+  // collapse the frame to a single scanout-capable element.
+  private fullscreenRectForWindow(
+    window: WaylandWindow,
+    preferredOutput?: string,
+  ): ManagedWindowRect {
+    const rect = window.state[WINDOW_STATE_RECT]();
+    const centerX = read(rect.x) + read(rect.width) / 2;
+    const centerY = read(rect.y) + read(rect.height) / 2;
+    const outputName =
+      preferredOutput ??
+      this.outputNameAt(centerX, centerY) ??
+      this.currentMonitor;
+    const output = outputName
+      ? WINDOW_MANAGER.output.current[outputName]
+      : undefined;
+    if (output?.resolution) {
+      return {
+        x: output.position.x,
+        y: output.position.y,
+        width: output.resolution.width / output.scale,
+        height: output.resolution.height / output.scale,
+      };
+    }
+    return rect;
+  }
+
+  public onWindowFullscreenRequest(event: WindowFullscreenRequestEvent) {
+    if (this.isGrabbing) {
+      return;
+    }
+    const window = event.window;
+    const workspace = this.findWorkspaceForWindow(window);
+    window.state[WINDOW_STATE_MINIMIZED].set(false);
+
+    if (!event.fullscreen) {
+      const restoreRect = window.state[WINDOW_STATE_FULLSCREEN_RESTORE_RECT]();
+      window.state[WINDOW_STATE_FULLSCREEN].set(false);
+      window.state[WINDOW_STATE_FULLSCREEN_RESTORE_RECT].set(null);
+      // A tiled window returns to its computed slot; a floating one animates
+      // back to where it was before going fullscreen.
+      if (workspace?.isTiled && workspace.shouldTile(window)) {
+        workspace.applyLayout();
+        this.applyWorkspaceStackPolicy(workspace);
+        return;
+      }
+      if (restoreRect) {
+        workspace?.syncFloatingWindowRect(window, restoreRect);
+        playRectAnimation(
+          window,
+          WINDOW_STATE_RECT,
+          restoreRect,
+          WINDOW_MANAGEMENT_EASING,
+          WINDOW_MANAGEMENT_ANIMATION_DURATION,
+        );
+      }
+      this.applyWorkspaceStackPolicy(workspace);
+      return;
+    }
+
+    if (!window.state[WINDOW_STATE_FULLSCREEN]()) {
+      const currentRect = window.state[WINDOW_STATE_RECT]();
+      const currentWidth = read(currentRect.width);
+      const currentHeight = read(currentRect.height);
+      if (currentWidth > 1 && currentHeight > 1) {
+        window.state[WINDOW_STATE_FULLSCREEN_RESTORE_RECT].set(currentRect);
+      }
+    }
+    const fullscreenRect = this.fullscreenRectForWindow(
+      window,
+      event.outputName,
+    );
+    window.state[WINDOW_STATE_FULLSCREEN].set(true);
+    workspace?.focusWindow(window);
+    workspace?.syncFloatingWindowRect(window, fullscreenRect);
+    playRectAnimation(
+      window,
+      WINDOW_STATE_RECT,
+      fullscreenRect,
+      WINDOW_MANAGEMENT_EASING,
+      WINDOW_MANAGEMENT_ANIMATION_DURATION,
+    );
+    this.applyWorkspaceStackPolicy(workspace);
+    window.focus();
   }
 
   private initialRestoreRectForMaximizedWindow(

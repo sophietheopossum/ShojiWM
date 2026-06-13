@@ -613,6 +613,18 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         }
     }
 
+    fn window_fullscreen_request(
+        &self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &super::WindowFullscreenRequestEventSnapshot,
+        now_ms: u64,
+    ) -> Result<super::DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
+        match self {
+            Self::Static(_) => Ok(super::DecorationWindowStateRequestInvocation::default()),
+            Self::Node(evaluator) => evaluator.window_fullscreen_request(snapshot, event, now_ms),
+        }
+    }
+
     fn window_activate_request(
         &self,
         snapshot: &WaylandWindowSnapshot,
@@ -1068,6 +1080,30 @@ impl ShojiWM {
             }
         };
         self.handle_window_state_request_invocation("runtime-window-minimize-request", invocation)
+    }
+
+    pub fn invoke_window_fullscreen_request_event(
+        &mut self,
+        snapshot: &WaylandWindowSnapshot,
+        event: &super::WindowFullscreenRequestEventSnapshot,
+        now_ms: u64,
+    ) -> bool {
+        self.sync_runtime_display_state();
+        let invocation = match self
+            .decoration_evaluator
+            .window_fullscreen_request(snapshot, event, now_ms)
+        {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                warn!(
+                    window_id = %snapshot.id,
+                    ?error,
+                    "runtime window fullscreen request event failed"
+                );
+                return false;
+            }
+        };
+        self.handle_window_state_request_invocation("runtime-window-fullscreen-request", invocation)
     }
 
     pub fn invoke_window_activate_request_event(

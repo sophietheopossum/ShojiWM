@@ -255,6 +255,17 @@ pub struct WindowMinimizeRequestEventSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WindowFullscreenRequestEventSnapshot {
+    pub fullscreen: bool,
+    /// Output the client asked to go fullscreen on (xdg_toplevel.set_fullscreen
+    /// carries an optional wl_output). None lets the config pick.
+    pub output_name: Option<String>,
+    pub source: WindowStateRequestSourceSnapshot,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WindowActivateRequestEventSnapshot {
     pub source: WindowActivateRequestSourceSnapshot,
     pub timestamp: u64,
@@ -586,6 +597,8 @@ pub enum WaylandWindowAction {
     Maximize,
     Unmaximize,
     Minimize,
+    Fullscreen,
+    Unfullscreen,
     Focus,
     ScheduleAnimation,
     CancelAnimation,

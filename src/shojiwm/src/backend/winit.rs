@@ -806,6 +806,28 @@ pub fn init_winit(
                         let (_, _lower_layer_elements) =
                             window_render::layer_elements_for_output(renderer, &output, scale, 1.0);
 
+                        // Fullscreen fast path (mirrors tty): collapse the
+                        // scene to "overlay layers above one raw client
+                        // surface". Winit has no DRM planes so no scanout,
+                        // but stacking policy and perf behavior stay aligned.
+                        let fullscreen_scanout = crate::backend::tty::fullscreen_scanout_window(
+                            &state.space,
+                            &state.window_decorations,
+                            &windows_top_to_bottom,
+                            state.closing_window_snapshots.len(),
+                            &output,
+                            output_geo,
+                            scale,
+                        );
+                        let fullscreen_backdrop_windows: Vec<smithay::desktop::Window>;
+                        let upper_layer_backdrop_windows: &[smithay::desktop::Window] =
+                            if let Some(window) = fullscreen_scanout.as_ref() {
+                                fullscreen_backdrop_windows = vec![window.clone()];
+                                &fullscreen_backdrop_windows
+                            } else {
+                                &windows_top_to_bottom
+                            };
+
                         let mut scene_elements: Vec<WinitRenderElements> = Vec::new();
                         scene_elements.extend(upper_layer_scene_elements(
                             renderer,
@@ -813,13 +835,52 @@ pub fn init_winit(
                             &output,
                             output_geo,
                             scale,
-                            &windows_top_to_bottom,
+                            upper_layer_backdrop_windows,
+                            fullscreen_scanout.is_some(),
                         ));
                         scene_elements.extend(
                             closing_snapshot_elements(renderer, state, &output, scale)
                                 .into_iter(),
                         );
                         for (_window_index, window) in windows_top_to_bottom.iter().enumerate() {
+                            // Fullscreen fast path: everything but the
+                            // fullscreen window is occluded; render it as a
+                            // bare surface tree + popups.
+                            if let Some(fullscreen_window) = fullscreen_scanout.as_ref() {
+                                if window != fullscreen_window {
+                                    continue;
+                                }
+                                let Some(window_location) =
+                                    state.space.element_location(window)
+                                else {
+                                    continue;
+                                };
+                                let physical_location = (window_location - output_geo.loc)
+                                    .to_physical_precise_round(scale);
+                                scene_elements.extend(
+                                    window_render::popup_elements(
+                                        window,
+                                        renderer,
+                                        physical_location,
+                                        scale,
+                                        1.0,
+                                    )
+                                    .into_iter()
+                                    .map(WinitRenderElements::Window),
+                                );
+                                scene_elements.extend(
+                                    window_render::surface_elements(
+                                        window,
+                                        renderer,
+                                        physical_location,
+                                        scale,
+                                        1.0,
+                                    )
+                                    .into_iter()
+                                    .map(WinitRenderElements::Window),
+                                );
+                                continue;
+                            }
                             let Some(window_location) = state.space.element_location(window) else {
                                 continue;
                             };
@@ -1605,14 +1666,18 @@ pub fn init_winit(
                             }
 
                         }
-                        scene_elements.extend(lower_layer_scene_elements(
-                            renderer,
-                            state,
-                            &output,
-                            output_geo,
-                            scale,
-                            &windows_top_to_bottom,
-                        ));
+                        // Fullscreen fast path: Bottom/Background layers are
+                        // fully occluded.
+                        if fullscreen_scanout.is_none() {
+                            scene_elements.extend(lower_layer_scene_elements(
+                                renderer,
+                                state,
+                                &output,
+                                output_geo,
+                                scale,
+                                &windows_top_to_bottom,
+                            ));
+                        }
 
                         let computed_damage = if state.damage_blink_enabled {
                             match blink_damage_tracker.damage_output(1, &scene_elements) {
@@ -3447,6 +3512,10 @@ fn configured_background_effect_elements_for_layer(
     output_geo: Rectangle<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
     windows_top_to_bottom: &[smithay::desktop::Window],
+    // Top/Overlay layers stacked below `layer_surface` (front-to-back). They
+    // sit above all toplevel windows, so backdrop captures must include them
+    // or an overlay's blur would miss any overlay/top layer behind it.
+    upper_layers_below: &[smithay::desktop::LayerSurface],
     layer_surface: &smithay::desktop::LayerSurface,
     alpha: f32,
     custom_background: Option<&crate::ssd::WindowEffectSlot>,
@@ -3531,11 +3600,30 @@ fn configured_background_effect_elements_for_layer(
                 true,
             ));
         }
+        if uses_backdrop {
+            entries.extend(collect_layer_source_damage(
+                state,
+                upper_layers_below.iter().cloned(),
+                false,
+            ));
+        }
         entries
     };
 
     let backdrop_texture = if config.effect.uses_backdrop_input() {
         let mut backdrop_scene: Vec<WinitRenderElements> = Vec::new();
+        // Upper layers below this one render above every toplevel window, so
+        // they go first in the front-to-back capture scene.
+        for upper_layer in upper_layers_below {
+            backdrop_scene.extend(layer_surface_scene_elements_for_capture(
+                renderer,
+                output,
+                actual_capture_geo,
+                capture_origin_physical,
+                scale,
+                upper_layer,
+            ));
+        }
         for lower_window in windows_top_to_bottom {
             backdrop_scene.extend(window_scene_elements_for_capture(
                 renderer,
@@ -3621,6 +3709,9 @@ fn configured_background_effect_elements_for_layer(
     }
     if uses_backdrop || uses_xray {
         hash_layer_scene_contributors(&mut hasher, output, &lower_layers, effect_rect);
+    }
+    if uses_backdrop {
+        hash_layer_scene_contributors(&mut hasher, output, upper_layers_below, effect_rect);
     }
     format!("{:?}", config.effect).hash(&mut hasher);
     (
@@ -3928,19 +4019,31 @@ fn upper_layer_scene_elements(
     output_geo: Rectangle<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
     windows_top_to_bottom: &[smithay::desktop::Window],
+    // Fullscreen fast path: a fullscreen window stacks above the Top layer
+    // but below Overlay, so only Overlay surfaces stay visible.
+    overlay_only: bool,
 ) -> Vec<WinitRenderElements> {
     let map = smithay::desktop::layer_map_for_output(output);
-    let upper_layers: Vec<_> = [
-        smithay::wayland::shell::wlr_layer::Layer::Overlay,
-        smithay::wayland::shell::wlr_layer::Layer::Top,
-    ]
-    .into_iter()
-    .flat_map(|layer| map.layers_on(layer).rev().cloned())
-    .collect();
+    let layer_kinds: &[smithay::wayland::shell::wlr_layer::Layer] = if overlay_only {
+        &[smithay::wayland::shell::wlr_layer::Layer::Overlay]
+    } else {
+        &[
+            smithay::wayland::shell::wlr_layer::Layer::Overlay,
+            smithay::wayland::shell::wlr_layer::Layer::Top,
+        ]
+    };
+    let upper_layers: Vec<_> = layer_kinds
+        .iter()
+        .flat_map(|layer| map.layers_on(*layer).rev().cloned())
+        .collect();
     drop(map);
 
     let mut elements = Vec::new();
-    for layer_surface in upper_layers {
+    for (layer_index, layer_surface) in upper_layers.iter().enumerate() {
+        let layer_surface = layer_surface.clone();
+        // Upper layers stacked below this one (the list is front-to-back);
+        // backdrop captures must see them since they draw above all windows.
+        let upper_layers_below = &upper_layers[layer_index + 1..];
         let layer_id = crate::ssd::layer_runtime_id(&layer_surface);
         // Popups draw above their layer; compose their effects per popup.
         let configured_popup_effects = state.configured_popup_effects.clone();
@@ -4017,6 +4120,7 @@ fn upper_layer_scene_elements(
                 output_geo,
                 scale,
                 windows_top_to_bottom,
+                upper_layers_below,
                 &layer_surface,
                 1.0,
                 custom_background.as_ref(),

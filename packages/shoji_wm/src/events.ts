@@ -174,6 +174,28 @@ export type RuntimeWindowMinimizeRequestEvent = Omit<
   "window"
 >;
 
+export interface WindowFullscreenRequestEvent {
+  window: WaylandWindow;
+  fullscreen: boolean;
+  /**
+   * Output the client asked to go fullscreen on. The protocol's wl_output
+   * argument is optional, so this can be undefined — let the window manager
+   * pick a sensible default (e.g. the window's current output).
+   */
+  outputName?: string;
+  source: WindowStateRequestSource;
+  timestamp: number;
+}
+
+export type WindowFullscreenRequestListener = (
+  event: WindowFullscreenRequestEvent,
+) => void;
+
+export type RuntimeWindowFullscreenRequestEvent = Omit<
+  WindowFullscreenRequestEvent,
+  "window"
+>;
+
 export interface WindowActivateRequestEvent {
   window: WaylandWindow;
   source: WindowActivateRequestSource;
@@ -258,6 +280,9 @@ export interface WindowManagerEventController {
   onWindowMove(listener: WindowMoveListener): () => void;
   onWindowMaximizeRequest(listener: WindowMaximizeRequestListener): () => void;
   onWindowMinimizeRequest(listener: WindowMinimizeRequestListener): () => void;
+  onWindowFullscreenRequest(
+    listener: WindowFullscreenRequestListener,
+  ): () => void;
   onWindowActivateRequest(listener: WindowActivateRequestListener): () => void;
   onOutputChange(listener: OutputChangeListener): () => void;
   onInputDeviceChange(listener: InputDeviceChangeListener): () => void;
@@ -284,6 +309,10 @@ export interface WindowManagerEventController {
   emitWindowMinimizeRequest(
     window: WaylandWindow,
     event: RuntimeWindowMinimizeRequestEvent,
+  ): boolean;
+  emitWindowFullscreenRequest(
+    window: WaylandWindow,
+    event: RuntimeWindowFullscreenRequestEvent,
   ): boolean;
   emitWindowActivateRequest(
     window: WaylandWindow,
@@ -317,6 +346,8 @@ export function createWindowManagerEventController(): WindowManagerEventControll
   const moveListeners = new Set<WindowMoveListener>();
   const maximizeRequestListeners = new Set<WindowMaximizeRequestListener>();
   const minimizeRequestListeners = new Set<WindowMinimizeRequestListener>();
+  const fullscreenRequestListeners =
+    new Set<WindowFullscreenRequestListener>();
   const activateRequestListeners = new Set<WindowActivateRequestListener>();
   const outputChangeListeners = new Set<OutputChangeListener>();
   const inputDeviceChangeListeners = new Set<InputDeviceChangeListener>();
@@ -379,6 +410,10 @@ export function createWindowManagerEventController(): WindowManagerEventControll
     onWindowMinimizeRequest(listener) {
       minimizeRequestListeners.add(listener);
       return () => minimizeRequestListeners.delete(listener);
+    },
+    onWindowFullscreenRequest(listener) {
+      fullscreenRequestListeners.add(listener);
+      return () => fullscreenRequestListeners.delete(listener);
     },
     onWindowActivateRequest(listener) {
       activateRequestListeners.add(listener);
@@ -482,6 +517,15 @@ export function createWindowManagerEventController(): WindowManagerEventControll
         return false;
       }
       for (const listener of minimizeRequestListeners) {
+        listener({ ...event, window });
+      }
+      return true;
+    },
+    emitWindowFullscreenRequest(window, event) {
+      if (fullscreenRequestListeners.size === 0) {
+        return false;
+      }
+      for (const listener of fullscreenRequestListeners) {
         listener({ ...event, window });
       }
       return true;

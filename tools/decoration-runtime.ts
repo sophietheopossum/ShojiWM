@@ -82,6 +82,7 @@ import {
   type RuntimeWindowMoveEvent,
   type RuntimeWindowMaximizeRequestEvent,
   type RuntimeWindowMinimizeRequestEvent,
+  type RuntimeWindowFullscreenRequestEvent,
   type RuntimeWindowActivateRequestEvent,
   type PointerMoveEvent,
   type GestureSwipeEvent,
@@ -314,6 +315,17 @@ interface WindowMinimizeRequest {
   inputState?: Record<string, InputDeviceInfo>;
 }
 
+interface WindowFullscreenRequest {
+  requestId: number;
+  kind: "windowFullscreenRequest";
+  windowId: string;
+  snapshot: WaylandWindowSnapshot;
+  event: RuntimeWindowFullscreenRequestEvent;
+  nowMs: number;
+  displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
+}
+
 interface WindowActivateRequest {
   requestId: number;
   kind: "windowActivateRequest";
@@ -400,6 +412,7 @@ type RuntimeRequest =
   | WindowMoveRequest
   | WindowMaximizeRequest
   | WindowMinimizeRequest
+  | WindowFullscreenRequest
   | WindowActivateRequest
   | PointerMoveAsyncRequest
   | GestureSwipeAsyncRequest
@@ -480,6 +493,8 @@ interface RuntimeWindowAction {
     | "maximize"
     | "unmaximize"
     | "minimize"
+    | "fullscreen"
+    | "unfullscreen"
     | "focus"
     | "scheduleAnimation"
     | "cancelAnimation";
@@ -618,6 +633,7 @@ interface WindowStateRequestSuccess {
   kind:
     | "windowMaximizeRequest"
     | "windowMinimizeRequest"
+    | "windowFullscreenRequest"
     | "windowActivateRequest";
   invoked: boolean;
   dirty: boolean;
@@ -955,6 +971,7 @@ const stats = {
   windowMove: 0,
   windowMaximizeRequest: 0,
   windowMinimizeRequest: 0,
+  windowFullscreenRequest: 0,
   windowActivateRequest: 0,
   pointerMoveAsync: 0,
   gestureSwipeAsync: 0,
@@ -1110,6 +1127,9 @@ async function main() {
             break;
           case "windowMinimizeRequest":
             stats.windowMinimizeRequest++;
+            break;
+          case "windowFullscreenRequest":
+            stats.windowFullscreenRequest++;
             break;
           case "windowActivateRequest":
             stats.windowActivateRequest++;
@@ -1574,6 +1594,33 @@ async function main() {
               requestId: request.requestId,
               ok: true,
               kind: "windowMinimizeRequest",
+              ...result,
+              displayConfig: pendingDisplayConfigPayload(),
+              keyBindingConfig,
+              pointerConfig,
+              inputConfig,
+              eventConfig,
+              processConfig,
+              processActions,
+            });
+          } else if (request.kind === "windowFullscreenRequest") {
+            const result = invokeWindowFullscreenRequest(
+              composition,
+              events,
+              request.windowId,
+              request.snapshot,
+              request.event,
+            );
+            const keyBindingConfig = pendingKeyBindingConfigPayload();
+            const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
+            const eventConfig = pendingEventConfigPayload(events);
+            const processConfig = pendingProcessConfigPayload();
+            const processActions = pendingProcessActionsPayload();
+            await writeResponse(output, {
+              requestId: request.requestId,
+              ok: true,
+              kind: "windowFullscreenRequest",
               ...result,
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
@@ -2226,6 +2273,18 @@ function createRuntimeCacheEntry(
         action: "minimize",
       });
     },
+    fullscreen() {
+      entry.pendingActions.push({
+        windowId: latestSnapshot.id,
+        action: "fullscreen",
+      });
+    },
+    unfullscreen() {
+      entry.pendingActions.push({
+        windowId: latestSnapshot.id,
+        action: "unfullscreen",
+      });
+    },
     focus() {
       entry.pendingActions.push({
         windowId: latestSnapshot.id,
@@ -2856,6 +2915,36 @@ function invokeWindowMinimizeRequest(
   const entry = ensureRuntimeCacheEntry(composition, events, snapshot);
 
   const invoked = events.emitWindowMinimizeRequest(entry.cache.window, event);
+  if (!invoked) {
+    return emptyWindowStateRequestResult();
+  }
+
+  const result = collectRuntimeMutationState();
+  return {
+    invoked: true,
+    dirty: result.dirty,
+    dirtyWindowIds: result.dirtyWindowIds,
+    dirtyManagedWindowIds: result.dirtyManagedWindowIds,
+    dirtyWindowNodeIds: result.dirtyWindowNodeIds,
+    dirtyLayerNodeIds: result.dirtyLayerNodeIds,
+    actions: result.actions,
+    nextPollInMs: hasActiveAnimations() ? 0 : result.nextPollInMs,
+  };
+}
+
+function invokeWindowFullscreenRequest(
+  composition: WindowCompositionFunction,
+  events: WindowManagerEventController,
+  windowId: string,
+  snapshot: WaylandWindowSnapshot,
+  event: RuntimeWindowFullscreenRequestEvent,
+): Omit<WindowStateRequestSuccess, "requestId" | "ok" | "kind"> {
+  if (snapshot.id !== windowId) {
+    return emptyWindowStateRequestResult();
+  }
+  const entry = ensureRuntimeCacheEntry(composition, events, snapshot);
+
+  const invoked = events.emitWindowFullscreenRequest(entry.cache.window, event);
   if (!invoked) {
     return emptyWindowStateRequestResult();
   }

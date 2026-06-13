@@ -431,6 +431,83 @@ impl XdgShellHandler for ShojiWM {
         );
     }
 
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+    ) {
+        let wl_surface = surface.wl_surface();
+        info!(
+            surface = ?wl_surface.id(),
+            "xdg toplevel fullscreen request received"
+        );
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface))
+            .cloned()
+        else {
+            warn!(
+                surface = ?wl_surface.id(),
+                "xdg toplevel fullscreen request did not match a mapped window"
+            );
+            return;
+        };
+        let output_name = output
+            .as_ref()
+            .and_then(smithay::output::Output::from_resource)
+            .map(|output| output.name());
+        let snapshot = self.snapshot_window(&window);
+        info!(
+            window_id = %snapshot.id,
+            title = %snapshot.title,
+            app_id = ?snapshot.app_id,
+            requested_output = ?output_name,
+            "xdg toplevel fullscreen request matched window"
+        );
+
+        self.request_window_fullscreen(
+            &window,
+            true,
+            output_name,
+            crate::ssd::WindowStateRequestSourceSnapshot::ClientCsd,
+        );
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        info!(
+            surface = ?wl_surface.id(),
+            "xdg toplevel unfullscreen request received"
+        );
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface))
+            .cloned()
+        else {
+            warn!(
+                surface = ?wl_surface.id(),
+                "xdg toplevel unfullscreen request did not match a mapped window"
+            );
+            return;
+        };
+        let snapshot = self.snapshot_window(&window);
+        info!(
+            window_id = %snapshot.id,
+            title = %snapshot.title,
+            app_id = ?snapshot.app_id,
+            "xdg toplevel unfullscreen request matched window"
+        );
+
+        self.request_window_fullscreen(
+            &window,
+            false,
+            None,
+            crate::ssd::WindowStateRequestSourceSnapshot::ClientCsd,
+        );
+    }
+
     fn minimize_request(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface();
         info!(

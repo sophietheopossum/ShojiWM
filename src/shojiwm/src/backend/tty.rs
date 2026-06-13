@@ -14,7 +14,7 @@ use smithay::{
         allocator::{Fourcc, gbm::GbmAllocator},
         drm::{
             DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode,
-            compositor::FrameFlags,
+            compositor::{FrameFlags, PrimaryPlaneElement},
             exporter::gbm::{GbmFramebufferExporter, NodeFilter},
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
         },
@@ -309,6 +309,142 @@ fn latest_backdrop_sample_rect(key: &str) -> Option<(f64, f64, f64, f64)> {
     guard.get(key).and_then(|state| state.sample_screen_rect)
 }
 
+fn direct_scanout_state_map() -> &'static Mutex<HashMap<String, bool>> {
+    static STATE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fullscreen_fast_path_state_map() -> &'static Mutex<HashMap<String, bool>> {
+    static STATE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Logs fullscreen-fast-path transitions edge-triggered. Separate from the
+/// scanout-plane log so we can distinguish "fast path engaged but the buffer
+/// was not promoted to a plane (e.g. shm or unsupported modifier)" from "fast
+/// path never engaged".
+fn note_fullscreen_fast_path_transition(output_name: &str, active: bool) {
+    let Ok(mut guard) = fullscreen_fast_path_state_map().lock() else {
+        return;
+    };
+    let previous = guard.insert(output_name.to_string(), active);
+    if previous == Some(active) {
+        return;
+    }
+    if active {
+        tracing::info!(
+            output = %output_name,
+            "fullscreen fast path engaged: scene collapsed to overlay layers + bare client surface"
+        );
+    } else {
+        tracing::info!(
+            output = %output_name,
+            "fullscreen fast path disengaged: full scene compositing resumed"
+        );
+    }
+}
+
+/// Logs direct-scanout transitions edge-triggered: one line when a client
+/// buffer first lands on the primary plane and one line when compositing
+/// resumes, instead of spamming per frame.
+fn note_direct_scanout_transition(output_name: &str, active: bool, fullscreen_fast_path: bool) {
+    let Ok(mut guard) = direct_scanout_state_map().lock() else {
+        return;
+    };
+    let previous = guard.insert(output_name.to_string(), active);
+    if previous == Some(active) {
+        return;
+    }
+    if active {
+        tracing::info!(
+            output = %output_name,
+            fullscreen_fast_path,
+            "direct scanout engaged: client buffer assigned to primary plane (zero-copy)"
+        );
+    } else {
+        tracing::info!(
+            output = %output_name,
+            fullscreen_fast_path,
+            "direct scanout disengaged: GL compositing resumed"
+        );
+    }
+}
+
+/// Detects the window that should take the fullscreen fast path on this
+/// output: the topmost rendered window carries the client-acked xdg
+/// Fullscreen state, its committed geometry covers the whole output, and no
+/// compositor-side visual transform or fade is in flight.
+///
+/// While this holds, scene assembly collapses to "overlay layers above one
+/// raw client surface" (Top/Bottom/Background layers, other windows,
+/// decorations and effects are all occluded and skipped). With nothing else
+/// in the element list, smithay's DrmCompositor can promote the client's
+/// dmabuf straight to the primary plane — zero-copy direct scanout.
+pub(crate) fn fullscreen_scanout_window(
+    space: &smithay::desktop::Space<smithay::desktop::Window>,
+    window_decorations: &std::collections::HashMap<
+        smithay::desktop::Window,
+        crate::ssd::WindowDecorationState,
+    >,
+    windows_top_to_bottom: &[smithay::desktop::Window],
+    closing_snapshot_count: usize,
+    output: &Output,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+) -> Option<smithay::desktop::Window> {
+    // Closing-window animations draw above live windows; let the normal
+    // pipeline run while one is active.
+    if closing_snapshot_count != 0 {
+        return None;
+    }
+    let output_name = output.name();
+    // Topmost window that actually renders on this output. If that is not
+    // the fullscreen window (e.g. a floating window stacked above it), the
+    // fast path must stay off so the upper window remains visible.
+    let window = windows_top_to_bottom.iter().find(|window| {
+        let Some(decoration) = window_decorations.get(window) else {
+            return false;
+        };
+        if !decoration.managed_window_allows_render_on_output(output_name.as_str()) {
+            return false;
+        }
+        space
+            .element_geometry(window)
+            .is_some_and(|geometry| geometry.intersection(output_geo).is_some())
+    })?;
+    let toplevel = window.toplevel()?;
+    let fullscreen = toplevel.with_committed_state(|state| {
+        state.is_some_and(|state| {
+            state
+                .states
+                .contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen)
+        })
+    });
+    if !fullscreen {
+        return None;
+    }
+    // The committed window must actually cover the output; during the
+    // fullscreen transition (configure sent, buffer not resized yet) the
+    // normal pipeline keeps rendering the scene below.
+    let geometry = space.element_geometry(window)?;
+    if geometry.intersection(output_geo) != Some(output_geo) {
+        return None;
+    }
+    // No animation transform/fade: effect and transform elements cannot ride
+    // direct scanout, so fall back to compositing until the window settles.
+    let decoration = window_decorations.get(window)?;
+    let visual_state = window_visual_state(
+        decoration.layout.root.rect,
+        decoration.visual_transform,
+        output_geo,
+        scale,
+    );
+    if !is_identity_visual_geometry(visual_state) || visual_state.opacity < 1.0 {
+        return None;
+    }
+    Some(window.clone())
+}
+
 struct SurfaceData {
     output: Output,
     drm_output: GbmDrmOutput,
@@ -338,6 +474,10 @@ enum RenderSurfaceOutcome {
 
 struct TtyRenderFrameResult {
     is_empty: bool,
+    /// True when DrmCompositor assigned a client buffer directly to the
+    /// primary plane (zero-copy direct scanout) instead of GL-compositing
+    /// into the swapchain.
+    primary_scanout: bool,
     states: RenderElementStates,
 }
 
@@ -476,7 +616,26 @@ pub fn device_added(
         gbm.clone(),
         BufferObjectFlags::RENDERING | BufferObjectFlags::SCANOUT,
     );
-    let exporter = GbmFramebufferExporter::new(gbm.clone(), NodeFilter::from(node));
+    // NodeFilter gates whether a client dmabuf is even considered for direct
+    // scanout (GbmFramebufferExporter::can_add_framebuffer). It compares the
+    // filter against the dmabuf's recorded source node — but smithay's
+    // zwp_linux_dmabuf import path hardcodes that node to `None`
+    // (wayland/dmabuf/dispatch.rs create_dmabuf(..., None)). So any
+    // `NodeFilter::Node(_)` — including the primary node we used before —
+    // never matches, silently disabling client direct scanout for every
+    // buffer (it always fell back to GL compositing with no reason).
+    //
+    // This exporter is per-GPU: `device_added` runs once per DRM node and each
+    // `BackendData` owns its own renderer/allocator/exporter, so this serves
+    // exactly the outputs driven by `node`. `NodeFilter::All` lets
+    // can_add_framebuffer return true for any client buffer and defers the real
+    // decision to `add_framebuffer`, which imports the dmabuf into THIS GPU's
+    // gbm device. Buffers this GPU cannot import (e.g. a foreign-GPU buffer with
+    // an incompatible modifier in a multi-GPU setup) fail there and fall back to
+    // GL compositing — no garbage, no crash, just no zero-copy for that buffer.
+    // (We cannot filter by source node precisely because smithay leaves it None,
+    // so "attempt and let the import decide" is the only workable policy.)
+    let exporter = GbmFramebufferExporter::new(gbm.clone(), NodeFilter::All);
 
     let render_formats = renderer.egl_context().dmabuf_render_formats().clone();
     let drm_output_manager = DrmOutputManager::new(
@@ -1567,6 +1726,31 @@ fn render_surface(
         let cursor_elapsed_ms = cursor_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.cursor_elapsed_ms = cursor_elapsed_ms;
 
+        // Fullscreen fast path: when the topmost window is settled fullscreen
+        // on this output, only overlay layers and the raw client surface are
+        // rendered (Hyprland-style stacking: fullscreen above Top, below
+        // Overlay). The collapsed element list is what allows direct scanout.
+        let fullscreen_scanout = fullscreen_scanout_window(
+            space,
+            window_decorations,
+            &windows_top_to_bottom,
+            closing_snapshots.len(),
+            &output,
+            output_geo,
+            scale,
+        );
+        note_fullscreen_fast_path_transition(output.name().as_str(), fullscreen_scanout.is_some());
+        // Overlay-layer backdrop effects must sample the fullscreen window
+        // instead of the regular window stack while the fast path is active.
+        let fullscreen_backdrop_windows: Vec<smithay::desktop::Window>;
+        let upper_layer_backdrop_windows: &[smithay::desktop::Window] =
+            if let Some(window) = fullscreen_scanout.as_ref() {
+                fullscreen_backdrop_windows = vec![window.clone()];
+                &fullscreen_backdrop_windows
+            } else {
+                &windows_top_to_bottom
+            };
+
         let mut scene_elements: Vec<TtyRenderElements> = Vec::new();
         let upper_layers_started_at = Instant::now();
         scene_elements.extend(upper_layer_scene_elements(
@@ -1575,6 +1759,7 @@ fn render_surface(
             window_decorations,
             &state.window_source_damage,
             &state.lower_layer_source_damage,
+            &state.upper_layer_source_damage,
             state.lower_layer_scene_generation,
             &state.configured_layer_effects,
             &state.configured_popup_effects,
@@ -1582,7 +1767,8 @@ fn render_surface(
             &output,
             output_geo,
             scale,
-            &windows_top_to_bottom,
+            upper_layer_backdrop_windows,
+            fullscreen_scanout.is_some(),
             &mut state.layer_backdrop_cache,
             &mut state.layer_framebuffer_effect_states,
             &mut state.layer_effect_cache,
@@ -1627,6 +1813,38 @@ fn render_surface(
             );
         }
         for (_window_index, window) in windows_top_to_bottom.iter().enumerate() {
+            // Fullscreen fast path: every other window is fully occluded;
+            // the fullscreen window itself renders as a bare surface tree +
+            // popups (no decorations, no effects) so the frame can collapse
+            // to a single scanout-capable element.
+            if let Some(fullscreen_window) = fullscreen_scanout.as_ref() {
+                if window != fullscreen_window {
+                    continue;
+                }
+                let Some(window_location) = space.element_location(window) else {
+                    continue;
+                };
+                let physical_location =
+                    (window_location - output_geo.loc).to_physical_precise_round(scale);
+                let popup_elements = window_render::popup_elements(
+                    window,
+                    &mut backend.renderer,
+                    physical_location,
+                    scale,
+                    1.0,
+                );
+                let surface_elements = window_render::surface_elements(
+                    window,
+                    &mut backend.renderer,
+                    physical_location,
+                    scale,
+                    1.0,
+                );
+                scene_elements.extend(popup_elements.into_iter().map(TtyRenderElements::Window));
+                scene_elements
+                    .extend(surface_elements.into_iter().map(TtyRenderElements::Window));
+                continue;
+            }
             let window_started_at = Instant::now();
             let mut window_timing = TtyWindowTimingMetrics::default();
             let Some(window_location) = space.element_location(window) else {
@@ -4133,21 +4351,24 @@ fn render_surface(
         timing.max_window_elapsed_ms = max_window_elapsed_ms;
         timing.max_window_id = max_window_id;
         let lower_layers_started_at = Instant::now();
-        scene_elements.extend(lower_layer_scene_elements(
-            &mut backend.renderer,
-            &output,
-            output_geo,
-            scale,
-            state.configured_background_effect.as_ref(),
-            &state.lower_layer_source_damage,
-            state.lower_layer_scene_generation,
-            &mut state.layer_backdrop_cache,
-            &state.configured_layer_effects,
-            &mut state.layer_effect_cache,
-            &state.configured_popup_effects,
-            &mut state.popup_effect_cache,
-            &mut state.popup_framebuffer_effect_states,
-        )?);
+        // Fullscreen fast path: Bottom/Background layers are fully occluded.
+        if fullscreen_scanout.is_none() {
+            scene_elements.extend(lower_layer_scene_elements(
+                &mut backend.renderer,
+                &output,
+                output_geo,
+                scale,
+                state.configured_background_effect.as_ref(),
+                &state.lower_layer_source_damage,
+                state.lower_layer_scene_generation,
+                &mut state.layer_backdrop_cache,
+                &state.configured_layer_effects,
+                &mut state.layer_effect_cache,
+                &state.configured_popup_effects,
+                &mut state.popup_effect_cache,
+                &mut state.popup_framebuffer_effect_states,
+            )?);
+        }
         let lower_layers_elapsed_ms = lower_layers_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.lower_layers_elapsed_ms = lower_layers_elapsed_ms;
 
@@ -4174,11 +4395,23 @@ fn render_surface(
         };
 
         let mut content_elements: Vec<TtyRenderElements> = Vec::new();
-        content_elements.extend(
-            damage::elements_for_output(&extra_damage, output_geo)
-                .into_iter()
-                .map(TtyRenderElements::Damage),
-        );
+        // Synthetic DamageOnly elements force the OutputDamageTracker to repaint
+        // regions (decorations, manual invalidation). During the fullscreen fast
+        // path they are actively harmful: the fullscreen surface occludes every
+        // region they target, but as non-scanout elements stacked above the
+        // client surface they knock it off the primary plane. Worse, scanning
+        // out skips the swapchain render, which feeds back as fresh decoration
+        // damage the next frame — so the damage element reappears every other
+        // frame and direct scanout flaps engaged/disengaged at ~30 Hz. The
+        // client surface carries its own damage for smithay's tracker, so
+        // dropping these here is safe and keeps scanout steady.
+        if fullscreen_scanout.is_none() {
+            content_elements.extend(
+                damage::elements_for_output(&extra_damage, output_geo)
+                    .into_iter()
+                    .map(TtyRenderElements::Damage),
+            );
+        }
         content_elements.extend(scene_elements);
 
         let cursor_status_for_log = cursor_override
@@ -4347,6 +4580,19 @@ fn render_surface(
             elements.extend(content_for_capture);
         }
 
+        // Direct scanout only kicks in if the CRTC background (clear color) is
+        // black/transparent OR the topmost element reports itself opaque and
+        // spans the output (smithay DrmCompositor::render_frame). Many clients
+        // (Chrome, Minecraft) never set a wl_surface opaque region, so the
+        // opaque check fails and the non-black desktop clear color blocks the
+        // primary-plane promotion. During the fullscreen fast path the window
+        // covers the whole output, so the clear color is never visible — swap
+        // in black there to satisfy the easy scanout path.
+        let frame_clear_color: [f32; 4] = if fullscreen_scanout.is_some() {
+            [0.0, 0.0, 0.0, 1.0]
+        } else {
+            CLEAR_COLOR
+        };
         let result = crate::backend::shader_effect::with_gpu_timing_renderer_span(
             &mut backend.renderer,
             "tty-render-frame",
@@ -4359,23 +4605,41 @@ fn render_surface(
                         .collect::<Vec<_>>();
                     surface
                         .drm_output
-                        .render_frame(renderer, &profiled_elements, CLEAR_COLOR, TTY_FRAME_FLAGS)
+                        .render_frame(
+                            renderer,
+                            &profiled_elements,
+                            frame_clear_color,
+                            TTY_FRAME_FLAGS,
+                        )
                         .map(|result| TtyRenderFrameResult {
                             is_empty: result.is_empty,
+                            primary_scanout: matches!(
+                                result.primary_element,
+                                PrimaryPlaneElement::Element(_)
+                            ),
                             states: result.states,
                         })
                 } else {
                     surface
                         .drm_output
-                        .render_frame(renderer, &elements, CLEAR_COLOR, TTY_FRAME_FLAGS)
+                        .render_frame(renderer, &elements, frame_clear_color, TTY_FRAME_FLAGS)
                         .map(|result| TtyRenderFrameResult {
                             is_empty: result.is_empty,
+                            primary_scanout: matches!(
+                                result.primary_element,
+                                PrimaryPlaneElement::Element(_)
+                            ),
                             states: result.states,
                         })
                 }
             },
         )?;
         fps_counter.record_present(output.name().as_str());
+        note_direct_scanout_transition(
+            output.name().as_str(),
+            result.primary_scanout,
+            fullscreen_scanout.is_some(),
+        );
         if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some()
             && (frame_transform_snapshot_window_count > 0 || frame_had_transform_snapshot_damage)
         {
@@ -7686,11 +7950,16 @@ fn configured_background_effect_elements_for_layer(
     >,
     window_source_damage: &[crate::state::OwnedDamageRect],
     lower_layer_source_damage: &[crate::state::OwnedDamageRect],
+    upper_layer_source_damage: &[crate::state::OwnedDamageRect],
     lower_layer_scene_generation: u64,
     output: &Output,
     output_geo: smithay::utils::Rectangle<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
     windows_top_to_bottom: &[smithay::desktop::Window],
+    // Top/Overlay layers stacked below `layer_surface` (front-to-back). They
+    // sit above all toplevel windows, so backdrop captures must include them
+    // or an overlay's blur would miss any overlay/top layer behind it.
+    upper_layers_below: &[smithay::desktop::LayerSurface],
     layer_surface: &smithay::desktop::LayerSurface,
     alpha: f32,
     layer_backdrop_cache: &mut std::collections::HashMap<
@@ -7781,10 +8050,30 @@ fn configured_background_effect_elements_for_layer(
                 lower_layer_source_damage,
             ));
         }
+        if uses_backdrop {
+            entries.extend(collect_layer_source_damage(
+                upper_layers_below.iter().cloned(),
+                upper_layer_source_damage,
+            ));
+        }
         entries
     };
     let backdrop_texture = if effect_config.effect.uses_backdrop_input() {
         let mut backdrop_scene: Vec<TtyRenderElements> = Vec::new();
+        // Upper layers below this one render above every toplevel window, so
+        // they go first in the front-to-back capture scene.
+        for upper_layer in upper_layers_below {
+            if let Ok(mut layer_elements) = layer_surface_scene_elements_for_capture(
+                renderer,
+                output,
+                actual_capture_geo,
+                capture_origin_physical,
+                scale,
+                upper_layer,
+            ) {
+                backdrop_scene.append(&mut layer_elements);
+            }
+        }
         for lower_window in windows_top_to_bottom {
             if let Ok(mut window_elements) = window_scene_elements_for_capture(
                 renderer,
@@ -7997,6 +8286,9 @@ fn configured_background_effect_elements_for_layer(
     }
     if uses_backdrop || uses_xray {
         hash_layer_scene_contributors(&mut hasher, output, &lower_layers, effect_rect);
+    }
+    if uses_backdrop {
+        hash_layer_scene_contributors(&mut hasher, output, upper_layers_below, effect_rect);
     }
     format!("{:?}", effect_config.effect).hash(&mut hasher);
     (
@@ -8624,6 +8916,7 @@ fn upper_layer_scene_elements(
     >,
     window_source_damage: &[crate::state::OwnedDamageRect],
     lower_layer_source_damage: &[crate::state::OwnedDamageRect],
+    upper_layer_source_damage: &[crate::state::OwnedDamageRect],
     lower_layer_scene_generation: u64,
     configured_layer_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
     configured_popup_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
@@ -8632,6 +8925,9 @@ fn upper_layer_scene_elements(
     output_geo: smithay::utils::Rectangle<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
     windows_top_to_bottom: &[smithay::desktop::Window],
+    // Fullscreen fast path: a fullscreen window stacks above the Top layer
+    // but below Overlay, so only Overlay surfaces stay visible.
+    overlay_only: bool,
     layer_backdrop_cache: &mut std::collections::HashMap<
         String,
         crate::backend::shader_effect::CachedBackdropTexture,
@@ -8654,17 +8950,26 @@ fn upper_layer_scene_elements(
     >,
 ) -> Result<Vec<TtyRenderElements>, Box<dyn std::error::Error>> {
     let map = layer_map_for_output(output);
-    let upper_layers: Vec<_> = [
-        smithay::wayland::shell::wlr_layer::Layer::Overlay,
-        smithay::wayland::shell::wlr_layer::Layer::Top,
-    ]
-    .into_iter()
-    .flat_map(|layer| map.layers_on(layer).rev().cloned())
-    .collect();
+    let layer_kinds: &[smithay::wayland::shell::wlr_layer::Layer] = if overlay_only {
+        &[smithay::wayland::shell::wlr_layer::Layer::Overlay]
+    } else {
+        &[
+            smithay::wayland::shell::wlr_layer::Layer::Overlay,
+            smithay::wayland::shell::wlr_layer::Layer::Top,
+        ]
+    };
+    let upper_layers: Vec<_> = layer_kinds
+        .iter()
+        .flat_map(|layer| map.layers_on(*layer).rev().cloned())
+        .collect();
     drop(map);
 
     let mut elements = Vec::new();
-    for layer_surface in upper_layers {
+    for (layer_index, layer_surface) in upper_layers.iter().enumerate() {
+        let layer_surface = layer_surface.clone();
+        // Upper layers stacked below this one (the list is front-to-back);
+        // backdrop captures must see them since they draw above all windows.
+        let upper_layers_below = &upper_layers[layer_index + 1..];
         // Popups draw above their layer; compose their effects per popup.
         elements.extend(composed_popup_scene_elements(
             renderer,
@@ -8741,11 +9046,13 @@ fn upper_layer_scene_elements(
                 window_decorations,
                 window_source_damage,
                 lower_layer_source_damage,
+                upper_layer_source_damage,
                 lower_layer_scene_generation,
                 output,
                 output_geo,
                 scale,
                 windows_top_to_bottom,
+                upper_layers_below,
                 &layer_surface,
                 1.0,
                 layer_backdrop_cache,

@@ -31,6 +31,7 @@ import {
   HybridWindowManager,
   TITLEBAR_HEIGHT,
   WINDOW_BORDER_PX,
+  WINDOW_STATE_FULLSCREEN,
   WINDOW_STATE_MINIMIZED,
   WINDOW_STATE_MINIMIZE_VISUAL_IDLE,
   WINDOW_STATE_TILE_DRAGGING,
@@ -520,6 +521,10 @@ WINDOW_MANAGER.event.onWindowMinimizeRequest((event) => {
   HYBRID_WINDOW_MANAGER.onWindowMinimizeRequest(event);
 });
 
+WINDOW_MANAGER.event.onWindowFullscreenRequest((event) => {
+  HYBRID_WINDOW_MANAGER.onWindowFullscreenRequest(event);
+});
+
 WINDOW_MANAGER.event.onWindowActivateRequest((event) => {
   HYBRID_WINDOW_MANAGER.onWindowActivateRequest(event);
   scheduleWorkspaceBroadcast();
@@ -653,6 +658,28 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
         </Box>
         <ClientWindow />
       </ShaderEffect>
+    );
+  }
+
+  // Fullscreen: drop all chrome (titlebar, border, rounded corners) and let
+  // the client surface fill its managed rect edge to edge. The rect is set to
+  // the whole output by onWindowFullscreenRequest. Rendering nothing but the
+  // bare ClientWindow is also what lets the tty backend promote the client
+  // buffer to the primary plane (direct scanout).
+  if (window.state[WINDOW_STATE_FULLSCREEN]()) {
+    return (
+      <ManagedWindow
+        rect={managedRect}
+        zIndex={HYBRID_WINDOW_MANAGER.getWindowZIndex(window)}
+        visibleOutputs={window.state[WINDOW_STATE_VISIBLE_OUTPUTS]}
+        opacity={workspaceOpacity}
+        forceRectSize={forceRectSize}
+        tiled={tiled}
+        idle={inactive}
+        interactive={inactive((value) => !value)}
+      >
+        <ClientWindow />
+      </ManagedWindow>
     );
   }
 
