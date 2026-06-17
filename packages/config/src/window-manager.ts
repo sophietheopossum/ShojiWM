@@ -26,6 +26,15 @@ import {
 import type { ManagedWindowRect, WindowSizeConstraints } from "shoji_wm/types";
 import { playRectAnimation, stopRectAnimation } from "./window-animation";
 
+export type SnapZone =
+  | "maximize"
+  | "left"
+  | "right"
+  | "top-left"
+  | "top-right"
+  | "bottom-left"
+  | "bottom-right";
+
 export const WINDOW_STATE_RECT = createWindowState<ManagedWindowRect>("rect", {
   default: (window) => window.rect,
 });
@@ -95,6 +104,14 @@ export const WINDOW_STATE_FLOATING_RECT =
   createWindowState<ManagedWindowRect | null>("floatingRect", {
     default: null,
   });
+export const WINDOW_STATE_SNAP_ZONE =
+  createWindowState<SnapZone | null>("snapZone", {
+    default: null,
+  });
+export const WINDOW_STATE_SNAP_MONITOR =
+  createWindowState<string | null>("snapMonitor", {
+    default: null,
+  });
 
 const OPEN_CLOSE_ANIMATION_DURATION = seconds(0.5);
 const WINDOW_MANAGEMENT_ANIMATION_DURATION = seconds(0.3);
@@ -143,15 +160,6 @@ const SNAP_EDGE_PX = 16;
 const SNAP_CORNER_PX = 140;
 const SNAP_GAP_PX = 8;
 
-export type SnapZone =
-  | "maximize"
-  | "left"
-  | "right"
-  | "top-left"
-  | "top-right"
-  | "bottom-left"
-  | "bottom-right";
-
 /** Monitor-local logical rect (relative to the monitor origin) for the bar. */
 export interface SnapPreviewRect {
   x: number;
@@ -167,6 +175,15 @@ export interface SnapPreviewPayload {
 }
 
 export type SnapPreviewBroadcaster = (preview: SnapPreviewPayload) => void;
+
+type LayoutSnapZone = Exclude<SnapZone, "maximize">;
+type SnapColumn = "left" | "right";
+
+interface FloatingSnapLayout {
+  splitX: number;
+  leftSplitY: number;
+  rightSplitY: number;
+}
 
 function markWindowCompositionDirty(window: WaylandWindow): void {
   markWindowDirty(window.id);
@@ -199,6 +216,8 @@ interface WorkspaceWindowSnapshot {
   tileWidth?: number;
   floatingRect?: ManagedWindowRect | null;
   restoreRect?: ManagedWindowRect | null;
+  snapZone?: SnapZone | null;
+  snapMonitor?: string | null;
   minimized: boolean;
   maximized: boolean;
 }
@@ -680,6 +699,11 @@ export class HybridWindowManager {
     }
 
     const nextRect = this.constrainResizeRect(event);
+    if (workspace && this.resizeFloatingSnapLayout(event, workspace, nextRect)) {
+      this.applyWorkspaceStackPolicy(workspace);
+      return;
+    }
+
     stopRectAnimation(event.window, WINDOW_STATE_RECT);
     event.window.state[WINDOW_STATE_RECT].set(nextRect);
     workspace?.syncFloatingWindowRect(event.window, nextRect);
@@ -699,11 +723,12 @@ export class HybridWindowManager {
       return;
     }
 
+    const window = event.window;
     if (event.phase === "start") {
       this.isGrabbing = true;
+      this.clearWindowSnapState(window);
     }
 
-    const window = event.window;
     if (window.state[WINDOW_STATE_MAXIMIZED]()) {
       const restoreRect =
         window.state[WINDOW_STATE_RESTORE_RECT]() ?? event.currentRect;
@@ -772,6 +797,7 @@ export class HybridWindowManager {
         workspace,
         lastWorkspaceSwitchAt: event.timestamp,
       };
+      this.clearWindowSnapState(window);
     }
 
     const drag = this.floatingDrag;
@@ -897,6 +923,7 @@ export class HybridWindowManager {
 
     const window = event.window;
     window.state[WINDOW_STATE_MINIMIZED].set(false);
+    this.clearWindowSnapState(window);
 
     if (workspace?.isTiled && workspace.shouldTile(window)) {
       if (!event.maximized) {
@@ -1943,6 +1970,7 @@ export class HybridWindowManager {
     const window = event.window;
     const workspace = this.findWorkspaceForWindow(window);
     window.state[WINDOW_STATE_MINIMIZED].set(false);
+    this.clearWindowSnapState(window);
 
     if (!event.fullscreen) {
       const restoreRect = window.state[WINDOW_STATE_FULLSCREEN_RESTORE_RECT]();
@@ -2150,6 +2178,322 @@ export class HybridWindowManager {
     }
   }
 
+  private resizeFloatingSnapLayout(
+    event: WindowResizeEvent,
+    workspace: Workspace,
+    nextRect: ManagedWindowRect,
+  ): boolean {
+    if (workspace.isTiled) {
+      return false;
+    }
+
+    const zone = event.window.state[WINDOW_STATE_SNAP_ZONE]();
+    if (!isLayoutSnapZone(zone)) {
+      return false;
+    }
+
+    const monitor =
+      event.window.state[WINDOW_STATE_SNAP_MONITOR]() || workspace.monitor;
+    const base = this.monitorSnapBaseRect(monitor);
+    if (!base) {
+      return false;
+    }
+
+    const snappedWindows = workspace
+      .listWindows()
+      .filter((window) => this.isWindowInFloatingSnapLayout(window, monitor));
+    if (!snappedWindows.some((window) => window.id === event.window.id)) {
+      return false;
+    }
+
+    const layout = this.floatingSnapLayoutFromWindows(base, snappedWindows);
+    let changed = false;
+
+    if (event.edges.right && isLeftSnapZone(zone)) {
+      layout.splitX = read(nextRect.x) + read(nextRect.width);
+      changed = true;
+    } else if (event.edges.left && isRightSnapZone(zone)) {
+      layout.splitX = read(nextRect.x) - SNAP_GAP_PX;
+      changed = true;
+    }
+
+    if (event.edges.bottom && isTopSnapZone(zone)) {
+      if (snapColumn(zone) === "left") {
+        layout.leftSplitY = read(nextRect.y) + read(nextRect.height);
+      } else {
+        layout.rightSplitY = read(nextRect.y) + read(nextRect.height);
+      }
+      changed = true;
+    } else if (event.edges.top && isBottomSnapZone(zone)) {
+      if (snapColumn(zone) === "left") {
+        layout.leftSplitY = read(nextRect.y) - SNAP_GAP_PX;
+      } else {
+        layout.rightSplitY = read(nextRect.y) - SNAP_GAP_PX;
+      }
+      changed = true;
+    }
+
+    if (!changed) {
+      return false;
+    }
+
+    this.clampFloatingSnapLayout(base, layout, snappedWindows);
+    this.applyFloatingSnapLayout(base, layout, snappedWindows);
+    return true;
+  }
+
+  private isWindowInFloatingSnapLayout(
+    window: WaylandWindow,
+    monitor: string,
+  ): boolean {
+    return (
+      isLayoutSnapZone(window.state[WINDOW_STATE_SNAP_ZONE]()) &&
+      window.state[WINDOW_STATE_SNAP_MONITOR]() === monitor &&
+      !window.state[WINDOW_STATE_MINIMIZED]() &&
+      !window.state[WINDOW_STATE_MAXIMIZED]()
+    );
+  }
+
+  private floatingSnapLayoutFromWindows(
+    base: ManagedWindowRect,
+    windows: WaylandWindow[],
+  ): FloatingSnapLayout {
+    const bx = read(base.x);
+    const by = read(base.y);
+    const bw = read(base.width);
+    const bh = read(base.height);
+    const defaultSplitX = bx + (bw - SNAP_GAP_PX) / 2;
+    const defaultSplitY = by + (bh - SNAP_GAP_PX) / 2;
+    const splitXSamples: number[] = [];
+    const leftSplitYSamples: number[] = [];
+    const rightSplitYSamples: number[] = [];
+
+    for (const window of windows) {
+      const zone = window.state[WINDOW_STATE_SNAP_ZONE]();
+      if (!isLayoutSnapZone(zone)) {
+        continue;
+      }
+      const rect = window.state[WINDOW_STATE_RECT]();
+      if (isLeftSnapZone(zone)) {
+        splitXSamples.push(read(rect.x) + read(rect.width));
+      } else {
+        splitXSamples.push(read(rect.x) - SNAP_GAP_PX);
+      }
+
+      if (isTopSnapZone(zone)) {
+        const samples =
+          snapColumn(zone) === "left" ? leftSplitYSamples : rightSplitYSamples;
+        samples.push(read(rect.y) + read(rect.height));
+      } else if (isBottomSnapZone(zone)) {
+        const samples =
+          snapColumn(zone) === "left" ? leftSplitYSamples : rightSplitYSamples;
+        samples.push(read(rect.y) - SNAP_GAP_PX);
+      }
+    }
+
+    return {
+      splitX: averageOr(splitXSamples, defaultSplitX),
+      leftSplitY: averageOr(leftSplitYSamples, defaultSplitY),
+      rightSplitY: averageOr(rightSplitYSamples, defaultSplitY),
+    };
+  }
+
+  private clampFloatingSnapLayout(
+    base: ManagedWindowRect,
+    layout: FloatingSnapLayout,
+    windows: WaylandWindow[],
+  ): void {
+    const bx = read(base.x);
+    const by = read(base.y);
+    const bw = read(base.width);
+    const bh = read(base.height);
+    const groups = this.floatingSnapMinSizeGroups(windows);
+
+    layout.splitX = clamp(
+      layout.splitX,
+      bx + groups.leftWidth,
+      bx + bw - SNAP_GAP_PX - groups.rightWidth,
+    );
+    layout.leftSplitY = clamp(
+      layout.leftSplitY,
+      by + groups.leftTopHeight,
+      by + bh - SNAP_GAP_PX - groups.leftBottomHeight,
+    );
+    layout.rightSplitY = clamp(
+      layout.rightSplitY,
+      by + groups.rightTopHeight,
+      by + bh - SNAP_GAP_PX - groups.rightBottomHeight,
+    );
+  }
+
+  private floatingSnapMinSizeGroups(windows: WaylandWindow[]): {
+    leftWidth: number;
+    rightWidth: number;
+    leftTopHeight: number;
+    leftBottomHeight: number;
+    rightTopHeight: number;
+    rightBottomHeight: number;
+  } {
+    const groups = {
+      leftWidth: 1,
+      rightWidth: 1,
+      leftTopHeight: 1,
+      leftBottomHeight: 1,
+      rightTopHeight: 1,
+      rightBottomHeight: 1,
+    };
+
+    for (const window of windows) {
+      const zone = window.state[WINDOW_STATE_SNAP_ZONE]();
+      if (!isLayoutSnapZone(zone)) {
+        continue;
+      }
+
+      const minSize = this.floatingSnapMinSize(window);
+      if (isLeftSnapZone(zone)) {
+        groups.leftWidth = Math.max(groups.leftWidth, minSize.width);
+      } else {
+        groups.rightWidth = Math.max(groups.rightWidth, minSize.width);
+      }
+
+      if (isTopSnapZone(zone)) {
+        if (snapColumn(zone) === "left") {
+          groups.leftTopHeight = Math.max(groups.leftTopHeight, minSize.height);
+        } else {
+          groups.rightTopHeight = Math.max(
+            groups.rightTopHeight,
+            minSize.height,
+          );
+        }
+      } else if (isBottomSnapZone(zone)) {
+        if (snapColumn(zone) === "left") {
+          groups.leftBottomHeight = Math.max(
+            groups.leftBottomHeight,
+            minSize.height,
+          );
+        } else {
+          groups.rightBottomHeight = Math.max(
+            groups.rightBottomHeight,
+            minSize.height,
+          );
+        }
+      }
+    }
+
+    return groups;
+  }
+
+  private floatingSnapMinSize(window: WaylandWindow): {
+    width: number;
+    height: number;
+  } {
+    const constraints = window.sizeConstraints();
+    const extra = this.clientToRootSizeExtra(window);
+    return {
+      width: Math.max(1, constraints.min?.width ?? 1) + extra.width,
+      height: Math.max(1, constraints.min?.height ?? 1) + extra.height,
+    };
+  }
+
+  private applyFloatingSnapLayout(
+    base: ManagedWindowRect,
+    layout: FloatingSnapLayout,
+    windows: WaylandWindow[],
+  ): void {
+    for (const window of windows) {
+      const zone = window.state[WINDOW_STATE_SNAP_ZONE]();
+      if (!isLayoutSnapZone(zone)) {
+        continue;
+      }
+
+      const rect = this.floatingSnapRectForZone(base, layout, zone);
+      stopRectAnimation(window, WINDOW_STATE_RECT);
+      window.state[WINDOW_STATE_RECT].set(rect);
+    }
+  }
+
+  private floatingSnapRectForZone(
+    base: ManagedWindowRect,
+    layout: FloatingSnapLayout,
+    zone: LayoutSnapZone,
+  ): ManagedWindowRect {
+    const bx = read(base.x);
+    const by = read(base.y);
+    const bw = read(base.width);
+    const bh = read(base.height);
+    const rightX = layout.splitX + SNAP_GAP_PX;
+    const leftWidth = Math.max(1, layout.splitX - bx);
+    const rightWidth = Math.max(1, bx + bw - rightX);
+
+    switch (zone) {
+      case "left":
+        return { x: bx, y: by, width: leftWidth, height: bh };
+      case "right":
+        return { x: rightX, y: by, width: rightWidth, height: bh };
+      case "top-left":
+        return {
+          x: bx,
+          y: by,
+          width: leftWidth,
+          height: Math.max(1, layout.leftSplitY - by),
+        };
+      case "bottom-left": {
+        const y = layout.leftSplitY + SNAP_GAP_PX;
+        return {
+          x: bx,
+          y,
+          width: leftWidth,
+          height: Math.max(1, by + bh - y),
+        };
+      }
+      case "top-right":
+        return {
+          x: rightX,
+          y: by,
+          width: rightWidth,
+          height: Math.max(1, layout.rightSplitY - by),
+        };
+      case "bottom-right": {
+        const y = layout.rightSplitY + SNAP_GAP_PX;
+        return {
+          x: rightX,
+          y,
+          width: rightWidth,
+          height: Math.max(1, by + bh - y),
+        };
+      }
+    }
+  }
+
+  private setWindowSnapState(
+    workspace: Workspace | undefined,
+    window: WaylandWindow,
+    monitor: string,
+    zone: LayoutSnapZone,
+  ): void {
+    if (workspace) {
+      for (const other of workspace.listWindows()) {
+        if (other.id === window.id) {
+          continue;
+        }
+        if (
+          other.state[WINDOW_STATE_SNAP_MONITOR]() === monitor &&
+          snapZonesConflict(other.state[WINDOW_STATE_SNAP_ZONE](), zone)
+        ) {
+          this.clearWindowSnapState(other);
+        }
+      }
+    }
+
+    window.state[WINDOW_STATE_SNAP_ZONE].set(zone);
+    window.state[WINDOW_STATE_SNAP_MONITOR].set(monitor);
+  }
+
+  private clearWindowSnapState(window: WaylandWindow): void {
+    window.state[WINDOW_STATE_SNAP_ZONE].set(null);
+    window.state[WINDOW_STATE_SNAP_MONITOR].set(null);
+  }
+
   /** Broadcast a preview rect (converted to monitor-local) or a hide (null). */
   private emitSnapPreview(
     monitor: string,
@@ -2244,6 +2588,7 @@ export class HybridWindowManager {
       window.state[WINDOW_STATE_MAXIMIZED]() || read(window.isMaximized);
 
     if (snap.zone === "maximize") {
+      this.clearWindowSnapState(window);
       // Route through the real maximize so the compositor `isMaximized` state
       // (and therefore the SSD maximize/restore icon) stays in sync. Calling
       // maximize() fires onWindowMaximizeRequest, which applies the rect.
@@ -2278,6 +2623,7 @@ export class HybridWindowManager {
         WINDOW_MANAGEMENT_EASING,
         WINDOW_MANAGEMENT_ANIMATION_DURATION,
       );
+      this.setWindowSnapState(workspace, window, snap.monitor, snap.zone);
       workspace?.syncFloatingWindowRect(window, snap.rect);
     }
     this.applyWorkspaceStackPolicy(workspace);
@@ -2376,6 +2722,10 @@ export class Workspace {
         restored.floatingRect ?? null,
       );
       window.state[WINDOW_STATE_RESTORE_RECT].set(restored.restoreRect ?? null);
+      window.state[WINDOW_STATE_SNAP_ZONE].set(restored.snapZone ?? null);
+      window.state[WINDOW_STATE_SNAP_MONITOR].set(
+        restored.snapMonitor ?? null,
+      );
       window.state[WINDOW_STATE_MINIMIZED].set(restored.minimized);
       window.state[WINDOW_STATE_MINIMIZE_VISUAL_IDLE].set(restored.minimized);
       window.state[WINDOW_STATE_MAXIMIZED].set(restored.maximized);
@@ -3171,6 +3521,8 @@ export class Workspace {
         tileWidth: this.tileWidthByWindowId.get(window.id),
         floatingRect: window.state[WINDOW_STATE_FLOATING_RECT](),
         restoreRect: window.state[WINDOW_STATE_RESTORE_RECT](),
+        snapZone: window.state[WINDOW_STATE_SNAP_ZONE](),
+        snapMonitor: window.state[WINDOW_STATE_SNAP_MONITOR](),
         minimized: window.state[WINDOW_STATE_MINIMIZED](),
         maximized: window.state[WINDOW_STATE_MAXIMIZED](),
       })),
@@ -3683,6 +4035,63 @@ function insetRect(
     width,
     height,
   };
+}
+
+function isLayoutSnapZone(zone: SnapZone | null): zone is LayoutSnapZone {
+  return zone !== null && zone !== "maximize";
+}
+
+function isLeftSnapZone(zone: LayoutSnapZone): boolean {
+  return zone === "left" || zone === "top-left" || zone === "bottom-left";
+}
+
+function isRightSnapZone(zone: LayoutSnapZone): boolean {
+  return zone === "right" || zone === "top-right" || zone === "bottom-right";
+}
+
+function isTopSnapZone(zone: LayoutSnapZone): boolean {
+  return zone === "top-left" || zone === "top-right";
+}
+
+function isBottomSnapZone(zone: LayoutSnapZone): boolean {
+  return zone === "bottom-left" || zone === "bottom-right";
+}
+
+function snapColumn(zone: LayoutSnapZone): SnapColumn {
+  return isLeftSnapZone(zone) ? "left" : "right";
+}
+
+function snapZonesConflict(
+  current: SnapZone | null,
+  next: LayoutSnapZone,
+): boolean {
+  if (!isLayoutSnapZone(current)) {
+    return false;
+  }
+  if (current === next) {
+    return true;
+  }
+
+  if (next === "left") {
+    return current === "top-left" || current === "bottom-left";
+  }
+  if (next === "right") {
+    return current === "top-right" || current === "bottom-right";
+  }
+  if (current === "left") {
+    return next === "top-left" || next === "bottom-left";
+  }
+  if (current === "right") {
+    return next === "top-right" || next === "bottom-right";
+  }
+  return false;
+}
+
+function averageOr(values: number[], fallback: number): number {
+  if (values.length === 0) {
+    return fallback;
+  }
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
 function withManagedWindowOnlySSDRebuildSuppressed<T>(
