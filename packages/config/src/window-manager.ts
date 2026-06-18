@@ -1094,6 +1094,65 @@ export class HybridWindowManager {
     });
   }
 
+  public moveFocusedTile(direction: -1 | 1) {
+    withManagedWindowOnlySSDRebuildSuppressed(() => {
+      const workspace = this.getCurrentWorkspace();
+      if (!workspace?.isTiled) {
+        return;
+      }
+      if (!workspace.moveFocusedTile(direction)) {
+        return;
+      }
+      this.applyWorkspaceStackPolicy(workspace);
+    });
+  }
+
+  public moveFocusedWindowToWorkspace(direction: -1 | 1) {
+    withManagedWindowOnlySSDRebuildSuppressed(() => {
+      this.syncWorkspaces();
+
+      const focused = Array.from(this.workspaces.values())
+        .map((workspace) => ({
+          workspace,
+          window: workspace.focusedWindow(),
+        }))
+        .find(({ window }) => window !== undefined);
+      const window = focused?.window;
+      if (!window) {
+        return;
+      }
+
+      const fromWorkspace = focused.workspace;
+      const targetIndex = Math.max(1, fromWorkspace.index + direction);
+      if (targetIndex === fromWorkspace.index) {
+        return;
+      }
+
+      const targetWorkspace = this.ensureWorkspace(
+        fromWorkspace.monitor,
+        targetIndex,
+      );
+      const moved = fromWorkspace.takeWindowForMove(window);
+      if (!moved) {
+        return;
+      }
+
+      targetWorkspace.addMovedWindow(window, moved.snapshot);
+      fromWorkspace.applyLayout();
+      targetWorkspace.applyLayout();
+      this.switchWorkspaceTo(fromWorkspace.monitor, targetIndex, {
+        focusActiveAfter: false,
+      });
+      if (targetWorkspace.isTiled) {
+        targetWorkspace.panToWindow(window);
+      }
+      window.focus();
+      this.applyWorkspaceStackPolicy(fromWorkspace);
+      this.applyWorkspaceStackPolicy(targetWorkspace);
+      this.syncWorkspaceVisibility();
+    });
+  }
+
   public closeFocusedWindow() {
     for (const workspace of this.workspaces.values()) {
       const focused = workspace.focusedWindow();
@@ -2905,6 +2964,58 @@ export class Workspace {
     return this.windows.find((window) => window.id === windowId);
   }
 
+  public moveFocusedTile(direction: -1 | 1): boolean {
+    if (!this.isTiled) {
+      return false;
+    }
+
+    const focused = this.focusedWindow();
+    if (!focused || !this.shouldTile(focused)) {
+      return false;
+    }
+
+    const tileable = this.tileableWindows();
+    const currentIndex = tileable.findIndex(
+      (window) => window.id === focused.id,
+    );
+    if (currentIndex < 0) {
+      return false;
+    }
+
+    const nextIndex = currentIndex + direction;
+    if (nextIndex < 0 || nextIndex >= tileable.length) {
+      return false;
+    }
+
+    this.stopKineticScroll();
+    this.activeWindowId = focused.id;
+    this.moveTileWindowToIndex(focused, nextIndex);
+    this.scrollToWindow(focused);
+    this.applyLayout();
+    focused.focus();
+    return true;
+  }
+
+  public takeWindowForMove(
+    window: WaylandWindow,
+  ): { window: WaylandWindow; snapshot: WorkspaceWindowSnapshot } | null {
+    if (!this.hasWindow(window)) {
+      return null;
+    }
+
+    const snapshot = this.snapshotWindow(window);
+    this.removeWindow(window);
+    return { window, snapshot };
+  }
+
+  public addMovedWindow(
+    window: WaylandWindow,
+    snapshot: WorkspaceWindowSnapshot,
+  ): boolean {
+    this.restoredWindowStateById.set(window.id, snapshot);
+    return this.addWindow(window);
+  }
+
   public isRestoringWindow(windowId: string): boolean {
     return this.restoredWindowStateById.has(windowId);
   }
@@ -3586,16 +3697,7 @@ export class Workspace {
       isTiled: this.isTiled,
       activeWindowId: this.activeWindowId,
       scrollOffset: this.scrollOffset,
-      windows: this.windows.map((window) => ({
-        id: window.id,
-        tileWidth: this.tileWidthByWindowId.get(window.id),
-        floatingRect: window.state[WINDOW_STATE_FLOATING_RECT](),
-        restoreRect: window.state[WINDOW_STATE_RESTORE_RECT](),
-        snapZone: window.state[WINDOW_STATE_SNAP_ZONE](),
-        snapMonitor: window.state[WINDOW_STATE_SNAP_MONITOR](),
-        minimized: window.state[WINDOW_STATE_MINIMIZED](),
-        maximized: window.state[WINDOW_STATE_MAXIMIZED](),
-      })),
+      windows: this.windows.map((window) => this.snapshotWindow(window)),
     };
   }
 
@@ -3623,6 +3725,19 @@ export class Workspace {
 
   public getWindows(): WaylandWindow[] {
     return Array.from(this.windows);
+  }
+
+  private snapshotWindow(window: WaylandWindow): WorkspaceWindowSnapshot {
+    return {
+      id: window.id,
+      tileWidth: this.tileWidthByWindowId.get(window.id),
+      floatingRect: window.state[WINDOW_STATE_FLOATING_RECT](),
+      restoreRect: window.state[WINDOW_STATE_RESTORE_RECT](),
+      snapZone: window.state[WINDOW_STATE_SNAP_ZONE](),
+      snapMonitor: window.state[WINDOW_STATE_SNAP_MONITOR](),
+      minimized: window.state[WINDOW_STATE_MINIMIZED](),
+      maximized: window.state[WINDOW_STATE_MAXIMIZED](),
+    };
   }
 
   private syncWindowVisibleOutputs(window: WaylandWindow) {

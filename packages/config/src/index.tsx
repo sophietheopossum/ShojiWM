@@ -307,6 +307,22 @@ WINDOW_MANAGER.key.bind("tile-focus-left", "Super+Ctrl+Left", () => {
 WINDOW_MANAGER.key.bind("tile-focus-right", "Super+Ctrl+Right", () => {
   HYBRID_WINDOW_MANAGER.focusTile(1);
 });
+WINDOW_MANAGER.key.bind("tile-move-left", "Super+Shift+Left", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedTile(-1);
+  scheduleWorkspaceBroadcast();
+});
+WINDOW_MANAGER.key.bind("tile-move-right", "Super+Shift+Right", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedTile(1);
+  scheduleWorkspaceBroadcast();
+});
+WINDOW_MANAGER.key.bind("window-move-workspace-prev", "Super+Shift+Up", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(-1);
+  scheduleWorkspaceBroadcast();
+});
+WINDOW_MANAGER.key.bind("window-move-workspace-next", "Super+Shift+Down", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(1);
+  scheduleWorkspaceBroadcast();
+});
 WINDOW_MANAGER.key.bind("workspace-prev", "Super+Ctrl+Up", () => {
   HYBRID_WINDOW_MANAGER.switchWorkspace(-1);
   scheduleWorkspaceBroadcast();
