@@ -26,6 +26,7 @@ use super::{
     WireWindowEffectConfig, decode_tree_json,
 };
 use crate::{
+    activation_environment::{RuntimeEnvUpdates, apply_runtime_env_updates},
     config::RuntimeDisplayConfigUpdate,
     runtime_debug::RuntimeDebugConfigUpdate,
     runtime_input::{RuntimeInputConfigUpdate, RuntimeInputDeviceSnapshot},
@@ -699,6 +700,10 @@ enum RuntimeTransportKind {
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum RuntimeRequest<'a> {
+    DrainPreload {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+    },
     Evaluate {
         #[serde(rename = "requestId")]
         request_id: u64,
@@ -989,6 +994,15 @@ struct RuntimeEvaluateResponse {
     process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
     process_actions: Option<Vec<RuntimeProcessAction>>,
+    error: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeDrainPreloadResponse {
+    #[serde(rename = "requestId")]
+    request_id: u64,
+    kind: String,
+    ok: bool,
     error: Option<String>,
 }
 
@@ -1531,7 +1545,52 @@ impl NodeDecorationEvaluator {
         let mut runtime_guard = self.runtime.lock().map_err(|_| {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
-        let _ = self.ensure_runtime(&mut runtime_guard)?;
+        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        let request_id = runtime.next_request_id;
+        runtime.next_request_id += 1;
+        let request = serde_json::to_string(&RuntimeRequest::DrainPreload { request_id })
+            .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
+        runtime.write_request(&request)?;
+
+        let response: RuntimeDrainPreloadResponse =
+            if let Some(response) = runtime.read_response()? {
+                response
+            } else {
+                let status = runtime
+                    .child
+                    .try_wait()?
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let stderr = runtime
+                    .stderr_log
+                    .lock()
+                    .map(|stderr| stderr.clone())
+                    .unwrap_or_default();
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            };
+        if response.request_id != request_id {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response id: expected {request_id}, got {}",
+                response.request_id
+            )));
+        }
+        if !response.ok {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                response
+                    .error
+                    .unwrap_or_else(|| "runtime returned failure".into()),
+            ));
+        }
+        if response.kind != "drainPreload" {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response kind for drainPreload: {}",
+                response.kind
+            )));
+        }
         Ok(())
     }
 
@@ -2230,7 +2289,25 @@ impl NodeDecorationRuntime {
         let Some(payload) = payload else {
             return Ok(None);
         };
-        serde_json::from_slice(&payload).map(Some).map_err(|error| {
+        let value: serde_json::Value = serde_json::from_slice(&payload).map_err(|error| {
+            DecorationEvaluationError::InvalidResponse(format!(
+                "{error}; payload={}",
+                String::from_utf8_lossy(&payload)
+            ))
+        })?;
+
+        if let Some(env_updates) = value.get("envUpdates") {
+            let env_updates: RuntimeEnvUpdates =
+                serde_json::from_value(env_updates.clone()).map_err(|error| {
+                    DecorationEvaluationError::InvalidResponse(format!(
+                        "invalid envUpdates: {error}; payload={}",
+                        String::from_utf8_lossy(&payload)
+                    ))
+                })?;
+            apply_runtime_env_updates(env_updates, "typescript-runtime");
+        }
+
+        serde_json::from_value(value).map(Some).map_err(|error| {
             DecorationEvaluationError::InvalidResponse(format!(
                 "{error}; payload={}",
                 String::from_utf8_lossy(&payload)

@@ -33,6 +33,7 @@ import {
   commitPointerConfigRegistration,
   commitProcessConfigRegistration,
   drainPendingProcessActions,
+  drainPendingEnvUpdates,
   hasActiveAnimations,
   type CompiledEffectHandle,
   type LayerEffectAssignment,
@@ -207,6 +208,11 @@ interface EvaluateRequest {
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
   inputState?: Record<string, InputDeviceInfo>;
+}
+
+interface DrainPreloadRequest {
+  requestId: number;
+  kind: "drainPreload";
 }
 
 interface EvaluatePreviewRequest {
@@ -400,6 +406,7 @@ interface LifecycleDisableRequest {
 }
 
 type RuntimeRequest =
+  | DrainPreloadRequest
   | EvaluateRequest
   | EvaluatePreviewRequest
   | SchedulerTickRequest
@@ -449,6 +456,12 @@ interface EvaluateSuccess {
   eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
+}
+
+interface DrainPreloadSuccess {
+  requestId: number;
+  ok: true;
+  kind: "drainPreload";
 }
 
 interface SchedulerTickSuccess {
@@ -1096,13 +1109,19 @@ async function main() {
     }
 
     try {
-      updateOutputState(request.displayState);
-      updateInputState(request.inputState);
+      if ("displayState" in request) {
+        updateOutputState(request.displayState);
+      }
+      if ("inputState" in request) {
+        updateInputState(request.inputState);
+      }
       if (hasRuntimeTimestamp(request)) {
         beginRuntimeTurn(request.nowMs);
       }
       if (statsEnabled) {
         switch (request.kind) {
+          case "drainPreload":
+            break;
           case "evaluate":
           case "evaluatePreview":
             stats.evaluate++;
@@ -1156,7 +1175,13 @@ async function main() {
             break;
         }
       }
-      if (request.kind === "lifecycleEnable") {
+      if (request.kind === "drainPreload") {
+        await writeResponse(output, {
+          requestId: request.requestId,
+          ok: true,
+          kind: "drainPreload",
+        });
+      } else if (request.kind === "lifecycleEnable") {
         applyRuntimeEnvironment(request.environment);
         const runtimeConfig = await loadRuntimeConfig();
         debugHotReload("lifecycle-enable-before-emit", {
@@ -3366,9 +3391,12 @@ function writeResponse(
     | EvaluatePopupEffectsSuccess
     | LifecycleEnableSuccess
     | LifecycleDisableSuccess
+    | DrainPreloadSuccess
     | RuntimeFailure,
 ): Promise<void> {
-  const payload = Buffer.from(JSON.stringify(response), "utf8");
+  const envUpdates = drainPendingEnvUpdates();
+  const responseWithEnv = envUpdates ? { ...response, envUpdates } : response;
+  const payload = Buffer.from(JSON.stringify(responseWithEnv), "utf8");
   if (payload.length > 0xffff_ffff) {
     throw new Error("runtime response too large");
   }

@@ -729,7 +729,26 @@ export interface LayerController {
   reservedInsets(outputName: string, options?: UsableAreaOptions): LayerInsets;
 }
 
-export type ProcessEnv = Record<string, string>;
+export type EnvValue = string | number | boolean;
+export type ProcessEnv = Record<string, EnvValue>;
+
+export interface EnvUpdateOperation {
+  key: string;
+  value?: string;
+}
+
+export interface EnvUpdatePayload {
+  operations: EnvUpdateOperation[];
+  publish: string[];
+}
+
+export interface EnvController {
+  set(key: string, value: EnvValue): void;
+  unset(key: string): void;
+  get(key: string): string | undefined;
+  apply(values: Record<string, EnvValue | null | undefined>): void;
+  publish(keys?: Iterable<string>): void;
+}
 
 /**
  * How a process is launched.
@@ -1058,6 +1077,7 @@ export interface WindowManagerDefinition {
   effect: WindowManagerEffectConfig;
   output: OutputController;
   input: InputController;
+  env: EnvController;
   process: ProcessController;
   key: KeyBindingController;
   pointer: PointerController;

@@ -43,6 +43,9 @@ import {
   WINDOW_STATE_WORKSPACE_OPACITY,
 } from "./window-manager";
 
+WINDOW_MANAGER.env.set("QT_QPA_PLATFORM", "wayland;xcb");
+WINDOW_MANAGER.env.set("QT_QPA_PLATFORMTHEME", "qt6ct");
+
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
 const HOT_RELOAD_WINDOW_MANAGER_STATE = "config.hybrid-window-manager";
 
@@ -214,10 +217,20 @@ WINDOW_MANAGER.onDisable(() => {
   WORKSPACE_IPC.close();
 });
 
+
+// enable fcitx5
+WINDOW_MANAGER.env.apply({
+  QT_IM_MODULE: "fcitx",
+  XMODIFIERS: "@im=fcitx",
+  SDL_IM_MODULE: "fcitx",
+  GLFW_IM_MODULE: "ibus",
+})
 WINDOW_MANAGER.process.once("fcitx5", {
   command: "fcitx5 -d",
   runPolicy: "once-per-session",
 });
+
+
 WINDOW_MANAGER.process.once("shell", {
   command: "cd ~/.config/shoji-bar-2 && ags run app.tsx",
   runPolicy: "once-per-session",
@@ -236,6 +249,13 @@ WINDOW_MANAGER.process.service("cliphist-image", {
 WINDOW_MANAGER.key.bind("terminal", "Super+T", () => {
   WINDOW_MANAGER.process.spawn({ command: ["kitty"] });
 });
+
+WINDOW_MANAGER.key.bind("chrome", "Super+B", () => {
+  WINDOW_MANAGER.process.spawn({
+    command: "google-chrome-stable --enable-features=OzonePlatform --ozone-platform=wayland"
+  });
+});
+
 // Resolve the monitor under the cursor and toggle shoji-bar-2's StartMenu via ags request.
 function toggleStartMenu() {
   const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();

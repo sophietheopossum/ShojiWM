@@ -59,6 +59,10 @@ import type {
   OutputPositionPreference,
   OutputResolutionPreference,
   OutputStateSnapshot,
+  EnvController,
+  EnvUpdateOperation,
+  EnvUpdatePayload,
+  EnvValue,
   InputAccelProfile,
   InputClickMethod,
   InputConfigDraft,
@@ -164,6 +168,7 @@ import {
 import { INPUT_CONTROLLER, installInputDeviceChangeEmitter } from "./input";
 import { OUTPUT_CONTROLLER, installOutputChangeEmitter } from "./output";
 import { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
+import { ENV_CONTROLLER, drainPendingEnvUpdates } from "./env";
 import { LAYER_CONTROLLER, updateLayerSnapshots } from "./layer";
 import {
   PROCESS_CONTROLLER,
@@ -310,6 +315,7 @@ export {
 } from "./output";
 export { LAYER_CONTROLLER, updateLayerSnapshots } from "./layer";
 export { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
+export { ENV_CONTROLLER, drainPendingEnvUpdates } from "./env";
 export {
   KEY_BINDING_CONTROLLER,
   beginKeyBindingRegistration,
@@ -483,6 +489,10 @@ export type {
   OutputPositionPreference,
   OutputResolutionPreference,
   OutputStateSnapshot,
+  EnvController,
+  EnvUpdateOperation,
+  EnvUpdatePayload,
+  EnvValue,
   ProcessController,
   ProcessEnv,
   ProcessLaunchSpec,
@@ -638,6 +648,7 @@ export const WINDOW_MANAGER: WindowManagerDefinition = {
     background_effect: null,
   },
   output: OUTPUT_CONTROLLER,
+  env: ENV_CONTROLLER,
   process: PROCESS_CONTROLLER,
   key: KEY_BINDING_CONTROLLER,
   pointer: POINTER_CONTROLLER,
