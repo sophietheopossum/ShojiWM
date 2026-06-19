@@ -3,7 +3,7 @@
 <p>A highly customizable Wayland compositor configured with TypeScript/TSX.</p>
 
 
-<video src="https://github.com/bea4dev/ShojiWM/raw/refs/heads/main/docs/static/video/example0.mp4" width="320" height="240" controls></video>
+<video src="https://github.com/user-attachments/assets/a6af022e-ff36-4fbd-9348-221d5e50d9b8" width="320" height="240" controls></video>
 </div>
 
 ## Features
