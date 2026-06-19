@@ -1452,6 +1452,26 @@ impl NodeDecorationEvaluator {
         }
     }
 
+    pub fn for_paths(
+        program: impl Into<PathBuf>,
+        script_path: impl Into<PathBuf>,
+        config_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            base_args: Vec::new(),
+            script_path: script_path.into(),
+            config_path: config_path.into(),
+            working_dir: None,
+            transport: RuntimeTransportKind::Uds,
+            runtime: Arc::new(Mutex::new(None)),
+            display_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            input_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
+            async_event_sender: Arc::new(Mutex::new(None)),
+        }
+    }
+
     pub fn with_working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
         self.working_dir = Some(working_dir.into());
         self

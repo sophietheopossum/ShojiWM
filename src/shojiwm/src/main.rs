@@ -20,6 +20,7 @@ pub mod foreign_toplevel;
 pub mod grabs;
 pub mod handlers;
 pub mod input;
+pub mod install_paths;
 pub mod presentation;
 pub mod protocols;
 pub mod runtime_debug;
@@ -46,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging(&args)?;
     install_panic_hook();
     apply_runtime_overrides(&args);
+    init_runtime_paths(&args);
     sanitize_inherited_compositor_environment();
 
     let backend = if args.tty {
@@ -166,6 +168,11 @@ struct CliArgs {
     xwayland_satellite_path: Option<String>,
     xwayland_satellite_glamor: Option<String>,
     decoration_runtime_node_args: Vec<String>,
+    dev: bool,
+    config_path: Option<PathBuf>,
+    runtime_dir: Option<PathBuf>,
+    tsx_program: Option<PathBuf>,
+    decoration_runtime: Option<PathBuf>,
 }
 
 impl CliArgs {
@@ -191,6 +198,11 @@ impl CliArgs {
         let xwayland_satellite = args.iter().any(|arg| arg == "--xwayland-satellite")
             || env_xwayland_satellite
             || xwayland_satellite_path.is_some();
+        let config_path = parse_option_value(&args, "--config").map(PathBuf::from);
+        let runtime_dir = parse_option_value(&args, "--runtime-dir").map(PathBuf::from);
+        let tsx_program = parse_option_value(&args, "--tsx").map(PathBuf::from);
+        let decoration_runtime =
+            parse_option_value(&args, "--decoration-runtime").map(PathBuf::from);
 
         Self {
             tty: args.iter().any(|arg| arg == "--tty"),
@@ -201,8 +213,23 @@ impl CliArgs {
             xwayland_satellite_path,
             xwayland_satellite_glamor,
             decoration_runtime_node_args,
+            dev: args.iter().any(|arg| arg == "--dev"),
+            config_path,
+            runtime_dir,
+            tsx_program,
+            decoration_runtime,
         }
     }
+}
+
+fn init_runtime_paths(args: &CliArgs) {
+    install_paths::init_runtime_path_options(install_paths::RuntimePathOptions {
+        dev: args.dev,
+        config_path: args.config_path.clone(),
+        runtime_dir: args.runtime_dir.clone(),
+        tsx_program: args.tsx_program.clone(),
+        decoration_runtime: args.decoration_runtime.clone(),
+    });
 }
 
 fn parse_tty_outputs(args: &[String]) -> Vec<String> {

@@ -52,7 +52,7 @@ echo ">> writing user portals.conf"
 mkdir -p "$HOME/.config/xdg-desktop-portal"
 cat > "$HOME/.config/xdg-desktop-portal/shojiwm-portals.conf" <<'EOF'
 [preferred]
-default=shojiwm
+default=gtk
 org.freedesktop.impl.portal.ScreenCast=shojiwm
 EOF
 
@@ -64,3 +64,6 @@ systemctl --user restart xdg-desktop-portal
 echo ""
 echo "done. tail logs with:"
 echo "  journalctl --user -fu xdg-desktop-portal-shojiwm -u xdg-desktop-portal"
+echo ""
+echo "note: this config routes only ScreenCast to shojiwm. Other portal"
+echo "interfaces use xdg-desktop-portal-gtk via default=gtk."

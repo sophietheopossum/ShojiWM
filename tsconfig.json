@@ -8,6 +8,7 @@
     "strict": true,
     "verbatimModuleSyntax": true,
     "noEmit": true,
+    "types": [],
     "baseUrl": ".",
     "paths": {
       "shoji_wm": [

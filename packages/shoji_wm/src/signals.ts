@@ -482,9 +482,10 @@ function createWritableSignalFacade<T>(
     value: 2,
     enumerable: false,
   });
-  facade[Symbol.iterator] = function* iterator(): IterableIterator<Signal<T> | SignalSetter<T>> {
-    yield facade;
-    yield set;
+  facade[Symbol.iterator] = function iterator(): ArrayIterator<
+    Signal<T> | SignalSetter<T>
+  > {
+    return [facade, set][Symbol.iterator]();
   };
 
   return facade;

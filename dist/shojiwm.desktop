@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=ShojiWM
+Comment=Start the ShojiWM Wayland compositor
+Exec=/usr/bin/shoji_wm --tty
+Type=Application
+DesktopNames=ShojiWM

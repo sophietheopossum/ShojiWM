@@ -665,25 +665,21 @@ impl ShojiWM {
 
         // Get the loop signal, used to stop the event loop
         let loop_signal = event_loop.get_signal();
-        let (decoration_evaluator, config_error_report) =
-            if std::path::Path::new("node_modules/.bin/tsx").exists() {
-                let evaluator =
-                    NodeDecorationEvaluator::for_workspace("packages/config/src/index.tsx")
-                        .with_working_dir(std::env::current_dir().unwrap_or_else(|_| ".".into()));
-                let config_error_report = match evaluator.preload() {
-                    Ok(()) => None,
-                    Err(error) => {
-                        warn!(?error, "failed to preload TypeScript config");
-                        Some(crate::config_error::ConfigErrorReport::initial_load(error))
-                    }
-                };
-                (
-                    DecorationRuntimeEvaluator::Node(evaluator),
-                    config_error_report,
-                )
-            } else {
-                (DecorationRuntimeEvaluator::Static(Default::default()), None)
-            };
+        let runtime_paths = crate::install_paths::decoration_runtime_paths();
+        let evaluator = NodeDecorationEvaluator::for_paths(
+            runtime_paths.tsx_program,
+            runtime_paths.script_path,
+            runtime_paths.config_path,
+        )
+        .with_working_dir(runtime_paths.working_dir);
+        let config_error_report = match evaluator.preload() {
+            Ok(()) => None,
+            Err(error) => {
+                warn!(?error, "failed to preload TypeScript config");
+                Some(crate::config_error::ConfigErrorReport::initial_load(error))
+            }
+        };
+        let decoration_evaluator = DecorationRuntimeEvaluator::Node(evaluator);
         let (runtime_async_event_tx, runtime_async_event_rx) = channel();
         decoration_evaluator.set_async_event_sender(runtime_async_event_tx);
         let runtime_async_loop_handle = event_loop.handle();
