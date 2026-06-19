@@ -2,7 +2,8 @@
 <h2>ShojiWM (WIP)</h2>
 <p>A highly customizable Wayland compositor configured with TypeScript/TSX.</p>
 
-<video src="docs/static/video/example0.mp4" controls muted></video>
+
+<video src="https://github.com/bea4dev/ShojiWM/raw/refs/heads/main/docs/static/video/example0.mp4" width="320" height="240" controls></video>
 </div>
 
 ## Features
