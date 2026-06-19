@@ -1,0 +1,22 @@
+{
+  "link.title.Docs": {
+    "message": "ドキュメント",
+    "description": "The title of the footer links column with title=Docs in the footer"
+  },
+  "link.title.More": {
+    "message": "その他",
+    "description": "The title of the footer links column with title=More in the footer"
+  },
+  "link.item.label.Introduction": {
+    "message": "はじめに",
+    "description": "The label of footer link with label=Introduction linking to /docs/intro"
+  },
+  "link.item.label.GitHub": {
+    "message": "GitHub",
+    "description": "The label of footer link with label=GitHub linking to https://github.com/bea4dev/ShojiWM"
+  },
+  "copyright": {
+    "message": "MIT License.<br/>コードはご自由にどうぞ、そして良いものを作ってください。<br/>Copyright © 2026 ShojiWM contributors.",
+    "description": "The footer copyright"
+  }
+}

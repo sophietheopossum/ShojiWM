@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="_レイヤー_1" data-name="レイヤー_1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192.31">
+  <defs>
+    <style>
+      /* Light color scheme (default) — matches Shoji_WM-light.svg */
+      .cls-1 { fill: #e5e5e5; }
+      .cls-2 { fill: #000; }
+
+      /* Dark color scheme — matches Shoji_WM-dark.svg */
+      @media (prefers-color-scheme: dark) {
+        .cls-1 { fill: #333; }
+        .cls-2 { fill: #fff; }
+      }
+    </style>
+  </defs>
+  <g>
+    <rect class="cls-1" y=".31" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-1" x="157.47" y="157.79" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-1" x="39.42" y="39.74" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-1" x="78.84" y="39.74" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-1" x="118.26" y="39.74" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-1" x="157.69" y="39.74" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-1" y="79.16" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-1" x="157.69" y="79.16" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-1" x="0" y="118.58" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-1" x="39.42" y="118.58" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-1" x="78.84" y="118.58" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-1" x="118.26" y="118.58" width="34.31" height="34.31" rx="6" ry="6"/>
+  </g>
+  <g>
+    <path class="cls-2" d="M34.31,186.31c0,3.3-2.7,6-6,6h-5.33c-12.69,0-22.98-10.29-22.98-22.98v-5.33c0-3.3,2.7-6,6-6h22.31c3.3,0,6,2.7,6,6v22.31Z"/>
+    <path class="cls-2" d="M157,6c0-3.3,2.7-6,6-6h5.33c12.69,0,22.98,10.29,22.98,22.98v5.33c0,3.3-2.7,6-6,6h-22.31c-3.3,0-6-2.7-6-6V6Z"/>
+    <rect class="cls-2" x="39.42" y=".31" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-2" x="78.84" y=".31" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-2" x="118.26" y=".31" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-2" x="0" y="39.74" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-2" x="39.42" y="79.16" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-2" x="78.84" y="79.16" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-2" x="118.26" y="79.16" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-2" x="157.69" y="118.58" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-2" x="39.42" y="158" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-2" x="78.84" y="158" width="34.31" height="34.31" rx="6" ry="6"/>
+    <rect class="cls-2" x="118.26" y="158" width="34.31" height="34.31" rx="6" ry="6"/>
+  </g>
+</svg>

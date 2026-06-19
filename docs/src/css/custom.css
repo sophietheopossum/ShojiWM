@@ -1,0 +1,43 @@
+/**
+ * Any CSS included here will be global. The classic template
+ * bundles Infima by default. Infima is a CSS framework designed to
+ * work well for content-centric websites.
+ *
+ * Simple, flat theme: a single restrained accent color, system fonts,
+ * and no gradients.
+ */
+
+:root {
+  --ifm-color-primary: #3b4252;
+  --ifm-color-primary-dark: #353a48;
+  --ifm-color-primary-darker: #323744;
+  --ifm-color-primary-darkest: #292d38;
+  --ifm-color-primary-light: #41475c;
+  --ifm-color-primary-lighter: #444a60;
+  --ifm-color-primary-lightest: #4d5470;
+
+  --ifm-code-font-size: 95%;
+  --ifm-font-family-base: system-ui, -apple-system, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, 'Noto Sans JP', sans-serif;
+  --ifm-navbar-shadow: none;
+  --ifm-global-radius: 6px;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.08);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #d8dee9;
+  --ifm-color-primary-dark: #c4cdde;
+  --ifm-color-primary-darker: #bac4d8;
+  --ifm-color-primary-darkest: #9aa8c6;
+  --ifm-color-primary-light: #eceff4;
+  --ifm-color-primary-lighter: #f5f7fa;
+  --ifm-color-primary-lightest: #ffffff;
+
+  --ifm-background-color: #1f2229;
+  --docusaurus-highlighted-code-line-bg: rgba(255, 255, 255, 0.1);
+}
+
+/* Flatten the navbar so there is no drop shadow. */
+.navbar {
+  border-bottom: 1px solid var(--ifm-toc-border-color);
+}
