@@ -82,6 +82,7 @@ impl ShojiWM {
     }
 
     fn notify_idle_activity(&mut self) {
+        self.refresh_idle_inhibit_state();
         let seat = self.seat.clone();
         self.idle_notifier_state.notify_activity(&seat);
     }

@@ -54,6 +54,7 @@ use smithay::{
         fifo::FifoManagerState,
         fixes::FixesState,
         fractional_scale::FractionalScaleManagerState,
+        idle_inhibit::IdleInhibitManagerState,
         idle_notify::IdleNotifierState,
         input_method::InputMethodManagerState,
         output::OutputManagerState,
@@ -261,6 +262,9 @@ pub struct ShojiWM {
         smithay::wayland::image_capture_source::ToplevelCaptureSourceState,
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
     pub idle_notifier_state: IdleNotifierState<ShojiWM>,
+    pub idle_inhibit_manager_state: IdleInhibitManagerState,
+    pub idle_inhibited_surfaces: Vec<WlSurface>,
+    pub active_idle_inhibit_labels: Vec<String>,
     pub session_lock_state: SessionLockManagerState,
     pub session_lock_active: bool,
     pub session_lock_surfaces: HashMap<String, LockSurface>,
@@ -505,6 +509,90 @@ impl ShojiWM {
             root = parent;
         }
         self.is_session_lock_surface(&root)
+    }
+
+    pub fn refresh_idle_inhibit_state(&mut self) {
+        let mut live_surfaces = Vec::with_capacity(self.idle_inhibited_surfaces.len());
+        let mut active_labels = BTreeSet::new();
+        for surface in self.idle_inhibited_surfaces.iter() {
+            if !surface.alive() {
+                continue;
+            }
+            if let Some(label) = self.idle_inhibit_surface_visible_label(surface) {
+                active_labels.insert(label);
+            }
+            live_surfaces.push(surface.clone());
+        }
+        let active_labels = active_labels.into_iter().collect::<Vec<_>>();
+        let was_inhibited = !self.active_idle_inhibit_labels.is_empty();
+        let inhibited = !active_labels.is_empty();
+        if inhibited && !was_inhibited {
+            info!(
+                apps = ?active_labels,
+                "idle inhibition started"
+            );
+        } else if !inhibited && was_inhibited {
+            info!(
+                apps = ?self.active_idle_inhibit_labels,
+                "idle inhibition stopped"
+            );
+        }
+        self.idle_inhibited_surfaces = live_surfaces;
+        self.active_idle_inhibit_labels = active_labels;
+        self.idle_notifier_state.set_is_inhibited(inhibited);
+    }
+
+    fn idle_inhibit_surface_root(&self, surface: &WlSurface) -> WlSurface {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        root
+    }
+
+    fn idle_inhibit_surface_visible_label(&self, surface: &WlSurface) -> Option<String> {
+        let root = self.idle_inhibit_surface_root(surface);
+        if let Some(label) = self.space.elements().find_map(|window| {
+            let owns_root = window
+                .toplevel()
+                .is_some_and(|toplevel| toplevel.wl_surface() == &root)
+                || window
+                    .x11_surface()
+                    .and_then(|x11| x11.wl_surface())
+                    .as_ref()
+                    == Some(&root);
+            if !(owns_root && self.window_allows_render(window)) {
+                return None;
+            }
+            let snapshot = self.snapshot_window(window);
+            snapshot
+                .app_id
+                .filter(|app_id| !app_id.is_empty())
+                .or_else(|| (!snapshot.title.is_empty()).then_some(snapshot.title))
+        }) {
+            return Some(label);
+        }
+
+        if let Some(label) = self.space.outputs().find_map(|output| {
+            let layers = layer_map_for_output(output);
+            let layer = layers.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)?;
+            if !layer.alive()
+                || !crate::backend::window::layer_surface_is_mapped(layer)
+                || layers.layer_geometry(layer).is_none()
+            {
+                return None;
+            }
+            let namespace = layer.namespace();
+            Some(if namespace.is_empty() {
+                "layer-shell".to_string()
+            } else {
+                namespace.to_string()
+            })
+        }) {
+            return Some(label);
+        }
+
+        None
     }
 
     pub fn output_for_lock_resource(
@@ -764,6 +852,7 @@ impl ShojiWM {
         let image_copy_capture_state =
             smithay::wayland::image_copy_capture::ImageCopyCaptureState::new::<Self>(&dh);
         let idle_notifier_state = IdleNotifierState::new(&dh, event_loop.handle());
+        let idle_inhibit_manager_state = IdleInhibitManagerState::new::<Self>(&dh);
         let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let fixes_state = FixesState::new::<Self>(&dh);
@@ -939,6 +1028,9 @@ impl ShojiWM {
             toplevel_capture_source_state,
             image_copy_capture_state,
             idle_notifier_state,
+            idle_inhibit_manager_state,
+            idle_inhibited_surfaces: Vec::new(),
+            active_idle_inhibit_labels: Vec::new(),
             session_lock_state,
             session_lock_active: false,
             session_lock_surfaces: HashMap::new(),

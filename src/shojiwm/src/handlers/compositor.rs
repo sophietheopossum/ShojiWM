@@ -403,9 +403,17 @@ impl CompositorHandler for ShojiWM {
         layer_shell::handle_commit(self, surface);
         resize_grab::handle_commit(&mut self.space, surface);
 
+        if !self.idle_inhibited_surfaces.is_empty() {
+            self.refresh_idle_inhibit_state();
+        }
+
         if cursor_surface_committed || self.is_session_lock_surface_tree_surface(surface) {
             self.schedule_redraw();
         }
+    }
+
+    fn destroyed(&mut self, _surface: &WlSurface) {
+        self.refresh_idle_inhibit_state();
     }
 }
 

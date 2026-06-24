@@ -27,8 +27,9 @@ use smithay::wayland::pointer_constraints::{
 use smithay::wayland::background_effect::{Capability, ExtBackgroundEffectHandler};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, ImportNotifier};
 use smithay::wayland::fractional_scale::{with_fractional_scale, FractionalScaleHandler};
-use smithay::wayland::input_method::{InputMethodHandler, PopupSurface};
+use smithay::wayland::idle_inhibit::IdleInhibitHandler;
 use smithay::wayland::idle_notify::{IdleNotifierHandler, IdleNotifierState};
+use smithay::wayland::input_method::{InputMethodHandler, PopupSurface};
 use smithay::wayland::shell::kde::decoration::KdeDecorationHandler;
 use smithay::wayland::selection::data_device::{
     set_data_device_focus, DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
@@ -167,6 +168,24 @@ impl ForeignToplevelListHandler for ShojiWM {
 impl IdleNotifierHandler for ShojiWM {
     fn idle_notifier_state(&mut self) -> &mut IdleNotifierState<Self> {
         &mut self.idle_notifier_state
+    }
+}
+
+impl IdleInhibitHandler for ShojiWM {
+    fn inhibit(&mut self, surface: WlSurface) {
+        self.idle_inhibited_surfaces.push(surface);
+        self.refresh_idle_inhibit_state();
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        if let Some(index) = self
+            .idle_inhibited_surfaces
+            .iter()
+            .position(|inhibited| inhibited == &surface)
+        {
+            self.idle_inhibited_surfaces.remove(index);
+        }
+        self.refresh_idle_inhibit_state();
     }
 }
 
