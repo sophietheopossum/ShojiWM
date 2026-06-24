@@ -19,6 +19,7 @@ use smithay::{
     utils::{Logical, Physical, Point, Rectangle, Scale},
     wayland::{
         compositor::{RectangleKind, RegionAttributes, with_states},
+        session_lock::LockSurface,
         shell::wlr_layer::Layer as WlrLayer,
         shell::xdg::XdgToplevelSurfaceData,
     },
@@ -272,6 +273,26 @@ where
             )
         })
         .collect()
+}
+
+pub fn lock_surface_elements<R>(
+    renderer: &mut R,
+    lock_surface: &LockSurface,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Vec<WaylandSurfaceRenderElement<R>>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    render_elements_from_surface_tree(
+        renderer,
+        lock_surface.wl_surface(),
+        Point::<i32, Logical>::from((0, 0)).to_physical_precise_round(scale),
+        scale,
+        alpha,
+        Kind::Unspecified,
+    )
 }
 
 /// Render elements of a layer surface's own surface tree, *excluding* its

@@ -14,7 +14,8 @@ use smithay::{
         utils::{
             OutputPresentationFeedback, send_frames_surface_tree,
             surface_presentation_feedback_flags_from_states, surface_primary_scanout_output,
-            update_surface_primary_scanout_output, with_surfaces_surface_tree,
+            take_presentation_feedback_surface_tree, update_surface_primary_scanout_output,
+            with_surfaces_surface_tree,
         },
     },
     output::Output,
@@ -22,10 +23,11 @@ use smithay::{
     utils::{Monotonic, Time},
     wayland::{
         commit_timing::CommitTimerBarrierStateUserData,
-        compositor::{CompositorHandler, SurfaceAttributes},
+        compositor::{CompositorHandler, SurfaceAttributes, SurfaceData},
         fifo::FifoBarrierCachedState,
         fractional_scale::with_fractional_scale,
         presentation::PresentationFeedbackCachedState,
+        session_lock::LockSurface,
     },
 };
 use tracing::info;
@@ -233,6 +235,7 @@ pub fn update_primary_scanout_output(
     space: &Space<Window>,
     output: &Output,
     cursor_status: &smithay::input::pointer::CursorImageStatus,
+    session_lock_surface: Option<&LockSurface>,
     render_element_states: &RenderElementStates,
     window_decorations: &HashMap<Window, crate::ssd::WindowDecorationState>,
 ) {
@@ -313,6 +316,19 @@ pub fn update_primary_scanout_output(
         });
     }
 
+    if let Some(lock_surface) = session_lock_surface {
+        with_surfaces_surface_tree(lock_surface.wl_surface(), |surface, states| {
+            update_surface_primary_scanout_output(
+                surface,
+                output,
+                states,
+                None,
+                render_element_states,
+                area_primary_scanout_compare,
+            );
+        });
+    }
+
     if let smithay::input::pointer::CursorImageStatus::Surface(surface) = cursor_status {
         with_surfaces_surface_tree(surface, |surface, states| {
             update_surface_primary_scanout_output(
@@ -330,6 +346,7 @@ pub fn update_primary_scanout_output(
 pub fn take_presentation_feedback(
     output: &Output,
     space: &Space<Window>,
+    session_lock_surface: Option<&LockSurface>,
     render_element_states: &RenderElementStates,
 ) -> OutputPresentationFeedback {
     let mut output_presentation_feedback = OutputPresentationFeedback::new(output);
@@ -365,10 +382,39 @@ pub fn take_presentation_feedback(
         );
     }
 
+    if let Some(lock_surface) = session_lock_surface {
+        take_presentation_feedback_surface_tree(
+            lock_surface.wl_surface(),
+            &mut output_presentation_feedback,
+            surface_primary_scanout_output,
+            |surface, _| {
+                surface_presentation_feedback_flags_from_states(
+                    surface,
+                    None,
+                    render_element_states,
+                )
+            },
+        );
+    }
+
     output_presentation_feedback
 }
 
 impl ShojiWM {
+    fn with_session_lock_surfaces_for_output<F>(&self, output: &Output, mut f: F)
+    where
+        F: FnMut(
+            &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+            &SurfaceData,
+        ),
+    {
+        if let Some(lock_surface) = self.session_lock_surface_for_output(output) {
+            with_surfaces_surface_tree(lock_surface.wl_surface(), |surface, states| {
+                f(surface, states);
+            });
+        }
+    }
+
     fn window_frame_processing_applies_to_output(&self, window: &Window, output: &Output) -> bool {
         if !self.window_allows_render(window) {
             return false;
@@ -489,6 +535,16 @@ impl ShojiWM {
         }
         drop(map);
 
+        if let Some(lock_surface) = self.session_lock_surface_for_output(output) {
+            send_frames_surface_tree(
+                lock_surface.wl_surface(),
+                output,
+                time,
+                throttle,
+                &should_send,
+            );
+        }
+
         if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &self.cursor_status {
             send_frames_surface_tree(surface, output, time, throttle, &should_send);
         }
@@ -573,6 +629,16 @@ impl ShojiWM {
             layer_surface.send_frame(output, time, throttle, &should_send);
         }
         drop(map);
+
+        if let Some(lock_surface) = self.session_lock_surface_for_output(output) {
+            send_frames_surface_tree(
+                lock_surface.wl_surface(),
+                output,
+                time,
+                throttle,
+                &should_send,
+            );
+        }
 
         // Cursor surfaces (e.g. Xwayland cursor surfaces forwarded by xwayland-satellite)
         // also need frame callbacks so the client can commit subsequent cursor buffers — without
@@ -734,6 +800,26 @@ impl ShojiWM {
         }
         drop(map);
 
+        self.with_session_lock_surfaces_for_output(output, |_, states| {
+            let deadline = states
+                .data_map
+                .get::<CommitTimerBarrierStateUserData>()
+                .and_then(|commit_timer| {
+                    let commit_timer_state = commit_timer.lock().unwrap();
+                    commit_timer_state.next_deadline()
+                })
+                .map(|deadline| {
+                    let deadline: Time<Monotonic> = deadline.into();
+                    Duration::from(deadline)
+                });
+            if let Some(deadline) = deadline {
+                next_deadline = Some(match next_deadline {
+                    Some(current) => current.min(deadline),
+                    None => deadline,
+                });
+            }
+        });
+
         next_deadline
     }
 
@@ -856,6 +942,41 @@ impl ShojiWM {
         }
 
         drop(map);
+
+        self.with_session_lock_surfaces_for_output(output, |surface, states| {
+            let primary_scanout_output = surface_primary_scanout_output(surface, states);
+            if let Some(output) = primary_scanout_output.as_ref() {
+                let scale = output.current_scale().fractional_scale();
+                with_fractional_scale(states, |fractional_scale| {
+                    if debug_scale {
+                        let protocol_id = surface.id().protocol_id();
+                        let prev = previous_preferred_scale(protocol_id, scale);
+                        if prev != Some(scale) {
+                            info!(
+                                surface = ?surface.id(),
+                                output = %output.name(),
+                                prev_scale = ?prev,
+                                new_scale = scale,
+                                "preferred scale changed for session lock surface"
+                            );
+                        }
+                    }
+                    fractional_scale.set_preferred_scale(scale);
+                });
+            }
+            let fifo_barrier = states
+                .cached_state
+                .get::<FifoBarrierCachedState>()
+                .current()
+                .barrier
+                .take();
+            if let Some(fifo_barrier) = fifo_barrier {
+                fifo_barrier.signal();
+                if let Some(client) = surface.client() {
+                    clients.insert(client.id(), client);
+                }
+            }
+        });
 
         // Update fractional scale on cursor surfaces too. This matters for Xwayland-via-
         // satellite, which sizes its cursor buffers based on the preferred scale; without

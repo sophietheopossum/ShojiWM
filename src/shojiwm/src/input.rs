@@ -72,6 +72,79 @@ fn stack_hit_debug_enabled() -> bool {
 }
 
 impl ShojiWM {
+    fn forward_locked_keyboard_event<I: InputBackend>(
+        &mut self,
+        event: &I::KeyboardKeyEvent,
+        serial: Serial,
+    ) {
+        let _ = self.seat.get_keyboard().unwrap().input(
+            self,
+            event.key_code(),
+            event.state(),
+            serial,
+            Event::time_msec(event),
+            |data, modifiers, _handle| {
+                data.current_keyboard_modifiers = modifiers.clone();
+                FilterResult::<KeyboardAction>::Forward
+            },
+        );
+        let _ = self.display_handle.flush_clients();
+    }
+
+    fn forward_locked_pointer_motion(
+        &mut self,
+        pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+        serial: Serial,
+        time: u32,
+    ) {
+        let pointer = self.seat.get_pointer().unwrap();
+        self.pointer_contents = self.pointer_contents_at(pos);
+        pointer.motion(
+            self,
+            self.pointer_contents.surface.clone(),
+            &MotionEvent {
+                location: pos,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+        self.schedule_redraw();
+    }
+
+    fn forward_locked_pointer_button(
+        &mut self,
+        button: u32,
+        state: ButtonState,
+        serial: Serial,
+        time: u32,
+    ) {
+        let pointer = self.seat.get_pointer().unwrap();
+        self.pointer_contents = self.pointer_contents_at(pointer.current_location());
+        pointer.motion(
+            self,
+            self.pointer_contents.surface.clone(),
+            &MotionEvent {
+                location: pointer.current_location(),
+                serial,
+                time,
+            },
+        );
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button,
+                state,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+        self.focus_session_lock_surface(serial);
+        let _ = self.display_handle.flush_clients();
+        self.schedule_redraw();
+    }
+
     /// Invoke a runtime key binding handler by id and apply the resulting
     /// runtime config/state changes. Shared by the normal (intercepted) key
     /// path and the modifier-tap (forwarded) path.
@@ -200,6 +273,10 @@ impl ShojiWM {
                 let device = event.device();
                 crate::runtime_input::apply_keyboard_config_for_backend_device(self, &device);
                 let serial = SERIAL_COUNTER.next_serial();
+                if self.session_lock_active {
+                    self.forward_locked_keyboard_event::<I>(&event, serial);
+                    return;
+                }
                 let time = Event::time_msec(&event);
                 let key_phase = match event.state() {
                     KeyState::Pressed => crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
@@ -422,6 +499,15 @@ impl ShojiWM {
                     (output_bounds.loc.y + output_bounds.size.h - 1) as f64,
                 );
 
+                if self.session_lock_active {
+                    self.forward_locked_pointer_motion(
+                        pos,
+                        SERIAL_COUNTER.next_serial(),
+                        event.time_msec(),
+                    );
+                    return;
+                }
+
                 let next_contents = self.pointer_contents_at(pos);
                 if pointer_confined {
                     let remains_on_surface = match (&under, &next_contents.surface) {
@@ -500,6 +586,11 @@ impl ShojiWM {
                     return;
                 }
 
+                if self.session_lock_active {
+                    self.forward_locked_pointer_motion(pos, serial, event.time_msec());
+                    return;
+                }
+
                 self.pointer_contents = self.pointer_contents_at(pos);
                 let under = self.pointer_contents.surface.clone();
 
@@ -552,6 +643,16 @@ impl ShojiWM {
                 }
                 if button == 272 && button_state == ButtonState::Released {
                     self.release_decoration_active_target();
+                }
+
+                if self.session_lock_active {
+                    self.forward_locked_pointer_button(
+                        button,
+                        button_state,
+                        serial,
+                        event.time_msec(),
+                    );
+                    return;
                 }
 
                 // A locked-pointer client already owns pointer focus. Re-running compositor hit
@@ -1140,6 +1241,12 @@ impl ShojiWM {
                 }
 
                 let pointer = self.seat.get_pointer().unwrap();
+                if self.session_lock_active {
+                    pointer.axis(self, frame);
+                    pointer.frame(self);
+                    let _ = self.display_handle.flush_clients();
+                    return;
+                }
                 pointer.axis(self, frame);
                 pointer.frame(self);
             }

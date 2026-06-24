@@ -1749,6 +1749,19 @@ pub fn init_winit(
                             .into_iter()
                             .map(WinitRenderElements::Blink),
                         );
+                        if let Some(lock_surface) = state.session_lock_surface_for_output(&output)
+                        {
+                            elements.extend(
+                                crate::backend::window::lock_surface_elements(
+                                    renderer,
+                                    &lock_surface,
+                                    scale,
+                                    1.0,
+                                )
+                                .into_iter()
+                                .map(WinitRenderElements::Window),
+                            );
+                        }
                         elements.extend(content_elements);
 
                         trace!(
@@ -1795,6 +1808,7 @@ pub fn init_winit(
                                     &state.space,
                                     &output,
                                     &state.cursor_status,
+                                    state.session_lock_surface_for_output(&output).as_ref(),
                                     &render_output_result.states,
                                     &state.window_decorations,
                                 );
@@ -1807,7 +1821,14 @@ pub fn init_winit(
 
                                 if render_output_result.damage.is_some() {
                                     let mut output_presentation_feedback =
-                                        take_presentation_feedback(&output, &state.space, &render_output_result.states);
+                                        take_presentation_feedback(
+                                            &output,
+                                            &state.space,
+                                            state
+                                                .session_lock_surface_for_output(&output)
+                                                .as_ref(),
+                                            &render_output_result.states,
+                                        );
                                     output_presentation_feedback.presented::<Duration, Monotonic>(
                                         frame_time,
                                         output

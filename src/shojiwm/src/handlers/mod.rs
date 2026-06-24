@@ -16,9 +16,10 @@ use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_k
     Mode as KdeDecorationMode, OrgKdeKwinServerDecoration,
 };
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Rectangle};
-use smithay::utils::Serial;
+use smithay::utils::{Serial, SERIAL_COUNTER};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::{
     PointerConstraintsHandler, with_pointer_constraint,
@@ -36,6 +37,10 @@ use smithay::wayland::selection::primary_selection::{
 };
 use smithay::wayland::selection::wlr_data_control::{DataControlHandler, DataControlState};
 use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::session_lock::{
+    LockSurface, LockSurfaceConfigure, SessionLockHandler, SessionLockManagerState,
+    SessionLocker,
+};
 use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
@@ -155,6 +160,58 @@ impl PointerConstraintsHandler for ShojiWM {
 impl ForeignToplevelListHandler for ShojiWM {
     fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
         &mut self.foreign_toplevel_list_state
+    }
+}
+
+impl SessionLockHandler for ShojiWM {
+    fn lock_state(&mut self) -> &mut SessionLockManagerState {
+        &mut self.session_lock_state
+    }
+
+    fn lock(&mut self, confirmation: SessionLocker) {
+        self.session_lock_active = true;
+        self.layer_shell_on_demand_focus = None;
+        self.window_keyboard_focus = None;
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(
+                self,
+                Option::<WlSurface>::None,
+                SERIAL_COUNTER.next_serial(),
+            );
+        }
+        confirmation.lock();
+        self.schedule_redraw();
+    }
+
+    fn unlock(&mut self) {
+        self.session_lock_active = false;
+        self.session_lock_surfaces.clear();
+        self.pointer_contents = crate::state::PointerContents::default();
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(
+                self,
+                Option::<WlSurface>::None,
+                SERIAL_COUNTER.next_serial(),
+            );
+        }
+        self.update_keyboard_focus(SERIAL_COUNTER.next_serial());
+        self.schedule_redraw();
+    }
+
+    fn new_surface(&mut self, surface: LockSurface, output: WlOutput) {
+        let Some(output) = self.output_for_lock_resource(&surface, &output) else {
+            tracing::warn!("session lock surface could not be matched to an output");
+            return;
+        };
+        self.session_lock_surfaces
+            .insert(output.name(), surface.clone());
+        self.configure_session_lock_surface_for_output(&output);
+        self.focus_session_lock_surface(SERIAL_COUNTER.next_serial());
+        self.schedule_redraw();
+    }
+
+    fn ack_configure(&mut self, _surface: WlSurface, _configure: LockSurfaceConfigure) {
+        self.schedule_redraw();
     }
 }
 

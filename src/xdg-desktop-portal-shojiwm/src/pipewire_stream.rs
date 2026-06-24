@@ -761,15 +761,14 @@ impl AppState {
             match self.create_dmabuf_slot() {
                 Ok(Some(slot)) => return Ok(slot),
                 Ok(None) if !allows_memfd => {
-                    return Err("PipeWire selected DMA-BUF, but DMA-BUF allocation is unavailable"
-                        .into());
+                    return Err(
+                        "PipeWire selected DMA-BUF, but DMA-BUF allocation is unavailable".into(),
+                    );
                 }
                 Ok(None) => {}
                 Err(e) if !allows_memfd => return Err(e),
                 Err(e) => {
-                    tracing::warn!(
-                        "create DMA-BUF screencast buffer: {e}; falling back to SHM"
-                    );
+                    tracing::warn!("create DMA-BUF screencast buffer: {e}; falling back to SHM");
                 }
             }
         }

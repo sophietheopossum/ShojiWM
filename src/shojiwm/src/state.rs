@@ -15,7 +15,7 @@ use smithay::{
     backend::renderer::element::memory::MemoryRenderBuffer,
     desktop::{
         LayerSurface, PopupKind, PopupManager, Space, Window, WindowSurfaceType,
-        find_popup_root_surface, layer_map_for_output,
+        find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
     },
     input::{
         Seat, SeatState,
@@ -46,7 +46,8 @@ use smithay::{
         background_effect::BackgroundEffectState,
         commit_timing::CommitTimingManagerState,
         compositor::{
-            CompositorClientState, CompositorState, Damage, SurfaceAttributes, with_states,
+            CompositorClientState, CompositorState, Damage, SurfaceAttributes, get_parent,
+            with_states,
         },
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufGlobal, DmabufState},
@@ -62,6 +63,7 @@ use smithay::{
             data_device::DataDeviceState, primary_selection::PrimarySelectionState,
             wlr_data_control::DataControlState,
         },
+        session_lock::{LockSurface, SessionLockManagerState},
         shell::kde::decoration::KdeDecorationState,
         shell::wlr_layer::Layer as WlrLayer,
         shell::wlr_layer::WlrLayerShellState,
@@ -257,6 +259,9 @@ pub struct ShojiWM {
     pub toplevel_capture_source_state:
         smithay::wayland::image_capture_source::ToplevelCaptureSourceState,
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
+    pub session_lock_state: SessionLockManagerState,
+    pub session_lock_active: bool,
+    pub session_lock_surfaces: HashMap<String, LockSurface>,
     /// Live capture sessions, kept alive so dropping doesn't auto-send
     /// `stopped` to clients. Keyed by source id.
     pub image_copy_capture_sessions:
@@ -443,11 +448,120 @@ impl ShojiWM {
     }
 
     pub fn pointer_contents_at(&self, pos: Point<f64, Logical>) -> PointerContents {
-        let surface = self.surface_under(pos);
+        let surface = self
+            .session_lock_surface_under(pos)
+            .or_else(|| self.surface_under(pos));
         let layer = surface
             .as_ref()
             .and_then(|(surface, _)| self.layer_surface_for_hit_surface(surface));
         PointerContents { surface, layer }
+    }
+
+    pub fn session_lock_surface_for_output(&self, output: &Output) -> Option<LockSurface> {
+        self.session_lock_surfaces
+            .get(output.name().as_str())
+            .cloned()
+    }
+
+    pub fn session_lock_surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        if !self.session_lock_active {
+            return None;
+        }
+
+        let output = self.space.outputs().find(|output| {
+            self.space
+                .output_geometry(output)
+                .is_some_and(|geometry| geometry.contains(pos.to_i32_round()))
+        })?;
+        let output_geo = self.space.output_geometry(output)?;
+        let lock_surface = self.session_lock_surface_for_output(output)?;
+        if !lock_surface.alive() {
+            return None;
+        }
+
+        under_from_surface_tree(
+            lock_surface.wl_surface(),
+            pos - output_geo.loc.to_f64(),
+            (0, 0),
+            WindowSurfaceType::ALL,
+        )
+        .map(|(surface, loc)| (surface, (loc + output_geo.loc).to_f64()))
+    }
+
+    pub fn is_session_lock_surface(&self, surface: &WlSurface) -> bool {
+        self.session_lock_surfaces
+            .values()
+            .any(|lock_surface| lock_surface.wl_surface() == surface)
+    }
+
+    pub fn is_session_lock_surface_tree_surface(&self, surface: &WlSurface) -> bool {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        self.is_session_lock_surface(&root)
+    }
+
+    pub fn output_for_lock_resource(
+        &self,
+        surface: &LockSurface,
+        wl_output: &smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
+    ) -> Option<Output> {
+        let client = surface.wl_surface().client()?;
+        self.space.outputs().find_map(|output| {
+            output
+                .client_outputs(&client)
+                .any(|client_output| &client_output == wl_output)
+                .then(|| output.clone())
+        })
+    }
+
+    pub fn configure_session_lock_surface_for_output(&self, output: &Output) {
+        let Some(surface) = self.session_lock_surface_for_output(output) else {
+            return;
+        };
+        let Some(output_geo) = self.space.output_geometry(output) else {
+            return;
+        };
+        surface.with_pending_state(|state| {
+            state.size = Some((output_geo.size.w as u32, output_geo.size.h as u32).into());
+        });
+        surface.send_configure();
+    }
+
+    pub fn configure_session_lock_surfaces(&self) {
+        for output in self.space.outputs() {
+            self.configure_session_lock_surface_for_output(output);
+        }
+    }
+
+    pub fn focus_session_lock_surface(&mut self, serial: smithay::utils::Serial) {
+        if !self.session_lock_active {
+            return;
+        }
+
+        let focus = self
+            .seat
+            .get_pointer()
+            .and_then(|pointer| {
+                self.session_lock_surface_under(pointer.current_location())
+                    .map(|(surface, _)| surface)
+            })
+            .or_else(|| {
+                self.space
+                    .outputs()
+                    .find_map(|output| self.session_lock_surface_for_output(output))
+                    .map(|surface| surface.wl_surface().clone())
+            });
+
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            if keyboard.current_focus().as_ref() != focus.as_ref() {
+                keyboard.set_focus(self, focus, serial);
+            }
+        }
     }
 
     pub fn set_window_keyboard_focus_target(&mut self, window: Option<&Window>) {
@@ -535,6 +649,11 @@ impl ShojiWM {
     }
 
     pub fn update_keyboard_focus(&mut self, serial: smithay::utils::Serial) {
+        if self.session_lock_active {
+            self.focus_session_lock_surface(serial);
+            return;
+        }
+
         self.prune_keyboard_focus_targets();
 
         let desired_focus = self
@@ -642,6 +761,7 @@ impl ShojiWM {
             smithay::wayland::image_capture_source::ToplevelCaptureSourceState::new::<Self>(&dh);
         let image_copy_capture_state =
             smithay::wayland::image_copy_capture::ImageCopyCaptureState::new::<Self>(&dh);
+        let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let fixes_state = FixesState::new::<Self>(&dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
@@ -815,6 +935,9 @@ impl ShojiWM {
             output_capture_source_state,
             toplevel_capture_source_state,
             image_copy_capture_state,
+            session_lock_state,
+            session_lock_active: false,
+            session_lock_surfaces: HashMap::new(),
             image_copy_capture_sessions: std::collections::HashMap::new(),
             image_copy_capture_pending: Vec::new(),
             single_pixel_buffer_state,
@@ -1916,6 +2039,7 @@ impl ShojiWM {
             self.runtime_animation_outputs.remove(&name);
             self.layer_effect_evaluation_cache.remove(&name);
             self.popup_effect_evaluation_cache.remove(&name);
+            self.session_lock_surfaces.remove(&name);
             self.damage_blink_visible.remove(&name);
             self.damage_blink_pending.remove(&name);
         }
@@ -1995,6 +2119,7 @@ impl ShojiWM {
                 ));
             }
         }
+        self.configure_session_lock_surfaces();
         self.schedule_redraw();
     }
 

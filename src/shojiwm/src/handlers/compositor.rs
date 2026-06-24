@@ -403,7 +403,7 @@ impl CompositorHandler for ShojiWM {
         layer_shell::handle_commit(self, surface);
         resize_grab::handle_commit(&mut self.space, surface);
 
-        if cursor_surface_committed {
+        if cursor_surface_committed || self.is_session_lock_surface_tree_surface(surface) {
             self.schedule_redraw();
         }
     }

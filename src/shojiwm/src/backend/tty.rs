@@ -40,7 +40,7 @@ use smithay::{
         },
         session::{Session, libseat::LibSeatSession},
     },
-    desktop::layer_map_for_output,
+    desktop::{layer_map_for_output, utils::send_dmabuf_feedback_surface_tree},
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     output::{Mode as WlMode, Output, PhysicalProperties},
     reexports::{
@@ -1838,6 +1838,7 @@ fn render_surface(
         .into_iter()
         .cloned()
         .collect();
+    let session_lock_surface_for_output = state.session_lock_surface_for_output(&output);
     let captured_blink_damage = {
         let window_source_damage_snapshot = state.window_source_damage.clone();
         let ShojiWM {
@@ -4690,6 +4691,18 @@ fn render_surface(
                 .into_iter()
                 .map(TtyRenderElements::Blink),
         );
+        if let Some(lock_surface) = session_lock_surface_for_output.as_ref() {
+            content_for_capture.extend(
+                crate::backend::window::lock_surface_elements(
+                    &mut backend.renderer,
+                    lock_surface,
+                    scale,
+                    1.0,
+                )
+                .into_iter()
+                .map(TtyRenderElements::Window),
+            );
+        }
         content_for_capture.extend(content_elements);
         // The element count for diagnostics — final elements is built below
         // after capture has run against the by-reference slices.
@@ -5128,6 +5141,7 @@ fn render_surface(
             &state.space,
             &output,
             &cursor_status_for_log,
+            session_lock_surface_for_output.as_ref(),
             effective_render_states,
             window_decorations,
         );
@@ -5150,6 +5164,21 @@ fn render_surface(
             .filter(|layer| crate::backend::window::layer_surface_is_mapped(layer))
         {
             layer.send_dmabuf_feedback(
+                &output,
+                |_, _| Some(output.clone()),
+                |wl_surface, _| {
+                    select_dmabuf_feedback(
+                        wl_surface,
+                        effective_render_states,
+                        &surface.dmabuf_feedback.render,
+                        &surface.dmabuf_feedback.scanout,
+                    )
+                },
+            );
+        }
+        if let Some(lock_surface) = session_lock_surface_for_output.as_ref() {
+            send_dmabuf_feedback_surface_tree(
+                lock_surface.wl_surface(),
                 &output,
                 |_, _| Some(output.clone()),
                 |wl_surface, _| {
@@ -5334,8 +5363,12 @@ fn render_surface(
                     });
                 }
             }
-            let output_presentation_feedback =
-                take_presentation_feedback(&output, &state.space, effective_render_states);
+            let output_presentation_feedback = take_presentation_feedback(
+                &output,
+                &state.space,
+                session_lock_surface_for_output.as_ref(),
+                effective_render_states,
+            );
             // Edge-triggered "tearing engaged/disengaged" log (kept as a normal operational
             // log; see `note_tearing_transition`).
             note_tearing_transition(output.name().as_str(), should_tear, tearing_forced);
