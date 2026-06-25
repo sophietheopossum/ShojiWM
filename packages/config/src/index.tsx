@@ -43,8 +43,16 @@ import {
   WINDOW_STATE_WORKSPACE_OPACITY,
 } from "./window-manager";
 
-COMPOSITOR.env.set("QT_QPA_PLATFORM", "wayland;xcb");
-COMPOSITOR.env.set("QT_QPA_PLATFORMTHEME", "qt6ct");
+COMPOSITOR.env.apply({
+  QT_QPA_PLATFORM: "wayland;xcb",
+  QT_QPA_PLATFORMTHEME: "qt6ct",
+  QT_IM_MODULE: "fcitx",
+  XMODIFIERS: "@im=fcitx",
+  SDL_IM_MODULE: "fcitx",
+  GLFW_IM_MODULE: "ibus",
+  ELECTRON_OZONE_PLATFORM_HINT: "wayland",
+});
+COMPOSITOR.env.publish();
 
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
 const HOT_RELOAD_WINDOW_MANAGER_STATE = "config.hybrid-window-manager";
@@ -222,13 +230,6 @@ COMPOSITOR.onDisable(() => {
 });
 
 
-// enable fcitx5
-COMPOSITOR.env.apply({
-  QT_IM_MODULE: "fcitx",
-  XMODIFIERS: "@im=fcitx",
-  SDL_IM_MODULE: "fcitx",
-  GLFW_IM_MODULE: "ibus",
-})
 COMPOSITOR.process.once("fcitx5", {
   command: "fcitx5 -d",
   runPolicy: "once-per-session",

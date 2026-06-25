@@ -11,7 +11,7 @@ interface PendingEnvOperation {
 
 const pendingOperations: PendingEnvOperation[] = [];
 const pendingPublishKeys = new Set<string>();
-const pendingModifiedKeys = new Set<string>();
+const desiredEnvironment = new Map<string, string>();
 
 function normalizeKey(key: string): string {
   const normalized = String(key);
@@ -44,13 +44,13 @@ export const ENV_CONTROLLER: EnvController = {
       key: normalizedKey,
       value: normalizedValue,
     });
-    pendingModifiedKeys.add(normalizedKey);
+    desiredEnvironment.set(normalizedKey, normalizedValue);
   },
   unset(key) {
     const normalizedKey = normalizeKey(key);
     delete processEnv()[normalizedKey];
     pendingOperations.push({ key: normalizedKey });
-    pendingModifiedKeys.add(normalizedKey);
+    desiredEnvironment.delete(normalizedKey);
   },
   get(key) {
     return processEnv()[normalizeKey(key)];
@@ -65,7 +65,7 @@ export const ENV_CONTROLLER: EnvController = {
     }
   },
   publish(keys) {
-    const targetKeys = keys ?? pendingModifiedKeys;
+    const targetKeys = keys ?? desiredEnvironment.keys();
     for (const key of targetKeys) {
       pendingPublishKeys.add(normalizeKey(key));
     }
@@ -82,6 +82,5 @@ export function drainPendingEnvUpdates(): EnvUpdatePayload | undefined {
     publish: Array.from(pendingPublishKeys).sort(),
   };
   pendingPublishKeys.clear();
-  pendingModifiedKeys.clear();
   return payload;
 }
