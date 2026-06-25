@@ -4,6 +4,8 @@
 # By default this removes both ShojiWM and xdg-desktop-portal-shojiwm. Use
 # --keep-portal if you only want to remove the compositor install.
 
+: "${XDG_CONFIG_HOME:=$HOME/.config}"
+
 set -euo pipefail
 
 REMOVE_PORTAL=1
@@ -33,8 +35,7 @@ sudo rm -rf \
     /usr/share/wayland-sessions/shojiwm.desktop
 
 if [[ $REMOVE_USER_CONFIG -eq 1 ]]; then
-    CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-    echo ">> removing user config at $CONFIG_HOME/shojiwm"
+    echo ">> removing user config at $XDG_CONFIG_HOME/shojiwm"
     rm -rf "$CONFIG_HOME/shojiwm"
 fi
 

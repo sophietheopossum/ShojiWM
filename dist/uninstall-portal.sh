@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Remove everything install-portal.sh put in place.
 
+: "${XDG_CONFIG_HOME:=$HOME/.config}"
+
 set -euo pipefail
 
 echo ">> stopping service"
@@ -13,7 +15,7 @@ sudo rm -f \
     /usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.shojiwm.service \
     /usr/lib/systemd/user/xdg-desktop-portal-shojiwm.service
 
-rm -f "$HOME/.config/xdg-desktop-portal/shojiwm-portals.conf"
+rm -f "$XDG_CONFIG_HOME/xdg-desktop-portal/shojiwm-portals.conf"
 
 echo ">> reloading systemd + restarting xdg-desktop-portal"
 systemctl --user daemon-reload

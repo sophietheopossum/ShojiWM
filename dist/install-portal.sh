@@ -9,6 +9,8 @@
 #   dist/install-portal.sh             # build + install
 #   dist/install-portal.sh --no-build  # install only (use existing target/release build)
 
+: "${XDG_CONFIG_HOME:=$HOME/.config}"
+
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,8 +51,8 @@ sudo install -Dm644 "$REPO_ROOT/dist/xdg-desktop-portal-shojiwm.service" \
     /usr/lib/systemd/user/xdg-desktop-portal-shojiwm.service
 
 echo ">> writing user portals.conf"
-mkdir -p "$HOME/.config/xdg-desktop-portal"
-cat > "$HOME/.config/xdg-desktop-portal/shojiwm-portals.conf" <<'EOF'
+mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal"
+cat > "$XDG_CONFIG_HOME/xdg-desktop-portal/shojiwm-portals.conf" <<'EOF'
 [preferred]
 default=gtk
 org.freedesktop.impl.portal.ScreenCast=shojiwm
