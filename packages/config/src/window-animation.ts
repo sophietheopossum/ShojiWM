@@ -10,7 +10,13 @@ export interface RectAnimationOptions {
     suppressSSDRebuild?: boolean;
 }
 
-const lastRectAnimationTargetByWindow = new WeakMap<WaylandWindow, Map<symbol, ManagedWindowRect>>();
+interface RectAnimationTarget {
+    target: ManagedWindowRect;
+    token: number;
+}
+
+const activeRectAnimationTargetByWindow = new WeakMap<WaylandWindow, Map<symbol, RectAnimationTarget>>();
+let rectAnimationToken = 0;
 
 function rectAnimationChannel(windowRectState: WindowStateKey<ManagedWindowRect>): string {
     return `rect:${windowRectState.description ?? "anon"}`;
@@ -32,25 +38,35 @@ function sameRect(a: ManagedWindowRect, b: ManagedWindowRect): boolean {
         && read(a.height) === read(b.height);
 }
 
-function lastRectTarget(window: WaylandWindow, windowRectState: WindowStateKey<ManagedWindowRect>): ManagedWindowRect | undefined {
-    return lastRectAnimationTargetByWindow.get(window)?.get(windowRectState);
+function activeRectTarget(window: WaylandWindow, windowRectState: WindowStateKey<ManagedWindowRect>): RectAnimationTarget | undefined {
+    return activeRectAnimationTargetByWindow.get(window)?.get(windowRectState);
 }
 
-function setLastRectTarget(
+function setActiveRectTarget(
     window: WaylandWindow,
     windowRectState: WindowStateKey<ManagedWindowRect>,
-    target: ManagedWindowRect | undefined,
+    target: RectAnimationTarget | undefined,
 ): void {
-    let perWindow = lastRectAnimationTargetByWindow.get(window);
+    let perWindow = activeRectAnimationTargetByWindow.get(window);
     if (!perWindow) {
         perWindow = new Map();
-        lastRectAnimationTargetByWindow.set(window, perWindow);
+        activeRectAnimationTargetByWindow.set(window, perWindow);
     }
 
     if (target) {
         perWindow.set(windowRectState, target);
     } else {
         perWindow.delete(windowRectState);
+    }
+}
+
+function clearActiveRectTarget(
+    window: WaylandWindow,
+    windowRectState: WindowStateKey<ManagedWindowRect>,
+    token: number,
+): void {
+    if (activeRectTarget(window, windowRectState)?.token === token) {
+        setActiveRectTarget(window, windowRectState, undefined);
     }
 }
 
@@ -70,7 +86,7 @@ export function playRectAnimation(
     // case races with focus-driven reevaluations and can leave one window using
     // an older animated rect for a frame. Treat rect animation requests as
     // idempotent at the declarative target level.
-    const previousTarget = lastRectTarget(window, windowRectState);
+    const previousTarget = activeRectTarget(window, windowRectState)?.target;
     if (previousTarget && sameRect(previousTarget, target)) {
         return;
     }
@@ -79,7 +95,8 @@ export function playRectAnimation(
     // interpolation and falls back to this target when the scheduled animation
     // finishes or is cancelled.
     window.state[windowRectState].set(target);
-    setLastRectTarget(window, windowRectState, target);
+    const token = ++rectAnimationToken;
+    setActiveRectTarget(window, windowRectState, { target, token });
     window.scheduleAnimation({
         channel: rectAnimationChannel(windowRectState),
         rect: {
@@ -90,12 +107,15 @@ export function playRectAnimation(
             mode: "override",
         },
     });
+    setTimeout(() => {
+        clearActiveRectTarget(window, windowRectState, token);
+    }, duration);
 }
 
 export function stopRectAnimation(
     window: WaylandWindow,
     windowRectState: WindowStateKey<ManagedWindowRect>,
 ): void {
-    setLastRectTarget(window, windowRectState, undefined);
+    setActiveRectTarget(window, windowRectState, undefined);
     window.cancelAnimation(rectAnimationChannel(windowRectState));
 }

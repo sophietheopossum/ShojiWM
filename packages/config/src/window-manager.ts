@@ -1067,10 +1067,10 @@ export class HybridWindowManager {
   }
 
   public onWindowMinimizeRequest(event: WindowMinimizeRequestEvent) {
-    stopRectAnimation(event.window, WINDOW_STATE_RECT);
     const wasMinimized = event.window.state[WINDOW_STATE_MINIMIZED]();
     const workspace = this.findWorkspaceForWindow(event.window);
     if (wasMinimized !== event.minimized) {
+      stopRectAnimation(event.window, WINDOW_STATE_RECT);
       if (!event.minimized) {
         event.window.state[WINDOW_STATE_MINIMIZE_VISUAL_IDLE].set(false);
       }
