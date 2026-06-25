@@ -21,11 +21,14 @@
         system:
         let
           pkgs = pkgsFor system;
+          libgbm = pkgs.libgbm or pkgs.mesa;
           xwayland = pkgs.xwayland or (pkgs.xorg.xwayland or null);
           xwaylandSatellite = pkgs.xwayland-satellite or null;
         in
         rec {
-          shojiwm = pkgs.callPackage ./nix/package.nix { inherit xwayland xwaylandSatellite; };
+          shojiwm = pkgs.callPackage ./nix/package.nix {
+            inherit libgbm xwayland xwaylandSatellite;
+          };
           default = shojiwm;
         }
       );
@@ -51,6 +54,7 @@
         system:
         let
           pkgs = pkgsFor system;
+          libgbm = pkgs.libgbm or pkgs.mesa;
           xwayland = pkgs.xwayland or (pkgs.xorg.xwayland or null);
           xwaylandSatellite = pkgs.xwayland-satellite or null;
         in
@@ -71,6 +75,8 @@
                 systemd
                 libinput
                 mesa
+                libgbm
+                pixman
                 seatd
                 pipewire
                 libdrm

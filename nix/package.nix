@@ -12,6 +12,8 @@
   systemd,
   libinput,
   mesa,
+  libgbm ? mesa,
+  pixman,
   seatd,
   pipewire,
   libdrm,
@@ -99,6 +101,8 @@ rustPlatform.buildRustPackage {
     systemd
     libinput
     mesa
+    libgbm
+    pixman
     seatd
     pipewire
     libdrm
