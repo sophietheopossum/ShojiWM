@@ -2917,6 +2917,10 @@ export class Workspace {
     this.index = index;
     for (const window of this.windows) {
       this.syncWindowVisibleOutputs(window);
+      if (window.state[WINDOW_STATE_FULLSCREEN]()) {
+        window.state[WINDOW_STATE_RECT].set(this.fullscreenRootRect(window));
+        continue;
+      }
       if (window.state[WINDOW_STATE_MAXIMIZED]()) {
         window.state[WINDOW_STATE_RECT].set(this.maximizedRootRect(window));
         continue;
@@ -3421,14 +3425,16 @@ export class Workspace {
 
     tileable.forEach((window, index) => {
       const tileWidth = this.tileWidthForWindow(window, viewportRect);
-      const rect = window.state[WINDOW_STATE_MAXIMIZED]()
-        ? this.maximizedTileRect(window, nextX)
-        : {
-            x: nextX,
-            y: read(viewportRect.y),
-            width: tileWidth,
-            height: tileHeight,
-          };
+      const rect = window.state[WINDOW_STATE_FULLSCREEN]()
+        ? this.fullscreenRootRect(window)
+        : window.state[WINDOW_STATE_MAXIMIZED]()
+          ? this.maximizedTileRect(window, nextX)
+          : {
+              x: nextX,
+              y: read(viewportRect.y),
+              width: tileWidth,
+              height: tileHeight,
+            };
       appliedRects[window.id] = rect;
       if (window.id === this.draggingWindowId) {
         this.lastDraggingSlotRect = rect;
@@ -4301,6 +4307,19 @@ export class Workspace {
       bottom: TILE_MARGIN,
       left: TILE_MARGIN,
     });
+  }
+
+  private fullscreenRootRect(window: WaylandWindow): ManagedWindowRect {
+    const monitor = COMPOSITOR.output.current[this.monitor];
+    if (monitor?.resolution) {
+      return {
+        x: monitor.position.x,
+        y: monitor.position.y,
+        width: monitor.resolution.width / monitor.scale,
+        height: monitor.resolution.height / monitor.scale,
+      };
+    }
+    return window.state[WINDOW_STATE_RECT]();
   }
 }
 

@@ -1994,8 +1994,11 @@ fn render_surface(
         // Fullscreen fast path: when the topmost window is settled fullscreen
         // on this output, only overlay layers and the raw client surface are
         // rendered (Hyprland-style stacking: fullscreen above Top, below
-        // Overlay). The collapsed element list is what allows direct scanout.
-        let fullscreen_scanout = fullscreen_scanout_window(
+        // Overlay). Keep this separate from the direct-scanout decision below:
+        // a notification/OSD overlay must not unfullscreen the window, but it
+        // must temporarily force compositing and synced flips until it goes
+        // away.
+        let fullscreen_window = fullscreen_scanout_window(
             space,
             window_decorations,
             &windows_top_to_bottom,
@@ -2004,12 +2007,12 @@ fn render_surface(
             output_geo,
             scale,
         );
-        note_fullscreen_fast_path_transition(output.name().as_str(), fullscreen_scanout.is_some());
+        note_fullscreen_fast_path_transition(output.name().as_str(), fullscreen_window.is_some());
         // Overlay-layer backdrop effects must sample the fullscreen window
         // instead of the regular window stack while the fast path is active.
         let fullscreen_backdrop_windows: Vec<smithay::desktop::Window>;
         let upper_layer_backdrop_windows: &[smithay::desktop::Window] =
-            if let Some(window) = fullscreen_scanout.as_ref() {
+            if let Some(window) = fullscreen_window.as_ref() {
                 fullscreen_backdrop_windows = vec![window.clone()];
                 &fullscreen_backdrop_windows
             } else {
@@ -2018,7 +2021,7 @@ fn render_surface(
 
         let mut scene_elements: Vec<TtyRenderElements> = Vec::new();
         let upper_layers_started_at = Instant::now();
-        scene_elements.extend(upper_layer_scene_elements(
+        let upper_layer_elements = upper_layer_scene_elements(
             &mut backend.renderer,
             space,
             window_decorations,
@@ -2033,13 +2036,16 @@ fn render_surface(
             output_geo,
             scale,
             upper_layer_backdrop_windows,
-            fullscreen_scanout.is_some(),
+            fullscreen_window.is_some(),
             &mut state.layer_backdrop_cache,
             &mut state.layer_framebuffer_effect_states,
             &mut state.layer_effect_cache,
             &mut state.popup_effect_cache,
             &mut state.popup_framebuffer_effect_states,
-        )?);
+        )?;
+        let fullscreen_overlay_visible =
+            fullscreen_window.is_some() && !upper_layer_elements.is_empty();
+        scene_elements.extend(upper_layer_elements);
         let upper_layers_elapsed_ms = upper_layers_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.upper_layers_elapsed_ms = upper_layers_elapsed_ms;
         let closing_snapshots_started_at = Instant::now();
@@ -2082,8 +2088,8 @@ fn render_surface(
             // the fullscreen window itself renders as a bare surface tree +
             // popups (no decorations, no effects) so the frame can collapse
             // to a single scanout-capable element.
-            if let Some(fullscreen_window) = fullscreen_scanout.as_ref() {
-                if window != fullscreen_window {
+            if let Some(fullscreen_fast_path_window) = fullscreen_window.as_ref() {
+                if window != fullscreen_fast_path_window {
                     continue;
                 }
                 let Some(window_location) = space.element_location(window) else {
@@ -4616,7 +4622,7 @@ fn render_surface(
         timing.max_window_id = max_window_id;
         let lower_layers_started_at = Instant::now();
         // Fullscreen fast path: Bottom/Background layers are fully occluded.
-        if fullscreen_scanout.is_none() {
+        if fullscreen_window.is_none() {
             scene_elements.extend(lower_layer_scene_elements(
                 &mut backend.renderer,
                 &output,
@@ -4669,7 +4675,7 @@ fn render_surface(
         // frame and direct scanout flaps engaged/disengaged at ~30 Hz. The
         // client surface carries its own damage for smithay's tracker, so
         // dropping these here is safe and keeps scanout steady.
-        if fullscreen_scanout.is_none() {
+        if fullscreen_window.is_none() {
             content_elements.extend(
                 damage::elements_for_output(&extra_damage, output_geo)
                     .into_iter()
@@ -4857,6 +4863,12 @@ fn render_surface(
             elements.extend(content_for_capture);
         }
 
+        let fullscreen_scanout_candidate = if fullscreen_overlay_visible {
+            None
+        } else {
+            fullscreen_window.as_ref()
+        };
+
         // Direct scanout only kicks in if the CRTC background (clear color) is
         // black/transparent OR the topmost element reports itself opaque and
         // spans the output (smithay DrmCompositor::render_frame). Many clients
@@ -4865,7 +4877,7 @@ fn render_surface(
         // primary-plane promotion. During the fullscreen fast path the window
         // covers the whole output, so the clear color is never visible — swap
         // in black there to satisfy the easy scanout path.
-        let frame_clear_color: [f32; 4] = if fullscreen_scanout.is_some() {
+        let frame_clear_color: [f32; 4] = if fullscreen_window.is_some() {
             [0.0, 0.0, 0.0, 1.0]
         } else {
             CLEAR_COLOR
@@ -4876,11 +4888,10 @@ fn render_surface(
         // refresh rate. Fullscreen games normally hide/lock the pointer, so their frames still use
         // direct scanout with async flips.
         let tearing_forced = tearing_force_enabled();
-        let fullscreen_window_id = fullscreen_scanout
-            .as_ref()
+        let fullscreen_window_id = fullscreen_scanout_candidate
             .and_then(|window| window_decorations.get(window))
             .map(|decoration| decoration.snapshot.id.clone());
-        let fullscreen_root_element_id = fullscreen_scanout.as_ref().and_then(|window| {
+        let fullscreen_root_element_id = fullscreen_scanout_candidate.and_then(|window| {
             window
                 .toplevel()
                 .map(|toplevel| Id::from_wayland_resource(toplevel.wl_surface()))
@@ -4900,7 +4911,7 @@ fn render_surface(
         // `SHOJI_FORCE_TEARING` still forces it on for testing.
         let should_tear = surface.supports_async_flip
             && !cursor_visible
-            && fullscreen_scanout.as_ref().is_some_and(|window| {
+            && fullscreen_scanout_candidate.is_some_and(|window| {
                 if tearing_forced {
                     return true;
                 }
@@ -4915,11 +4926,13 @@ fn render_surface(
                     })
             });
         surface.tearing_active = should_tear;
-        let frame_flags = if should_tear {
-            TTY_FRAME_FLAGS.difference(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT)
-        } else {
-            TTY_FRAME_FLAGS
-        };
+        let mut frame_flags = TTY_FRAME_FLAGS;
+        if fullscreen_overlay_visible {
+            frame_flags = frame_flags.difference(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY);
+        }
+        if should_tear {
+            frame_flags = frame_flags.difference(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
+        }
         // Keep every real damage frame asynchronous for the whole tearing period. In
         // particular, a visible software-cursor update must not fall back to a synced flip:
         // alternating async game frames with vblank-bound cursor frames produces visibly uneven
@@ -4996,11 +5009,11 @@ fn render_surface(
         note_direct_scanout_transition(
             output.name().as_str(),
             result.primary_scanout,
-            fullscreen_scanout.is_some(),
+            fullscreen_scanout_candidate.is_some(),
             fullscreen_root_buffer_details.as_deref(),
         );
         if direct_scanout_debug_enabled()
-            && fullscreen_scanout.is_some()
+            && fullscreen_scanout_candidate.is_some()
             && direct_scanout_debug_log_allowed(output.name().as_str())
         {
             let mut zero_copy_count = 0usize;
