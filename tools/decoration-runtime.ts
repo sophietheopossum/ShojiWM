@@ -1281,17 +1281,15 @@ async function main() {
             request.kind === "evaluate"
               ? cacheByWindowId.get(request.snapshot.id)?.cache
               : undefined;
-          // Drain this window's queued actions so they ride along with the
-          // evaluation response (typically scheduleAnimation from onOpen /
-          // onFirstCommit). Without this they'd sit in pendingActions until the
-          // next scheduler tick, causing a one-frame flash at the static target.
-          const evaluationEntry = cacheByWindowId.get(request.snapshot.id);
-          const evaluationActions = evaluationEntry
-            ? evaluationEntry.pendingActions.splice(
-                0,
-                evaluationEntry.pendingActions.length,
-              )
-            : [];
+          // Drain queued actions so they ride along with the evaluation response.
+          // Layout events such as onFirstCommit can schedule animations for
+          // multiple windows while only one window is being evaluated; draining
+          // all render actions here keeps those animations frame-aligned instead
+          // of leaking them to later dirty evaluations in window order.
+          const evaluationActions =
+            request.kind === "evaluate"
+              ? drainPendingActions()
+              : drainPendingActionsForWindow(request.snapshot.id);
           if (evaluationActions.length > 0) {
             debugHotReload("evaluate-actions", {
               kind: request.kind,
@@ -1414,15 +1412,10 @@ async function main() {
             const inputConfig = pendingInputConfigPayload();
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
-            // Same as evaluate: drain queued window actions (scheduleAnimation /
-            // cancelAnimation) so Rust sees them in lockstep with this evaluation.
-            const cachedEntry = cacheByWindowId.get(request.windowId);
-            const cachedActions = cachedEntry
-              ? cachedEntry.pendingActions.splice(
-                  0,
-                  cachedEntry.pendingActions.length,
-                )
-              : [];
+            // Same as evaluate: drain all queued window actions so layout-wide
+            // animation requests produced by one cached event are delivered in
+            // a single response.
+            const cachedActions = drainPendingActions();
             if (cachedActions.length > 0) {
               debugHotReload("evaluate-cached-actions", {
                 windowId: request.windowId,
@@ -3152,7 +3145,7 @@ function startClose(
 
   const dirtyNodeIds = takeDirtyWindowNodeIds(windowId);
   const reevaluated = entry.cache.reevaluate(dirtyNodeIds);
-  const actions = entry.pendingActions.splice(0, entry.pendingActions.length);
+  const actions = drainPendingActions();
   return {
     invoked: true,
     serialized: reevaluated?.serialized,
@@ -3305,6 +3298,14 @@ function drainPendingActions(): RuntimeWindowAction[] {
     );
   }
   return actions;
+}
+
+function drainPendingActionsForWindow(windowId: string): RuntimeWindowAction[] {
+  const entry = cacheByWindowId.get(windowId);
+  if (!entry || entry.pendingActions.length === 0) {
+    return [];
+  }
+  return entry.pendingActions.splice(0, entry.pendingActions.length);
 }
 
 function resolveComposition(
