@@ -3641,6 +3641,15 @@ export class Workspace {
       return undefined;
     }
 
+    const focused = this.focusedWindow();
+    if (
+      focused &&
+      focused.id !== window.id &&
+      this.areTransientRelatives(focused, window)
+    ) {
+      return undefined;
+    }
+
     if (read(window.isFocused)) {
       return undefined;
     }
@@ -3654,6 +3663,36 @@ export class Workspace {
     }
     window.focus();
     return window;
+  }
+
+  private areTransientRelatives(a: WaylandWindow, b: WaylandWindow): boolean {
+    return (
+      this.isTransientChildOf(a, b) ||
+      this.isTransientChildOf(b, a) ||
+      this.hasUnparentedTransientAffinity(a, b)
+    );
+  }
+
+  private isTransientChildOf(
+    child: WaylandWindow,
+    parent: WaylandWindow,
+  ): boolean {
+    return child.isTransient() && child.parentId() === parent.id;
+  }
+
+  private hasUnparentedTransientAffinity(
+    a: WaylandWindow,
+    b: WaylandWindow,
+  ): boolean {
+    const transient = !this.shouldTile(a) && a.isTransient() ? a : null;
+    const other =
+      transient === a ? b : !this.shouldTile(b) && b.isTransient() ? b : null;
+    if (!transient || !other || transient.parentId()) {
+      return false;
+    }
+
+    const transientAppId = transient.appId();
+    return transientAppId !== undefined && transientAppId === other.appId();
   }
 
   private reapplyStaticManagedLayout(): void {
