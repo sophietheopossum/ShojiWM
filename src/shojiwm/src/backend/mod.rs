@@ -28,7 +28,7 @@ use smithay::{
     backend::{
         drm::DrmNode,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-        session::{Session, libseat::LibSeatSession},
+        session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent, primary_gpu},
     },
     reexports::{calloop::EventLoop, input::Libinput, wayland_server::Display},
@@ -37,7 +37,10 @@ use tracing::{error, info, trace, warn};
 
 use crate::{
     activation_environment::publish_activation_environment,
-    backend::tty::{device_added, device_changed, device_removed, render_if_needed},
+    backend::tty::{
+        device_added, device_changed, device_removed, pause_tty_session, render_if_needed,
+        resume_tty_session,
+    },
     config::tty_output_names_match,
     state::ShojiWM,
 };
@@ -88,7 +91,7 @@ pub fn run_tty_udev() -> Result<(), Box<dyn std::error::Error>> {
     publish_activation_environment("tty-wayland-display");
     state.start_xwayland(&event_loop);
 
-    let (mut session, _session_notifier) = LibSeatSession::new()?;
+    let (mut session, session_notifier) = LibSeatSession::new()?;
     let seat_name = session.seat();
     info!(seat = %seat_name, "initialized tty session");
 
@@ -97,16 +100,39 @@ pub fn run_tty_udev() -> Result<(), Box<dyn std::error::Error>> {
     let mut libinput =
         Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
     libinput.udev_assign_seat(&seat_name).map_err(|_| "")?;
-    let libinput_backend = LibinputInputBackend::new(libinput);
+    let libinput_backend = LibinputInputBackend::new(libinput.clone());
 
     event_loop
         .handle()
         .insert_source(libinput_backend, |event, _, state| {
+            if !state.tty_session_active {
+                return;
+            }
             state.record_event_source_wake("libinput");
             state.request_tty_maintenance("libinput");
             state.handle_libinput_input_event(&event);
             state.process_input_event(event);
         })?;
+
+    event_loop.handle().insert_source(
+        session_notifier,
+        move |event, &mut (), state| match event {
+            SessionEvent::PauseSession => {
+                info!("pausing tty session");
+                state.tty_session_active = false;
+                libinput.suspend();
+                pause_tty_session(state);
+            }
+            SessionEvent::ActivateSession => {
+                info!("resuming tty session");
+                state.tty_session_active = true;
+                if let Err(err) = libinput.resume() {
+                    warn!(?err, "failed to resume libinput context");
+                }
+                resume_tty_session(state);
+            }
+        },
+    )?;
 
     let primary_node = primary_gpu(session.seat())?
         .as_ref()

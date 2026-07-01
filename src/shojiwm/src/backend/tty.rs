@@ -206,6 +206,20 @@ fn sanitize_next_frame_target(
     }
 }
 
+fn error_chain_has_permission_denied(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|source| source.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
 fn browser_cpu_debug_allowed(output_name: &str) -> bool {
     if !browser_cpu_debug_enabled() {
         return false;
@@ -626,6 +640,50 @@ struct SurfaceData {
 struct SurfaceDmabufFeedback {
     render: DmabufFeedback,
     scanout: DmabufFeedback,
+}
+
+pub fn pause_tty_session(state: &mut ShojiWM) {
+    for backend in state.tty_backends.values_mut() {
+        backend.drm_output_manager.pause();
+        for surface in backend.surfaces.values_mut() {
+            reset_surface_after_tty_pause(surface);
+        }
+    }
+}
+
+pub fn resume_tty_session(state: &mut ShojiWM) {
+    for (node, backend) in state.tty_backends.iter_mut() {
+        if let Err(err) = backend.drm_output_manager.lock().activate(false) {
+            warn!(
+                ?node,
+                ?err,
+                "failed to activate drm backend after tty resume"
+            );
+        }
+        for surface in backend.surfaces.values_mut() {
+            reset_surface_after_tty_resume(surface);
+        }
+    }
+    state.force_full_damage = true;
+    state.request_tty_maintenance("tty-session-resume");
+    state.schedule_redraw();
+}
+
+fn reset_surface_after_tty_pause(surface: &mut SurfaceData) {
+    surface.frame_pending = false;
+    surface.queued_at = None;
+    surface.queued_cpu_duration = Duration::ZERO;
+    surface.skipped_while_pending_count = 0;
+    surface.frame_callback_timer_armed = false;
+    surface.commit_timing_timer_armed = false;
+    surface.next_frame_target = None;
+    surface.tearing_active = false;
+    surface.redraw_state = TtyRedrawState::Idle;
+}
+
+fn reset_surface_after_tty_resume(surface: &mut SurfaceData) {
+    reset_surface_after_tty_pause(surface);
+    surface.redraw_state = TtyRedrawState::Queued;
 }
 
 enum RenderSurfaceOutcome {
@@ -1057,6 +1115,10 @@ pub fn render_if_needed(
     loop_handle: &LoopHandle<'_, ShojiWM>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !state.needs_redraw {
+        return Ok(());
+    }
+    if !state.tty_session_active {
+        trace!("skipping tty redraw while session is inactive");
         return Ok(());
     }
 
@@ -5392,9 +5454,21 @@ fn render_surface(
             // `should_tear` selects an immediate (async) page flip when the fullscreen
             // direct-scanout tearing fast path is active, and a normal vblank-synced flip
             // otherwise. See `should_tear` / the tearing fast-path block above.
-            surface
+            if let Err(err) = surface
                 .drm_output
-                .queue_frame_tearing(Some(output_presentation_feedback), should_tear)?;
+                .queue_frame_tearing(Some(output_presentation_feedback), should_tear)
+            {
+                if error_chain_has_permission_denied(&err) {
+                    warn!(
+                        output = %output.name(),
+                        ?err,
+                        "tty queue_frame lost drm access; waiting for session resume"
+                    );
+                    reset_surface_after_tty_pause(surface);
+                    return Ok(RenderSurfaceOutcome::Skipped);
+                }
+                return Err(Box::new(err));
+            }
             if animation_gap_debug_enabled() {
                 info!(
                     output = %output.name(),

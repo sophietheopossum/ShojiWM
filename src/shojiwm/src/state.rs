@@ -389,6 +389,7 @@ pub struct ShojiWM {
     pub popup_latency_debug: Option<PopupLatencyDebugState>,
     pub popup_lifecycle_debug_entries: BTreeMap<u32, PopupLifecycleDebugEntry>,
     pub right_click_debug: RightClickDebugState,
+    pub tty_session_active: bool,
 
     pub is_running: bool,
     pub needs_redraw: bool,
@@ -1261,6 +1262,7 @@ impl ShojiWM {
                 released_at: None,
                 location: None,
             },
+            tty_session_active: true,
 
             is_running: true,
             needs_redraw: true,
