@@ -69,11 +69,13 @@ fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<ShojiWM> = EventLoop::try_new()?;
     let display: Display<ShojiWM> = Display::new()?;
     let mut state = ShojiWM::new(&mut event_loop, display);
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
-    publish_activation_environment("winit-wayland-display");
+    publish_activation_environment("winit-wayland-display-pre-init");
 
     info!("initializing winit backend");
     winit::init_winit(&mut event_loop, &mut state)?;
+
+    unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
+    publish_activation_environment("winit-wayland-display");
 
     state.start_xwayland(&event_loop);
     state.enable_initial_decoration_runtime();
