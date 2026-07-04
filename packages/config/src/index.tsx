@@ -734,7 +734,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     </Box>
   );
 
-  const TERMINALS = ["kitty", "ghostty"];
+  const TERMINALS = ["kitty", "ghostty", "rio"];
 
   if (TERMINALS.includes(window.appId() ?? "")) {
     innerComponents = (
