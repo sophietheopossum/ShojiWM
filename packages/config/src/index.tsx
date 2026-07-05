@@ -48,9 +48,6 @@ import {
 COMPOSITOR.env.apply({
   QT_QPA_PLATFORM: "wayland;xcb",
   QT_QPA_PLATFORMTHEME: "qt6ct",
-  QT_IM_MODULE: "fcitx",
-  XMODIFIERS: "@im=fcitx",
-  SDL_IM_MODULE: "fcitx",
   GLFW_IM_MODULE: "ibus",
   ELECTRON_OZONE_PLATFORM_HINT: "wayland",
 });
@@ -300,10 +297,6 @@ COMPOSITOR.onDisable(() => {
   WORKSPACE_IPC.close();
 });
 
-COMPOSITOR.process.once("fcitx5", {
-  command: "fcitx5 -d",
-  runPolicy: "once-per-session",
-});
 
 // GTK_A11Y=none disables the AT-SPI accessibility bridge for the bar. A status
 // bar never needs a screen reader, and GTK 4.22's accessibility relation
