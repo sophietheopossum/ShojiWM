@@ -833,7 +833,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   const maximizeButton = <MaximizeButton window={window} />;
   const closeButton = <CloseButton window={window} />;
 
-  var innerComponents = (
+  let innerComponents = (
     <Box direction="column">
       <ShaderEffect
         shader={titleOnlyShader}
@@ -949,7 +949,7 @@ const CloseButton = ({ window }: { window: WaylandWindow }) => {
 
   const borderColor = hover((hover) => (hover ? "#00000000" : "#F0808030"));
 
-  var icon: CompositionRenderable | null = null;
+  let icon: CompositionRenderable | null = null;
   if (hover()) {
     icon = (
       <Image
@@ -994,7 +994,7 @@ const MaximizeButton = ({ window }: { window: WaylandWindow }) => {
   });
   const shouldHover = computed(() => hover() && window.isResizable());
 
-  var icon: CompositionRenderable | null = null;
+  let icon: CompositionRenderable | null = null;
   if (shouldHover()) {
     const src = window.isMaximized((maximized) => {
       return maximized ? "./assets/minimize-2.svg" : "./assets/maximize-2.svg";
@@ -1047,7 +1047,7 @@ const MinimizeButton = ({ window }: { window: WaylandWindow }) => {
 
   const borderColor = hover((hover) => (hover ? "#00000000" : "#F8FF7530"));
 
-  var icon: CompositionRenderable | null = null;
+  let icon: CompositionRenderable | null = null;
   if (hover()) {
     icon = (
       <Image
