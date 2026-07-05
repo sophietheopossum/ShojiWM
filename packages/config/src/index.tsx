@@ -57,9 +57,6 @@ import type { TitlebarButton } from "./window-switcher";
 COMPOSITOR.env.apply({
   QT_QPA_PLATFORM: "wayland;xcb",
   QT_QPA_PLATFORMTHEME: "qt6ct",
-  QT_IM_MODULE: "fcitx",
-  XMODIFIERS: "@im=fcitx",
-  SDL_IM_MODULE: "fcitx",
   GLFW_IM_MODULE: "ibus",
   ELECTRON_OZONE_PLATFORM_HINT: "wayland",
 });
@@ -386,10 +383,6 @@ COMPOSITOR.onDisable(() => {
   WORKSPACE_IPC.close();
 });
 
-COMPOSITOR.process.once("fcitx5", {
-  command: "fcitx5 -d",
-  runPolicy: "once-per-session",
-});
 
 // shoji-bar-3, the session's shell: bar, wallpaper, notification daemon and
 // tray host.
