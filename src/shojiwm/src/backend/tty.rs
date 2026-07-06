@@ -2056,6 +2056,7 @@ render_elements! {
     RelocatedBackdrop=RelocateRenderElement<crate::backend::shader_effect::StableBackdropTextureElement>,
     TransformedBackdrop=RelocateRenderElement<RescaleRenderElement<RelocateRenderElement<crate::backend::shader_effect::StableBackdropTextureElement>>>,
     Cursor=PointerRenderElement<GlesRenderer>,
+    HdrEncode=crate::backend::hdr_pipeline::HdrEncodeElement,
 }
 
 fn tty_render_element_name(element: &TtyRenderElements) -> &'static str {
