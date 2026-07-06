@@ -8,6 +8,8 @@
 #
 # Usage:
 #   dist/install.sh
+#   dist/install.sh --dev        build quickly to allow faster testing for features (release-fast: no LTO, incremental)
+#   dist/install.sh --debug      hardened allocator (heap-debug feature) and full debuginfo, for chasing heap corruption; combines with --dev
 #   dist/install.sh --no-build
 #   dist/install.sh --no-portal
 #   dist/install.sh --no-config
@@ -20,11 +22,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 BUILD=1
+DEBUG=0
+DEV=0
 INSTALL_PORTAL=1
 INSTALL_CONFIG=1
 
 for arg in "$@"; do
     case "$arg" in
+        --debug) DEBUG=1 ;;
+        --dev) DEV=1 ;;
         --no-build) BUILD=0 ;;
         --no-portal) INSTALL_PORTAL=0 ;;
         --no-config) INSTALL_CONFIG=0 ;;
@@ -36,23 +42,43 @@ for arg in "$@"; do
     esac
 done
 
-if [[ $BUILD -eq 1 ]]; then
-    echo ">> cargo build --release -p shoji_wm -p xdg-desktop-portal-shojiwm"
-    cargo build --release -p shoji_wm -p xdg-desktop-portal-shojiwm
+# --dev selects the release-fast profile; binaries land in a different
+# target subdirectory, so resolve it here for the build and install steps.
+PROFILE_DIR=release
+PROFILE_FLAG=--release
+if [[ $DEV -eq 1 ]]; then
+    PROFILE_DIR=release-fast
+    PROFILE_FLAG="--profile release-fast"
 fi
 
-SHOJI_BIN="$REPO_ROOT/target/release/shoji_wm"
-PORTAL_BIN="$REPO_ROOT/target/release/xdg-desktop-portal-shojiwm"
+if [[ $BUILD -eq 1 ]]; then
+    CARGO_ARGS=($PROFILE_FLAG -p shoji_wm -p xdg-desktop-portal-shojiwm)
+    if [[ $DEBUG -eq 1 ]]; then
+        # Hardened mimalloc (guard pages, encoded free lists): heap
+        # corruption aborts at the faulting write instead of detonating
+        # later. Expect higher memory use and a small slowdown.
+        CARGO_ARGS+=(--features shoji_wm/heap-debug)
+        # Full debuginfo so core dumps symbolize cleanly. Cargo maps
+        # profile names to env keys with hyphens as underscores.
+        export CARGO_PROFILE_RELEASE_DEBUG=true
+        export CARGO_PROFILE_RELEASE_FAST_DEBUG=true
+    fi
+    echo ">> cargo build ${CARGO_ARGS[*]}"
+    cargo build "${CARGO_ARGS[@]}"
+fi
+
+SHOJI_BIN="$REPO_ROOT/target/$PROFILE_DIR/shoji_wm"
+PORTAL_BIN="$REPO_ROOT/target/$PROFILE_DIR/xdg-desktop-portal-shojiwm"
 
 if [[ ! -x "$SHOJI_BIN" ]]; then
     echo "binary not found: $SHOJI_BIN" >&2
-    echo "run without --no-build, or run cargo build --release -p shoji_wm first" >&2
+    echo "run without --no-build, or run cargo build $PROFILE_FLAG -p shoji_wm first" >&2
     exit 1
 fi
 
 if [[ $INSTALL_PORTAL -eq 1 && ! -x "$PORTAL_BIN" ]]; then
     echo "binary not found: $PORTAL_BIN" >&2
-    echo "run without --no-build, or run cargo build --release -p xdg-desktop-portal-shojiwm first" >&2
+    echo "run without --no-build, or run cargo build $PROFILE_FLAG -p xdg-desktop-portal-shojiwm first" >&2
     exit 1
 fi
 
@@ -154,5 +180,5 @@ fi
 
 echo ""
 echo "done."
-echo "Development run: cargo run --release -p shoji_wm -- --dev"
+echo "Development run: cargo run --profile release-fast -p shoji_wm -- --dev"
 echo "Installed run: select ShojiWM in your display manager, or run: shoji_wm --tty"
