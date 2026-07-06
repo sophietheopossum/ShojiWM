@@ -48,7 +48,11 @@ use smithay::{
             LoopHandle,
             timer::{TimeoutAction, Timer},
         },
-        drm::control::{connector, crtc},
+        drm::control::{
+            ModeTypeFlags, 
+            connector,
+            crtc,
+        },
         gbm::{BufferObjectFlags, Device, Format},
         rustix::fs::OFlags,
         wayland_protocols::wp::{
@@ -11449,6 +11453,11 @@ fn select_output_mode(
     preference: &DisplayModePreference,
 ) -> smithay::reexports::drm::control::Mode {
     match preference {
+        // Rank the connector's PREFERRED mode (the panel's native timing)
+        // above raw pixel area: kernel `video=` parameters inject synthetic
+        // modes into every connector, and on panels like the UX482
+        // ScreenPad (native 1920x515) a synthetic 1920x1080 would otherwise
+        // win and drive the panel at a timing it cannot display.
         DisplayModePreference::Auto => connector
             .modes()
             .iter()
@@ -11456,6 +11465,11 @@ fn select_output_mode(
             .max_by_key(|mode| {
                 let wl_mode = WlMode::from(*mode);
                 (
+                    mode
+                        .mode_type()
+                        .contains(
+                            ModeTypeFlags::PREFERRED
+                        ),
                     i64::from(wl_mode.size.w) * i64::from(wl_mode.size.h),
                     mode.vrefresh(),
                     wl_mode.refresh,
