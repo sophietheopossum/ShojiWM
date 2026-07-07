@@ -35,6 +35,7 @@ pub struct RuntimeOutputConfig {
     pub resolution: Option<RuntimeDisplayModePreference>,
     pub position: Option<RuntimeOutputPositionPreference>,
     pub scale: Option<f64>,
+    pub hdr: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
