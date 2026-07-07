@@ -101,6 +101,7 @@ function cloneOutputConfigEntry(config: OutputConfigEntry): OutputConfigEntry {
           ? { ...config.position }
           : undefined,
     scale: config.scale,
+    hdr: config.hdr,
   };
 }
 
