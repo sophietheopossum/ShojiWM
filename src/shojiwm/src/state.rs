@@ -2207,6 +2207,12 @@ impl ShojiWM {
                         },
                         scale: output.current_scale().fractional_scale(),
                         available_modes,
+                        hdr_supported: self
+                            .output_color
+                            .get(
+                                &name,
+                            )
+                            .is_some_and(|color| color.edid_hdr.is_some()),
                     },
                 )
             })

@@ -36,6 +36,7 @@ function cloneOutputState(
         position: { ...snapshot.position },
         scale: snapshot.scale,
         availableModes: snapshot.availableModes.map((mode) => ({ ...mode })),
+        hdrSupported: snapshot.hdrSupported,
       },
     ]),
   );
@@ -65,6 +66,7 @@ function normalizeOutputState(
         position: { ...snapshot.position },
         scale: snapshot.scale,
         availableModes: snapshot.availableModes.map((mode) => ({ ...mode })),
+        hdrSupported: snapshot.hdrSupported,
       },
     ]),
   );

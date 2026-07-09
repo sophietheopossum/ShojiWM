@@ -518,6 +518,9 @@ pub struct WaylandOutputSnapshot {
     pub position: OutputPositionSnapshot,
     pub scale: f64,
     pub available_modes: Vec<OutputModeSnapshot>,
+    /// EDID advertises HDR (CTA-861 static metadata). Can
+    /// be used to check display capabilities.
+    pub hdr_supported: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
