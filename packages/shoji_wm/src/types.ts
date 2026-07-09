@@ -1036,6 +1036,8 @@ export interface OutputStateSnapshot {
   };
   scale: number;
   availableModes: OutputMode[];
+  /** EDID advertises HDR (CTA-861 static metadata block). */
+  hdrSupported?: boolean;
 }
 
 export interface OutputInfo extends OutputStateSnapshot {
