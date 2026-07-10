@@ -25,13 +25,41 @@ import {
   compilePopupEffect,
   popupSource,
 } from "shoji_wm";
-import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
+import type {
+  CompositionRenderable,
+  InputAccelProfile,
+  InputScrollMethod,
+  ManagedWindowRect,
+} from "shoji_wm/types";
 import { createIpcServer } from "shoji_wm/ipc";
+// User-facing settings owned by MinkaConf; tsx resolves JSON imports
+// natively. The import seeds boot values; `settings.apply` over IPC swaps
+// them at runtime (input/output factories re-run, no config reload).
+// MinkaConf persists to the same file so the next boot agrees.
+import minkaSettings from "./minka-settings.json";
+
+// Full per-display schema MinkaConf's visual page writes. The JSON import
+// only types what the file currently contains, so displays get an explicit
+// shape here.
+interface MinkaDisplaySettings {
+  scale?: number;
+  position?: { x: number; y: number };
+  resolution?: { width: number; height: number; refreshRate?: number } | "best";
+  enabled?: boolean;
+  mirror?: string | null;
+  hdr?: boolean;
+}
+
+type MinkaSettings = Omit<typeof minkaSettings, "displays"> & {
+  displays: Record<string, MinkaDisplaySettings | undefined>;
+};
+let activeSettings: MinkaSettings = minkaSettings as MinkaSettings;
 import {
   HybridWindowManager,
   TITLEBAR_HEIGHT,
   WINDOW_BORDER_PX,
   WINDOW_STATE_FULLSCREEN,
+  WINDOW_STATE_MAXIMIZED,
   WINDOW_STATE_MINIMIZED,
   WINDOW_STATE_MINIMIZE_VISUAL_IDLE,
   WINDOW_STATE_TILE_DRAGGING,
@@ -48,6 +76,12 @@ COMPOSITOR.env.apply({
   QT_QPA_PLATFORMTHEME: "qt6ct",
   GLFW_IM_MODULE: "ibus",
   ELECTRON_OZONE_PLATFORM_HINT: "wayland",
+  // Firefox/hellfire was running through XWayland here (8/7/2026), where
+  // fractional scaling makes click hit-testing unreliable — "some clicks
+  // don't work". Force native Wayland for this session only; KDE keeps
+  // whatever it was doing.
+  MOZ_ENABLE_WAYLAND: "1",
+  MOZ_DBUS_REMOTE: "1",
 });
 COMPOSITOR.env.publish();
 
@@ -203,6 +237,78 @@ WORKSPACE_IPC.handle("windows.activate", (params) => {
     scheduleWorkspaceBroadcast();
   }
 });
+WORKSPACE_IPC.handle("windows.close", (params) => {
+  const windowId = (params as { windowId?: string } | undefined)?.windowId;
+  if (typeof windowId === "string") {
+    HYBRID_WINDOW_MANAGER.closeWindowById(windowId);
+    scheduleWorkspaceBroadcast();
+  }
+});
+// Debug helper (Rio maximize investigation): drive the same maximize path a
+// client CSD button takes, addressable by window id from outside the session.
+WORKSPACE_IPC.handle("windows.maximize", (params) => {
+  const request = params as
+    | { windowId?: string; maximized?: boolean }
+    | undefined;
+  if (!request?.windowId) {
+    return;
+  }
+  const window = HYBRID_WINDOW_MANAGER.findWindowById(request.windowId);
+  if (!window) {
+    return;
+  }
+  if (request.maximized === false) {
+    window.unmaximize();
+  } else {
+    window.maximize();
+  }
+  scheduleWorkspaceBroadcast();
+});
+
+// Diagnostic dump for the window-sizing investigation (7/2026): everything
+// the runtime believes about outputs, layer exclusive zones, and the usable
+// areas derived from them. Queryable from another session while the
+// compositor is still running (VT switch, not logout):
+//   printf '{"id":1,"method":"debug.geometry"}\n' \
+//     | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/shojiwm-<display>.sock
+// Config-schema revision handshake. Bump whenever the settings schema or
+// the factories consuming it change, so MinkaConf can tell the user the
+// running session predates the edit ("reload with Super+Shift+R") instead
+// of silently half-applying. History: 1 = input + display scale;
+// 2 = full display schema (position/mode/enabled/mirror/hdr).
+const MINKA_CONFIG_REVISION = 2;
+WORKSPACE_IPC.handle("minka.revision", () => ({
+  revision: MINKA_CONFIG_REVISION,
+}));
+
+// Effective user settings, for MinkaConf to display.
+WORKSPACE_IPC.handle("settings.get", () => activeSettings);
+// Live-apply from MinkaConf: swap the active settings and re-run the input
+// and output factories. No config reload; takes effect immediately.
+WORKSPACE_IPC.handle("settings.apply", (params) => {
+  if (!params || typeof params !== "object") {
+    return { ok: false, error: "expected a settings object" };
+  }
+  activeSettings = params as MinkaSettings;
+  COMPOSITOR.input.reconfigure();
+  COMPOSITOR.output.reconfigure();
+  return { ok: true };
+});
+
+WORKSPACE_IPC.handle("debug.geometry", () => {
+  const usable: Record<string, unknown> = {};
+  const insets: Record<string, unknown> = {};
+  for (const name of COMPOSITOR.output.list) {
+    usable[name] = COMPOSITOR.layer.usableArea(name);
+    insets[name] = COMPOSITOR.layer.reservedInsets(name);
+  }
+  return {
+    outputs: COMPOSITOR.output.current,
+    usable,
+    insets,
+    layers: COMPOSITOR.layer.current,
+  };
+});
 
 // ---------------------------------------------------------------------------
 // Dock proximity: watch the pointer and broadcast enter/leave for the bottom
@@ -291,13 +397,34 @@ COMPOSITOR.onDisable(() => {
 });
 
 
-// GTK_A11Y=none disables the AT-SPI accessibility bridge for the bar. A status
-// bar never needs a screen reader, and GTK 4.22's accessibility relation
-// handling can melt down into a recursive notify storm (100% CPU) when a
-// GMenuModel-backed popover's model is destroyed while open — e.g. quitting an
-// app from its system-tray menu. Must be set before GTK init, hence here.
+COMPOSITOR.process.once("fcitx5", {
+  command: "fcitx5 -d",
+  runPolicy: "once-per-session",
+});
+
+
+// MinkaShell (Quickshell-based) is the session shell now; shoji-bar-2 is retired.
+// Logs go to /tmp/minkashell.log so warnings and crashes survive the session
+// for later inspection (Sophie has to switch to KDE to debug with Claude).
 COMPOSITOR.process.once("shell", {
-  command: "cd ~/.config/shoji-bar-2 && GTK_A11Y=none ags run app.tsx",
+  command: "qs -p \"$HOME/Documents/src/MinkaDE/MinkaShell\" > /tmp/minkashell.log 2>&1",
+  runPolicy: "once-per-session",
+});
+// MinkaFX: the Guido-style wgpu overlay process (snap preview, future OSDs).
+// Guarded so a not-yet-built binary is a silent no-op instead of a failure.
+COMPOSITOR.process.once("MinkaFX", {
+  command: "[ -x \"$HOME/Documents/src/MinkaDE/MinkaFX/target/release/MinkaFX\" ] && exec \"$HOME/Documents/src/MinkaDE/MinkaFX/target/release/MinkaFX\" > /tmp/minkafx.log 2>&1",
+  runPolicy: "once-per-session",
+});
+// Polkit authentication agent: without one, anything that needs privilege
+// escalation (pamac, GParted, systemd prompts…) fails silently because
+// polkit has nowhere to send the password dialog. KDE sessions start their
+// own; ours must too. `once` rather than a restarting service: polkit
+// permits one agent per session, so a duplicate spawn exits immediately
+// and a restart-on-exit policy would loop on that.
+// TODO(Minka): replace with a themed MinkaConf-family agent eventually.
+COMPOSITOR.process.once("polkit-agent", {
+  command: "/usr/lib/polkit-kde-authentication-agent-1",
   runPolicy: "once-per-session",
 });
 // cliphist clipboard history watchers. Text and image need separate watchers;
@@ -347,11 +474,13 @@ COMPOSITOR.key.bind("prev", "XF86AudioPrev", () => {
   COMPOSITOR.process.spawn({ command: "playerctl previous" });
 });
 
-// Resolve the monitor under the cursor and toggle shoji-bar-2's StartMenu via ags request.
+// Resolve the monitor under the cursor and toggle the start menu.
+// MinkaShell listens for the ui.startMenu broadcast on the IPC socket.
 function toggleStartMenu() {
   const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
-  COMPOSITOR.process.spawn({
-    command: ["ags", "request", "-i", "ags", "start-menu", "toggle", monitor],
+  WORKSPACE_IPC.broadcast("ui.startMenu", {
+    connector: monitor,
+    action: "toggle",
   });
 }
 COMPOSITOR.key.bind("start-menu", "Super+A", toggleStartMenu);
@@ -359,13 +488,9 @@ COMPOSITOR.key.bind("start-menu", "Super+A", toggleStartMenu);
 COMPOSITOR.key.bind("start-menu-tap", "Super", toggleStartMenu, {
   on: "release",
 });
-// Toggle shoji-bar-2's clipboard history on the monitor under the cursor.
-COMPOSITOR.key.bind("clipboard", "Super+V", () => {
-  const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
-  COMPOSITOR.process.spawn({
-    command: ["ags", "request", "-i", "ags", "clipboard", "toggle", monitor],
-  });
-});
+// Clipboard UI was dropped with shoji-bar-2 (Sophie's call); the cliphist
+// watchers above keep collecting history for a future picker, so Super+V is
+// intentionally unbound for now.
 COMPOSITOR.key.bind("screenshot", "Super+P", () => {
   COMPOSITOR.process.spawn({
     command: "hyprshot -m region --raw | swappy -f -",
@@ -375,6 +500,14 @@ COMPOSITOR.key.bind("screenshot-freeze", "Super+Ctrl+P", () => {
   COMPOSITOR.process.spawn({
     command: "hyprshot -m region --freeze --raw | swappy -f -",
   });
+});
+COMPOSITOR.key.bind("cycle-windows", "Alt+Tab", () => {
+  HYBRID_WINDOW_MANAGER.cycleWorkspaceFocus(1);
+  scheduleWorkspaceBroadcast();
+});
+COMPOSITOR.key.bind("cycle-windows-back", "Alt+Shift+Tab", () => {
+  HYBRID_WINDOW_MANAGER.cycleWorkspaceFocus(-1);
+  scheduleWorkspaceBroadcast();
 });
 COMPOSITOR.key.bind("toggle-tiling-mode", "Super+S", () => {
   HYBRID_WINDOW_MANAGER.toggleCurrentWorkspaceTiling();
@@ -429,6 +562,11 @@ COMPOSITOR.key.bind("fps", "Super+Shift+F", () => {
   COMPOSITOR.debug.fpsCounter = fpsCounter;
 });
 
+// Displays are fully user-managed through MinkaConf (minka-settings.json):
+// scale, explicit position, mode, enable/disable, mirroring, and the HDR
+// opt-in (HDR only engages when the sink's EDID advertises PQ support).
+// Connectors with no entry get KDE-parity defaults: best mode, auto
+// position, scale 1.0.
 let profileEnabled = false;
 COMPOSITOR.key.bind("profile", "Super+Shift+T", () => {
   profileEnabled = !profileEnabled;
@@ -438,43 +576,31 @@ COMPOSITOR.key.bind("profile", "Super+Shift+T", () => {
 COMPOSITOR.output.configure((context) => {
   const display: DisplayConfigDraft = {};
 
-  display["eDP-1"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.8,
-  };
-  display["eDP-2"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.8,
-  };
-  display["HDMI-A-1"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.5,
-  };
-  display["DP-1"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.5,
-  };
-  display["DP-4"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.5,
-  };
-  display["DP-2"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.6,
-  };
+  const names = new Set<string>(Object.keys(activeSettings.displays));
+  for (const output of context.connected) {
+    names.add(output.name);
+  }
 
+  for (const name of names) {
+    const entry = activeSettings.displays[name];
+    if (entry?.enabled === false) {
+      display[name] = { mode: "disabled" };
+      continue;
+    }
+    if (entry?.mirror) {
+      display[name] = { mode: "mirror", source: entry.mirror };
+      continue;
+    }
+    display[name] = {
+      mode: "extend",
+      resolution: entry?.resolution ?? "best",
+      position: entry?.position ?? "auto",
+      scale: entry?.scale ?? 1.0,
+      hdr: entry?.hdr === true,
+    };
+  }
+
+  // Lid-closed docked mode: the external monitor replaces the built-ins.
   const isDocked = context.connected.some(
     (output) => output.name === "HDMI-A-1",
   );
@@ -483,21 +609,71 @@ COMPOSITOR.output.configure((context) => {
     display["eDP-2"] = { mode: "disabled" };
   }
 
+  // Keep the live layout's bounding box anchored at (0,0), like xrandr does.
+  // X11 toolkits reading RandR through the Xwayland bridge assume the screen
+  // starts at the top-left monitor corner (GTK clips menu workareas against
+  // it). MinkaConf normalizes the arrangement it saves, but only across the
+  // displays connected at the time — so a disconnect (e.g. the TV owning the
+  // top-left corner) can leave the remaining subset with a floating origin.
+  // Translating every output by the same delta preserves the arrangement and
+  // is invisible to the user; "auto" positions are left to the compositor.
+  const connectedNames = new Set(
+      context.connected
+          .map(
+              (output) => output.name
+          )
+  );
+  const positioned: { x: number; y: number }[] = [];
+  for (const [name, entry] of Object.entries(display)) {
+    if (
+      entry.mode === "extend" &&
+      typeof entry.position === "object" &&
+      connectedNames
+          .has(
+              name
+          )
+    ) {
+      positioned
+          .push(
+              entry.position
+          );
+    }
+  }
+  if (positioned.length > 0) {
+    const minX = Math
+        .min(...positioned.map((position) => position.x));
+    const minY = Math
+        .min(...positioned.map((position) => position.y));
+    if (minX !== 0 || minY !== 0) {
+      for (const position of positioned) {
+        position.x -= minX;
+        position.y -= minY;
+      }
+    }
+  }
+
   return display;
 });
 
+// Pointer/touchpad behavior comes from minka-settings.json (MinkaConf).
+// 8/7/2026 defaults per Sophie: adaptive accel at +0.4 (the old flat/0.0
+// was "acceleration too low") and natural scroll off everywhere.
 COMPOSITOR.input.configure((input, _context) => {
+  const inputSettings = activeSettings.input;
   input.global = {
     touchpad: {
-      tapToClick: true,
-      naturalScroll: true,
-      scrollMethod: "twoFinger",
-      disableWhileTyping: true,
-      scrollFactor: 0.3,
+      tapToClick: inputSettings.touchpad.tapToClick,
+      naturalScroll: inputSettings.touchpad.naturalScroll,
+      scrollMethod: inputSettings.touchpad.scrollMethod as InputScrollMethod,
+      disableWhileTyping: inputSettings.touchpad.disableWhileTyping,
+      scrollFactor: inputSettings.touchpad.scrollFactor,
+      pointerAccel: inputSettings.pointerAccel,
+      accelProfile: inputSettings.accelProfile as InputAccelProfile,
     },
     pointer: {
-      pointerAccel: 0.0,
-      accelProfile: "flat",
+      pointerAccel: inputSettings.pointerAccel,
+      accelProfile: inputSettings.accelProfile as InputAccelProfile,
+      naturalScroll: inputSettings.naturalScroll,
     },
     keyboard: {
       options: "caps:ctrl_modifier",
@@ -601,8 +777,17 @@ COMPOSITOR.rendering.surfacePolicy = (surface) => {
   return null;
 };
 
+// The dock displays live window titles, so a title change must refresh the
+// IPC view. The broadcast is JSON-diffed and coalesced per tick, so noisy
+// title churn (terminals) only goes out when the string actually changed.
+const titleSubscriptions = new Map<string, () => void>();
+
 COMPOSITOR.event.onOpen((window) => {
   HYBRID_WINDOW_MANAGER.onOpen(window);
+  titleSubscriptions.set(
+    window.id,
+    window.title.subscribe(() => scheduleWorkspaceBroadcast()),
+  );
 });
 
 COMPOSITOR.event.onFirstCommit((window) => {
@@ -617,6 +802,8 @@ COMPOSITOR.event.onStartClose((window) => {
 
 COMPOSITOR.event.onClose((window) => {
   HYBRID_WINDOW_MANAGER.onClose(window);
+  titleSubscriptions.get(window.id)?.();
+  titleSubscriptions.delete(window.id);
   scheduleWorkspaceBroadcast();
 });
 
@@ -624,8 +811,12 @@ COMPOSITOR.event.onFocus((window, focused) => {
   HYBRID_WINDOW_MANAGER.onFocus(window, focused);
   if (focused) {
     HYBRID_WINDOW_MANAGER.recordFocus(window.id);
-    scheduleWorkspaceBroadcast();
   }
+  // Broadcast on loss of focus too: when the unfocus event lands in a later
+  // tick than the gain, a gain-only broadcast snapshots BOTH windows as
+  // focused and nothing ever corrects it — the dock/bar keep highlighting
+  // the previously focused window (Sophie's "selection border persists").
+  scheduleWorkspaceBroadcast();
 });
 
 COMPOSITOR.event.onPointerMoveAsync((event) => {
@@ -678,6 +869,12 @@ COMPOSITOR.pointer.bindWindowResizeModifier("Super");
 
 COMPOSITOR.event.onWindowMove((event) => {
   HYBRID_WINDOW_MANAGER.onWindowMove(event);
+  // A drag can hand the window to another monitor's workspace (adoption in
+  // onWindowMove); without a broadcast the dock keeps listing it on the old
+  // output until some unrelated event refreshes the view.
+  if (event.phase === "end" || event.phase === "cancel") {
+    scheduleWorkspaceBroadcast();
+  }
 });
 
 COMPOSITOR.event.onWindowMaximizeRequest((event) => {
@@ -732,8 +929,9 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     () => minimizeVisualIdle() || (!workspaceVisible() && !tileDragging()),
   );
 
+  // Eternal Darkness red (Theme.red / Theme.redDim until shared theme.json).
   const borderColor = window.isFocused((focused) =>
-    focused ? "#d7ba7d" : "#4f5666",
+    focused ? "#e0263c" : "#8f1e2d",
   );
   const titlebarBackground = window.isFocused((focused) =>
     focused ? "#1f243080" : "#2a2f3a80",
@@ -870,6 +1068,27 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         interactive={inactive((value) => !value)}
       >
         <ClientWindow />
+      </ManagedWindow>
+    );
+  }
+
+  // Maximized: keep the titlebar but drop the border, padding and rounded
+  // corners — square frame, edge to edge in the usable area
+  // (maximizedRectForWindow applies no inset to match). Floating windows
+  // below keep the full chrome.
+  if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+    return (
+      <ManagedWindow
+        rect={managedRect}
+        zIndex={HYBRID_WINDOW_MANAGER.getWindowZIndex(window)}
+        visibleOutputs={window.state[WINDOW_STATE_VISIBLE_OUTPUTS]}
+        opacity={workspaceOpacity}
+        forceRectSize={forceRectSize}
+        tiled={tiled}
+        idle={inactive}
+        interactive={inactive((value) => !value)}
+      >
+        <Box direction="row">{innerComponents}</Box>
       </ManagedWindow>
     );
   }
