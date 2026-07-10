@@ -166,7 +166,9 @@ fn sanitize_inherited_compositor_environment() {
         process_env::set_var(key, "");
     }
 
-    process_env::set_var("XDG_CURRENT_DESKTOP", "ShojiWM");
+    // Keep in sync with prepare_runtime_process_environment: the KDE
+    // entry lets Chromium/Electron pick the kwallet6 password store.
+    process_env::set_var("XDG_CURRENT_DESKTOP", "ShojiWM:KDE");
     process_env::set_var("XDG_SESSION_DESKTOP", "ShojiWM");
     process_env::set_var("XDG_SESSION_TYPE", "wayland");
     process_env::set_var("DESKTOP_SESSION", "ShojiWM");
