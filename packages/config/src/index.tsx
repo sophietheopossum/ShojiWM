@@ -322,6 +322,22 @@ WORKSPACE_IPC.handle("windows.maximize", (params) => {
   scheduleWorkspaceBroadcast();
 });
 
+// Bar window-controls: minimize the window (restore goes through
+// windows.activate, which unminimizes and focuses).
+WORKSPACE_IPC.handle("windows.minimize", (params) => {
+  const request = params as { windowId?: string } | undefined;
+  if (!request?.windowId) {
+    return;
+  }
+  const window = HYBRID_WINDOW_MANAGER.findWindowById(request.windowId);
+  if (!window) {
+    return;
+  }
+  window
+      .minimize();
+  scheduleWorkspaceBroadcast();
+});
+
 // Diagnostic dump for the window-sizing investigation (7/2026): everything
 // the runtime believes about outputs, layer exclusive zones, and the usable
 // areas derived from them. Queryable from another session while the
@@ -940,10 +956,14 @@ COMPOSITOR.event.onWindowMove((event) => {
 
 COMPOSITOR.event.onWindowMaximizeRequest((event) => {
   HYBRID_WINDOW_MANAGER.onWindowMaximizeRequest(event);
+  // The workspaces view carries maximized/minimized per window (the bar's
+  // window controls render from it), so state changes must broadcast.
+  scheduleWorkspaceBroadcast();
 });
 
 COMPOSITOR.event.onWindowMinimizeRequest((event) => {
   HYBRID_WINDOW_MANAGER.onWindowMinimizeRequest(event);
+  scheduleWorkspaceBroadcast();
 });
 
 COMPOSITOR.event.onWindowFullscreenRequest((event) => {

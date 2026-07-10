@@ -256,6 +256,8 @@ export interface WorkspacesViewWindow {
   appId?: string;
   title: string;
   focused: boolean;
+  maximized: boolean;
+  minimized: boolean;
   /** epoch ms — most recent focus time for MRU ordering. 0 if never focused. */
   lastFocusedAt: number;
 }
@@ -1299,8 +1301,23 @@ export class HybridWindowManager {
     }
 
     if (!event.maximized) {
-      const restoreRect = window.state[WINDOW_STATE_RESTORE_RECT]();
-      if (restoreRect) {
+      // Unmaximize always lands centred at half the screen's dimensions
+      // rather than restoring the pre-maximize rect: a remembered rect can
+      // put the titlebar out of reach (display changes, panel moves), and a
+      // deterministic centred rect means the titlebar is always recoverable.
+      // The stored restore rect is only a signal now — the snap and
+      // interactive-drag paths clear it first to request a silent
+      // unmaximize because they place the window themselves.
+      if (
+          window
+              .state[
+                  WINDOW_STATE_RESTORE_RECT
+              ]()
+      ) {
+        const restoreRect = this
+            .centeredHalfRectForWindow(
+                window,
+            );
         workspace?.syncFloatingWindowRect(window, restoreRect);
         playRectAnimation(
           window,
@@ -1676,6 +1693,8 @@ export class HybridWindowManager {
           appId: window.appId(),
           title: window.title(),
           focused: window.isFocused(),
+          maximized: window.state[WINDOW_STATE_MAXIMIZED](),
+          minimized: window.state[WINDOW_STATE_MINIMIZED](),
           lastFocusedAt: this.lastFocusedAt.get(window.id) ?? 0,
         }));
       list.push({
@@ -2426,6 +2445,23 @@ export class HybridWindowManager {
     return {
       width: Math.max(0, read(natural.width) - window.position.width),
       height: Math.max(0, read(natural.height) - window.position.height),
+    };
+  }
+
+  /** Half the screen's dimensions, centred in the usable area. */
+  private centeredHalfRectForWindow(window: WaylandWindow): ManagedWindowRect {
+    const full = this.maximizedRectForWindow(window);
+    const fullX = read(full.x);
+    const fullY = read(full.y);
+    const fullWidth = read(full.width);
+    const fullHeight = read(full.height);
+    const width = Math.round(fullWidth / 2);
+    const height = Math.round(fullHeight / 2);
+    return {
+      x: fullX + Math.round((fullWidth - width) / 2),
+      y: fullY + Math.round((fullHeight - height) / 2),
+      width,
+      height,
     };
   }
 
