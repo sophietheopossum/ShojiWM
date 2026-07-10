@@ -406,7 +406,9 @@ const WORKSPACE_VISUAL_RECT_ANIMATION_CHANNEL = `${WORKSPACE_VISUAL_ANIMATION_CH
 const WORKSPACE_VISUAL_OPACITY_ANIMATION_CHANNEL = `${WORKSPACE_VISUAL_ANIMATION_CHANNEL}.opacity`;
 export const WINDOW_BORDER_PX = 2;
 export const TITLEBAR_HEIGHT = 30;
-export const MAXIMIZED_WINDOW_PADDING = {
+// Outer margin around the snap layout (halves/quarters). Maximized windows
+// deliberately get none — they fill the usable area edge to edge.
+export const SNAP_BASE_PADDING = {
   top: 8,
   right: 8,
   bottom: 8,
@@ -915,17 +917,33 @@ export class HybridWindowManager {
     }
     window.setCloseAnimationDuration(OPEN_CLOSE_ANIMATION_DURATION);
 
-    const layoutWasDeferred = this.deferredInitialLayoutWindowIds.delete(
-      window.id,
-    );
-    const initialized = this.initializeWindowLayout(window, {
-      restoreScrollIfInitiallyFloating: layoutWasDeferred,
-    });
-    const restoredDuringInitialConfigure =
-      this.restoredDuringInitialConfigure.delete(window.id);
-    const restoredExistingWindow =
-      initialized.restoredExistingWindow || restoredDuringInitialConfigure;
-    const workspace = initialized.workspace;
+    let restoredExistingWindow = false;
+    const workspace =
+      this.findWorkspaceRestoringWindow(window) ?? this.getCurrentWorkspace();
+    if (workspace) {
+      restoredExistingWindow = workspace.addWindow(window);
+      if (
+        !restoredExistingWindow &&
+        workspace.isTiled &&
+        workspace.shouldTile(window)
+      ) {
+        this.trackPendingInitialFocus(window);
+      }
+      this.applyWorkspaceStackPolicy(workspace);
+      this.syncWorkspaceVisibility();
+    } else {
+      window.state[WINDOW_STATE_RECT].set(this.naturalRootRect(window));
+    }
+
+    if (window.isMaximized()) {
+      window.state[WINDOW_STATE_RESTORE_RECT].set(
+        this.initialRestoreRectForMaximizedWindow(window),
+      );
+      window.state[WINDOW_STATE_RECT].set(this.maximizedRectForWindow(window));
+      window.state[WINDOW_STATE_MAXIMIZED].set(true);
+    } else {
+      this.clampInitialFloatingRect(window, workspace);
+    }
     if (!restoredExistingWindow) {
       scheduleOpenAnimation(window);
     }
@@ -938,6 +956,62 @@ export class HybridWindowManager {
       restoredExistingWindow,
       scheduledOpenAnimation: !restoredExistingWindow,
     });
+  }
+
+  /**
+   * Panels are a forbidden zone for new floating windows. Clients that get
+   * no size guidance (we configure 0x0 and bounds 0x0) may size themselves
+   * to the full output — Rio does — which legally overlaps the bar since
+   * floating windows are unconstrained. Clamp the initial rect into the
+   * usable area; no-ops for windows that already fit.
+   */
+  private clampInitialFloatingRect(
+    window: WaylandWindow,
+    workspace: Workspace | undefined,
+  ) {
+    if (workspace?.isTiled && workspace.shouldTile(window)) {
+      return;
+    }
+    if (window.state[WINDOW_STATE_FULLSCREEN]()) {
+      return;
+    }
+    const rect = window.state[WINDOW_STATE_RECT]();
+    const x = read(rect.x);
+    const y = read(rect.y);
+    const width = read(rect.width);
+    const height = read(rect.height);
+    if (width <= 1 || height <= 1) {
+      return;
+    }
+    const monitor =
+      this.outputNameAt(x + width / 2, y + height / 2) ?? this.currentMonitor;
+    const usable = monitor ? COMPOSITOR.layer.usableArea(monitor) : null;
+    if (!usable) {
+      return;
+    }
+    const clampedWidth = Math.min(width, usable.width);
+    const clampedHeight = Math.min(height, usable.height);
+    const clampedX = Math.min(
+      Math.max(x, usable.x),
+      usable.x + usable.width - clampedWidth,
+    );
+    const clampedY = Math.min(
+      Math.max(y, usable.y),
+      usable.y + usable.height - clampedHeight,
+    );
+    if (
+      clampedWidth !== width ||
+      clampedHeight !== height ||
+      clampedX !== x ||
+      clampedY !== y
+    ) {
+      window.state[WINDOW_STATE_RECT].set({
+        x: clampedX,
+        y: clampedY,
+        width: clampedWidth,
+        height: clampedHeight,
+      });
+    }
   }
 
   public onStartClose(window: WaylandWindow) {
@@ -1588,6 +1662,53 @@ export class HybridWindowManager {
         return;
       }
     }
+  }
+
+  /**
+   * Alt+Tab: cycle focus through the current workspace's windows in stack
+   * order. Fixed order (not MRU) so repeated presses reach every window
+   * without a hold-to-cycle switcher UI (that's an M4 nicety).
+   */
+  public cycleWorkspaceFocus(direction: 1 | -1) {
+    const workspace = this.getCurrentWorkspace();
+    if (!workspace) {
+      return;
+    }
+    const windows = workspace
+      .listWindows()
+      .filter((window) => !window.state[WINDOW_STATE_MINIMIZED]());
+    if (windows.length === 0) {
+      return;
+    }
+    const focused = workspace.focusedWindow();
+    const index = focused
+      ? windows.findIndex((window) => window.id === focused.id)
+      : -1;
+    const next =
+      windows[(index + direction + windows.length) % windows.length];
+    if (!next) {
+      return;
+    }
+    if (workspace.isTiled && workspace.shouldTile(next)) {
+      workspace.focusWindow(next);
+    } else {
+      this.windowStack.raise(next);
+    }
+    next.focus();
+  }
+
+  public closeWindowById(
+      windowId: string,
+  ): boolean {
+    const window = this.findWindowById(windowId);
+    if (
+        !window
+    ) {
+      return false;
+    }
+    window
+        .close();
+    return true;
   }
 
   public toggleFocusedWindowMaximize() {
@@ -2555,27 +2676,23 @@ export class HybridWindowManager {
       ? COMPOSITOR.layer.usableArea(outputName)
       : undefined;
 
+    // Maximized fills the usable area edge to edge — no padding; the
+    // composition also drops the border and rounded corners for this state.
     if (usable) {
-      return insetRect(
-        {
-          x: usable.x,
-          y: usable.y,
-          width: usable.width,
-          height: usable.height,
-        },
-        MAXIMIZED_WINDOW_PADDING,
-      );
+      return {
+        x: usable.x,
+        y: usable.y,
+        width: usable.width,
+        height: usable.height,
+      };
     }
     if (output?.resolution) {
-      return insetRect(
-        {
-          x: output.position.x,
-          y: output.position.y,
-          width: output.resolution.width / output.scale,
-          height: output.resolution.height / output.scale,
-        },
-        MAXIMIZED_WINDOW_PADDING,
-      );
+      return {
+        x: output.position.x,
+        y: output.position.y,
+        width: output.resolution.width / output.scale,
+        height: output.resolution.height / output.scale,
+      };
     }
     return rect;
   }
@@ -2753,14 +2870,14 @@ export class HybridWindowManager {
     };
   }
 
-  /** Usable area inset by the maximized padding — the base for all snap rects. */
+  /** Usable area inset by the snap margin — the base for all snap rects. */
   private monitorSnapBaseRect(monitor: string): ManagedWindowRect | null {
     const usable =
       COMPOSITOR.layer.usableArea(monitor) ?? this.monitorFullRect(monitor);
     if (!usable) {
       return null;
     }
-    return insetRect(usable, MAXIMIZED_WINDOW_PADDING);
+    return insetRect(usable, SNAP_BASE_PADDING);
   }
 
   /** Resolve the snap zone for a pointer near the physical screen edges. */
