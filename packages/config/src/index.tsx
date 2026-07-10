@@ -32,15 +32,9 @@ import type {
   ManagedWindowRect,
 } from "shoji_wm/types";
 import { createIpcServer } from "shoji_wm/ipc";
-// User-facing settings owned by MinkaConf; tsx resolves JSON imports
-// natively. The import seeds boot values; `settings.apply` over IPC swaps
-// them at runtime (input/output factories re-run, no config reload).
-// MinkaConf persists to the same file so the next boot agrees.
-import minkaSettings from "./minka-settings.json";
+import { readFileSync } from "node:fs";
 
-// Full per-display schema MinkaConf's visual page writes. The JSON import
-// only types what the file currently contains, so displays get an explicit
-// shape here.
+// Full per-display schema MinkaConf's visual page writes.
 interface MinkaDisplaySettings {
   scale?: number;
   position?: { x: number; y: number };
@@ -50,10 +44,66 @@ interface MinkaDisplaySettings {
   hdr?: boolean;
 }
 
-type MinkaSettings = Omit<typeof minkaSettings, "displays"> & {
+interface MinkaInputSettings {
+  pointerAccel: number;
+  accelProfile: string;
+  naturalScroll: boolean;
+  touchpad: {
+    naturalScroll: boolean;
+    tapToClick: boolean;
+    scrollMethod: string;
+    scrollFactor: number;
+    disableWhileTyping: boolean;
+  };
+}
+
+interface MinkaSettings {
+  input: MinkaInputSettings;
   displays: Record<string, MinkaDisplaySettings | undefined>;
+  // Shell-side keys (e.g. shell.layout) ride along untouched: MinkaConf owns
+  // the whole file and MinkaShell reads it directly.
+  shell?: { layout?: string };
+}
+
+// User-facing settings owned by MinkaConf. Read at runtime, NOT imported as
+// a module: this config can live anywhere (repo checkout via SHOJI_CONFIG,
+// symlink, installed copy) and ESM resolves relative imports against the
+// module's realpath, while MinkaConf and MinkaShell always use the path
+// below. Boot reads the file once; `settings.apply` over IPC swaps values at
+// runtime (input/output factories re-run, no config reload). A missing or
+// unparseable file falls back to defaults so a fresh machine boots before
+// MinkaConf has ever written anything.
+const MINKA_SETTINGS_PATH = `${process.env.HOME}/.config/shojiwm/src/minka-settings.json`;
+
+// 8/7/2026 defaults per Sophie: adaptive accel, natural scroll off.
+const MINKA_SETTINGS_DEFAULTS: MinkaSettings = {
+  input: {
+    pointerAccel: 0.4,
+    accelProfile: "adaptive",
+    naturalScroll: false,
+    touchpad: {
+      naturalScroll: false,
+      tapToClick: true,
+      scrollMethod: "twoFinger",
+      scrollFactor: 1,
+      disableWhileTyping: false,
+    },
+  },
+  displays: {},
 };
-let activeSettings: MinkaSettings = minkaSettings as MinkaSettings;
+
+function loadMinkaSettings(): MinkaSettings {
+  try {
+    return JSON.parse(readFileSync(MINKA_SETTINGS_PATH, "utf8")) as MinkaSettings;
+  } catch (error) {
+    console.warn(
+      `minka-settings: using defaults (cannot read ${MINKA_SETTINGS_PATH}: ${error})`,
+    );
+    return MINKA_SETTINGS_DEFAULTS;
+  }
+}
+
+let activeSettings: MinkaSettings = loadMinkaSettings();
 import {
   HybridWindowManager,
   TITLEBAR_HEIGHT,
