@@ -474,14 +474,17 @@ COMPOSITOR.process.once("fcitx5", {
 // MinkaShell (Quickshell-based) is the session shell now; shoji-bar-2 is retired.
 // Logs go to /tmp/minkashell.log so warnings and crashes survive the session
 // for later inspection (Sophie has to switch to KDE to debug with Claude).
+// MINKA_SHELL_DIR overrides the installed location for repo-checkout sessions
+// (set in shojiwm-env.fish); tarball installs land in /usr/share/minka.
 COMPOSITOR.process.once("shell", {
-  command: "qs -p \"$HOME/Documents/src/MinkaDE/MinkaShell\" > /tmp/minkashell.log 2>&1",
+  command: "qs -p \"${MINKA_SHELL_DIR:-/usr/share/minka/MinkaShell}\" > /tmp/minkashell.log 2>&1",
   runPolicy: "once-per-session",
 });
 // MinkaFX: the Guido-style wgpu overlay process (snap preview, future OSDs).
-// Guarded so a not-yet-built binary is a silent no-op instead of a failure.
+// Guarded so a missing/not-yet-built binary is a silent no-op instead of a
+// failure. MINKA_FX_BIN overrides the installed path for repo-checkout runs.
 COMPOSITOR.process.once("MinkaFX", {
-  command: "[ -x \"$HOME/Documents/src/MinkaDE/MinkaFX/target/release/MinkaFX\" ] && exec \"$HOME/Documents/src/MinkaDE/MinkaFX/target/release/MinkaFX\" > /tmp/minkafx.log 2>&1",
+  command: "MINKA_FX=\"${MINKA_FX_BIN:-/usr/bin/MinkaFX}\"; [ -x \"$MINKA_FX\" ] && exec \"$MINKA_FX\" > /tmp/minkafx.log 2>&1",
   runPolicy: "once-per-session",
 });
 // Polkit authentication agent: without one, anything that needs privilege
