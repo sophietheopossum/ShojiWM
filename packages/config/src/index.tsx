@@ -473,7 +473,7 @@ COMPOSITOR.process.once("fcitx5", {
 
 // MinkaShell (Quickshell-based) is the session shell now; shoji-bar-2 is retired.
 // Logs go to /tmp/minkashell.log so warnings and crashes survive the session
-// for later inspection (Sophie has to switch to KDE to debug with Claude).
+// for later inspection.
 // MINKA_SHELL_DIR overrides the installed location for repo-checkout sessions
 // (set in shojiwm-env.fish); tarball installs land in /usr/share/minka.
 COMPOSITOR.process.once("shell", {
