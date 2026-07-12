@@ -55,6 +55,11 @@ interface MinkaInputSettings {
     scrollFactor: number;
     disableWhileTyping: boolean;
   };
+  // Optional: settings files written before the keyboard section lack it.
+  keyboard?: {
+    layout?: string;
+    variant?: string;
+  };
 }
 
 interface MinkaSettings {
@@ -87,6 +92,10 @@ const MINKA_SETTINGS_DEFAULTS: MinkaSettings = {
       scrollMethod: "twoFinger",
       scrollFactor: 1,
       disableWhileTyping: false,
+    },
+    keyboard: {
+      layout: "us",
+      variant: "",
     },
   },
   displays: {},
@@ -742,6 +751,10 @@ COMPOSITOR.input.configure((input, _context) => {
       naturalScroll: inputSettings.naturalScroll,
     },
     keyboard: {
+      layout: inputSettings.keyboard?.layout || "us",
+      ...(inputSettings.keyboard?.variant
+        ? { variant: inputSettings.keyboard.variant }
+        : {}),
       options: "caps:ctrl_modifier",
       repeatRate: 60,
       repeatDelay: 250,
