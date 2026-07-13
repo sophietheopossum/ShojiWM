@@ -351,14 +351,16 @@ impl ScreenCast {
         thumbnail_tx: tokio::sync::mpsc::UnboundedSender<ThumbnailUpdate>,
     ) -> Self {
         Self {
-            picker,
-            sessions: Mutex::new(HashMap::new()),
-            streams: Mutex::new(HashMap::new()),
-            cursor_visibility: Mutex::new(HashMap::new()),
-            persist_modes: Mutex::new(
-                HashMap::new()
-            ),
-            thumbnail_tx,
+            inner: Arc::new(Inner {
+                picker,
+                sessions: Mutex::new(HashMap::new()),
+                streams: Mutex::new(HashMap::new()),
+                cursor_visibility: Mutex::new(HashMap::new()),
+                persist_modes: Mutex::new(
+                    HashMap::new()
+                ),
+                thumbnail_tx,
+            }),
         }
     }
 }
@@ -391,12 +393,35 @@ impl ScreenCast {
         session_handle: ObjectPath<'_>,
         app_id: String,
         options: HashMap<String, OwnedValue>,
+        #[zbus(object_server)] server: &zbus::ObjectServer,
         #[zbus(signal_emitter)] _emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, OwnedValue>)> {
         tracing::info!(
             %handle, %session_handle, %app_id, option_keys = ?options.keys().collect::<Vec<_>>(),
             "CreateSession"
         );
+        // Export the impl Session object at the session handle so the portal
+        // frontend can Close() us — that's how a session's stream gets torn
+        // down when the app is done with it.
+        let session = SessionImpl {
+            session_key: session_handle
+                .to_string(),
+            inner: self.inner
+                .clone(),
+        };
+        server
+            .at(
+                &session_handle, 
+                session,
+            )
+            .await
+            .map_err(
+                |e| zbus::fdo::Error::Failed(
+                    format!(
+                        "export session object: {e}",
+                    ),
+                ),
+            )?;
         Ok((0, HashMap::new()))
     }
 
@@ -418,7 +443,7 @@ impl ScreenCast {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(cursor_modes::EMBEDDED);
         let cursor_visible = cursor_mode & cursor_modes::EMBEDDED != 0;
-        self.cursor_visibility
+        self.inner.cursor_visibility
             .lock()
             .unwrap()
             .insert(session_handle.to_string(), cursor_visible);
@@ -431,7 +456,7 @@ impl ScreenCast {
                     .ok(),
             )
             .unwrap_or(0);
-        self.persist_modes
+        self.inner.persist_modes
             .lock()
             .unwrap()
             .insert(
@@ -455,7 +480,7 @@ impl ScreenCast {
         // discovery + first thumbnails, then keeps refreshing each source in
         // round-robin until the returned handle is dropped.
         let (init_tx, init_rx) = tokio::sync::oneshot::channel();
-        let thumbnail_tx = self.thumbnail_tx.clone();
+        let thumbnail_tx = self.inner.thumbnail_tx.clone();
         let _stream_guard = tokio::task::spawn_blocking(move || {
             sources::start_thumbnail_stream(init_tx, thumbnail_tx)
         })
@@ -483,7 +508,7 @@ impl ScreenCast {
                     "restore_data matched a live source; skipping picker",
                 );
                 drop(_stream_guard);
-                self.sessions
+                self.inner.sessions
                     .lock()
                     .unwrap()
                     .insert(
@@ -504,14 +529,14 @@ impl ScreenCast {
             );
         }
 
-        let pick = self.picker.pick(filtered).await;
+        let pick = self.inner.picker.pick(filtered).await;
         drop(_stream_guard);
 
         match pick {
             PickResult::Source(src) => match src.kind {
                 SourceKind::Output(out) => {
                     tracing::info!(?out, %session_handle, "picker: selected output");
-                    self.sessions
+                    self.inner.sessions
                         .lock()
                         .unwrap()
                         .insert(session_handle.to_string(), Selection::Output(out));
@@ -519,7 +544,7 @@ impl ScreenCast {
                 }
                 SourceKind::Toplevel(top) => {
                     tracing::info!(?top, %session_handle, "picker: selected toplevel");
-                    self.sessions
+                    self.inner.sessions
                         .lock()
                         .unwrap()
                         .insert(session_handle.to_string(), Selection::Toplevel(top));
@@ -542,6 +567,7 @@ impl ScreenCast {
         _options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, OwnedValue>)> {
         let selection = self
+            .inner
             .sessions
             .lock()
             .unwrap()
@@ -551,6 +577,7 @@ impl ScreenCast {
 
         let session_key = session_handle.to_string();
         let cursor_visible = self
+            .inner
             .cursor_visibility
             .lock()
             .unwrap()
@@ -558,6 +585,7 @@ impl ScreenCast {
             .copied()
             .unwrap_or(true);
         let persist_mode = self
+            .inner
             .persist_modes
             .lock()
             .unwrap()
@@ -591,7 +619,7 @@ impl ScreenCast {
                         return Ok((2, HashMap::new()));
                     }
                 };
-                self.streams
+                self.inner.streams
                     .lock()
                     .unwrap()
                     .insert(session_key, AnyStreamHandle::Output(handle_owned));
@@ -642,7 +670,7 @@ impl ScreenCast {
                         return Ok((2, HashMap::new()));
                     }
                 };
-                self.streams
+                self.inner.streams
                     .lock()
                     .unwrap()
                     .insert(session_key, AnyStreamHandle::Toplevel(handle_owned));
