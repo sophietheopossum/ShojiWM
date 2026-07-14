@@ -1864,32 +1864,34 @@ unsafe fn fill_header_meta(
     pw_buf: *mut pw::sys::pw_buffer,
     seq: u64,
 ) {
-    let buf = (*pw_buf).buffer;
-    if buf.is_null() || (*buf).metas.is_null() {
-        return;
-    }
-    let metas = std::slice::from_raw_parts_mut(
-        (*buf).metas,
-        (*buf).n_metas as usize,
-    );
-    for meta in metas {
-        if meta.type_ != spa_sys::SPA_META_Header
-            || (meta.size as usize) < size_of::<spa_sys::spa_meta_header>()
-            || meta.data.is_null()
-        {
-            continue;
+    unsafe {
+        let buf = (*pw_buf).buffer;
+        if buf.is_null() || (*buf).metas.is_null() {
+            return;
         }
-        let now = rustix::time::clock_gettime(
-            rustix::time::ClockId::Monotonic,
+        let metas = std::slice::from_raw_parts_mut(
+            (*buf).metas,
+            (*buf).n_metas as usize,
         );
-        let header = &mut *(
-            meta.data as *mut spa_sys::spa_meta_header
-        );
-        header.flags = 0;
-        header.offset = 0;
-        header.seq = seq;
-        header.pts = now.tv_sec as i64 * 1_000_000_000 + now.tv_nsec as i64;
-        header.dts_offset = 0;
+        for meta in metas {
+            if meta.type_ != spa_sys::SPA_META_Header
+                || (meta.size as usize) < size_of::<spa_sys::spa_meta_header>()
+                || meta.data.is_null()
+            {
+                continue;
+            }
+            let now = rustix::time::clock_gettime(
+                rustix::time::ClockId::Monotonic,
+            );
+            let header = &mut *(
+                meta.data as *mut spa_sys::spa_meta_header
+            );
+            header.flags = 0;
+            header.offset = 0;
+            header.seq = seq;
+            header.pts = now.tv_sec as i64 * 1_000_000_000 + now.tv_nsec as i64;
+            header.dts_offset = 0;
+        }
     }
 }
 
