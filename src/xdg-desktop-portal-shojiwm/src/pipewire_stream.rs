@@ -999,6 +999,10 @@ impl AppState {
                 tracing::error!("on_add_buffer: no datas in pw_buffer");
                 return;
             }
+            tracing::debug!(
+                n_metas = (*buf).n_metas,
+                "on_add_buffer: negotiated buffer metas"
+            );
             let data = &mut datas[0];
             data.type_ = data_type;
             data.flags = spa_sys::SPA_DATA_FLAG_READWRITE;
