@@ -65,6 +65,9 @@ interface MinkaInputSettings {
 interface MinkaSettings {
   input: MinkaInputSettings;
   displays: Record<string, MinkaDisplaySettings | undefined>;
+  // XCursor theme + size, owned by MinkaConf's cursor page. Optional so
+  // settings files from before revision 3 still parse.
+  cursor?: { theme?: string; size?: number };
   // Shell-side keys (e.g. shell.layout) ride along untouched: MinkaConf owns
   // the whole file and MinkaShell reads it directly.
   shell?: { layout?: string };
@@ -357,8 +360,9 @@ WORKSPACE_IPC.handle("windows.minimize", (params) => {
 // the factories consuming it change, so MinkaConf can tell the user the
 // running session predates the edit ("reload with Super+Shift+R") instead
 // of silently half-applying. History: 1 = input + display scale;
-// 2 = full display schema (position/mode/enabled/mirror/hdr).
-const MINKA_CONFIG_REVISION = 2;
+// 2 = full display schema (position/mode/enabled/mirror/hdr);
+// 3 = cursor theme + size.
+const MINKA_CONFIG_REVISION = 3;
 WORKSPACE_IPC.handle("minka.revision", () => ({
   revision: MINKA_CONFIG_REVISION,
 }));
@@ -374,8 +378,31 @@ WORKSPACE_IPC.handle("settings.apply", (params) => {
   activeSettings = params as MinkaSettings;
   COMPOSITOR.input.reconfigure();
   COMPOSITOR.output.reconfigure();
+  applyCursorSettings();
   return { ok: true };
 });
+
+// Cursor theme + size come from minka-settings.json (MinkaConf's cursor
+// page). configure() applies live and also exports XCURSOR_THEME /
+// XCURSOR_SIZE to the systemd and D-Bus activation environments, so apps
+// launched afterwards agree with the compositor. Feature-detected so this
+// config still evaluates on a ShojiWM build without the cursor API.
+function applyCursorSettings() {
+  const cursorApi = (
+    COMPOSITOR as {
+      cursor?: { configure(config: { theme: string; size: number }): void };
+    }
+  ).cursor;
+  const cursor = activeSettings.cursor;
+  if (!cursorApi || !cursor?.theme) {
+    return;
+  }
+  cursorApi.configure({
+    theme: cursor.theme,
+    size: cursor.size ?? 24,
+  });
+}
+applyCursorSettings();
 
 WORKSPACE_IPC.handle("debug.geometry", () => {
   const usable: Record<string, unknown> = {};
