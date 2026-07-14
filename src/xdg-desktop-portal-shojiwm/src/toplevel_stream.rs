@@ -413,10 +413,21 @@ fn run(
     };
     let format_bytes = build_video_format_param(adv_width, adv_height, spec.framerate)?;
     let buffers_bytes = build_buffers_param(adv_width, adv_height)?;
+    let meta_bytes = build_header_meta_param()?;
     let format_pod = Pod::from_bytes(&format_bytes).ok_or("format POD parse failed".to_string())?;
     let buffers_pod =
         Pod::from_bytes(&buffers_bytes).ok_or("buffers POD parse failed".to_string())?;
-    let mut params = [format_pod, buffers_pod];
+    let meta_pod = Pod::from_bytes(
+        &meta_bytes,
+    ).ok_or(
+        "meta POD parse failed"
+            .to_string(),
+    )?;
+    let mut params = [
+        format_pod,
+        buffers_pod,
+        meta_pod,
+    ];
     stream.connect(
         spa::utils::Direction::Output,
         None,
@@ -467,12 +478,45 @@ fn run(
                 match (
                     build_video_format_param(new_w, new_h, framerate),
                     build_buffers_param(new_w, new_h),
+                    build_header_meta_param(),
                 ) {
-                    (Ok(fbytes), Ok(bbytes)) => {
-                        if let (Some(fpod), Some(bpod)) =
-                            (Pod::from_bytes(&fbytes), Pod::from_bytes(&bbytes))
-                        {
-                            let mut params = [fpod, bpod];
+                    (
+                        Ok(
+                            fbytes,
+                        ),
+                        Ok(
+                            bbytes,
+                        ),
+                        Ok(
+                            mbytes,
+                        ),
+                    ) => {
+                        if let (
+                            Some(
+                                fpod,
+                            ),
+                            Some(
+                                bpod,
+                            ),
+                            Some(
+                                mpod,
+                            ),
+                        ) = (
+                            Pod::from_bytes(
+                                &fbytes,
+                            ),
+                            Pod::from_bytes(
+                                &bbytes,
+                            ),
+                            Pod::from_bytes(
+                                &mbytes,
+                            ),
+                        ) {
+                            let mut params = [
+                                fpod,
+                                bpod,
+                                mpod,
+                            ];
                             if let Err(e) = stream.update_params(&mut params) {
                                 tracing::warn!("update_params failed: {e:?}");
                             }
