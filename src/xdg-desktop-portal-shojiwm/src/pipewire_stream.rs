@@ -470,6 +470,10 @@ fn run(
     let mut param_bytes = build_video_format_params(&spec, &dmabuf_modifiers, false)?;
     let buffers_bytes = build_buffers_param(&spec, !dmabuf_modifiers.is_empty())?;
     param_bytes.push(buffers_bytes);
+    param_bytes
+        .push(
+            build_header_meta_param()?,
+        );
     let mut params = Vec::with_capacity(param_bytes.len());
     for bytes in &param_bytes {
         params.push(Pod::from_bytes(bytes).ok_or("PipeWire POD parse failed".to_string())?);
@@ -888,6 +892,10 @@ impl AppState {
         let mut param_bytes = build_video_format_params(&self.spec, modifiers, true)?;
         let buffers_bytes = build_buffers_param(&self.spec, !modifiers.is_empty())?;
         param_bytes.push(buffers_bytes);
+        param_bytes
+            .push(
+                build_header_meta_param()?,
+            );
         let mut params = Vec::with_capacity(param_bytes.len());
         for bytes in &param_bytes {
             params.push(Pod::from_bytes(bytes).ok_or("PipeWire POD parse failed".to_string())?);
@@ -1816,4 +1824,135 @@ fn build_buffers_param(
     Ok(PodSerializer::serialize(Cursor::new(Vec::new()), &obj)?
         .0
         .into_inner())
+}
+
+/// Advertise a per-buffer `SPA_META_Header` region. Every mainstream portal
+/// (KWin, Mutter, xdph) provides this; consumers use the pts/seq for frame
+/// pacing, and its absence puts us off the code paths consumers are actually
+/// tested against.
+fn build_header_meta_param() -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let obj = Value::Object(Object {
+        type_: spa_sys::SPA_TYPE_OBJECT_ParamMeta,
+        id: spa_sys::SPA_PARAM_Meta,
+        properties: vec![
+            Property::new(
+                spa_sys::SPA_PARAM_META_type,
+                Value::Id(
+                    Id(
+                        spa_sys::SPA_META_Header,
+                    ),
+                ),
+            ),
+            Property::new(
+                spa_sys::SPA_PARAM_META_size,
+                Value::Int(
+                    size_of::<spa_sys::spa_meta_header>() as i32,
+                ),
+            ),
+        ],
+    });
+    Ok(PodSerializer::serialize(Cursor::new(Vec::new()), &obj)?
+        .0
+        .into_inner())
+}
+
+/// Fill the negotiated `SPA_META_Header` region on a pw_buffer with a
+/// monotonic timestamp and sequence number. `flags` must be explicitly
+/// zeroed — a stray `SPA_META_HEADER_FLAG_CORRUPTED` makes consumers drop
+/// the frame silently.
+unsafe fn fill_header_meta(
+    pw_buf: *mut pw::sys::pw_buffer,
+    seq: u64,
+) {
+    let buf = (*pw_buf).buffer;
+    if buf.is_null() || (*buf).metas.is_null() {
+        return;
+    }
+    let metas = std::slice::from_raw_parts_mut(
+        (*buf).metas,
+        (*buf).n_metas as usize,
+    );
+    for meta in metas {
+        if meta.type_ != spa_sys::SPA_META_Header
+            || (meta.size as usize) < size_of::<spa_sys::spa_meta_header>()
+            || meta.data.is_null()
+        {
+            continue;
+        }
+        let now = rustix::time::clock_gettime(
+            rustix::time::ClockId::Monotonic,
+        );
+        let header = &mut *(
+            meta.data as *mut spa_sys::spa_meta_header
+        );
+        header.flags = 0;
+        header.offset = 0;
+        header.seq = seq;
+        header.pts = now.tv_sec as i64 * 1_000_000_000 + now.tv_nsec as i64;
+        header.dts_offset = 0;
+    }
+}
+
+/// Extract the fixated `maxFramerate` from a negotiated Format param.
+fn parse_pipewire_max_framerate(
+    param: &Pod,
+) -> Option<Fraction> {
+    let obj = param
+        .as_object()
+        .ok()?;
+    let prop = obj
+        .find_prop(
+            Id(
+                spa_sys::SPA_FORMAT_VIDEO_maxFramerate,
+            ),
+        )?;
+    let ptr = NonNull::new(
+        prop
+            .value()
+            .as_raw_ptr(),
+    )?;
+    let value: Value = unsafe {
+        PodDeserializer::deserialize_ptr(
+            ptr,
+        ).ok()?
+    };
+    match value {
+        Value::Fraction(
+            fraction,
+        ) => Some(
+            fraction,
+        ),
+        Value::Choice(
+            ChoiceValue::Fraction(
+                Choice(
+                    _,
+                    choice,
+                ),
+            ),
+        ) => match choice {
+            ChoiceEnum::None(
+                fraction,
+            ) => Some(
+                fraction,
+            ),
+            ChoiceEnum::Range {
+                default, ..
+            }
+            | ChoiceEnum::Step {
+                default,
+                ..
+            }
+            | ChoiceEnum::Enum {
+                default,
+                ..
+            }
+            | ChoiceEnum::Flags {
+                default,
+                ..
+            } => Some(
+                default,
+            ),
+        },
+        _ => None,
+    }
 }
