@@ -3,7 +3,10 @@
 //! See: https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.impl.portal.ScreenCast.html
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{
+    Arc,
+    Mutex,
+};
 
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
@@ -48,14 +51,298 @@ enum AnyStreamHandle {
     Toplevel(ToplevelStreamHandle),
 }
 
-pub struct ScreenCast {
+/// Shared portal state. Held by the ScreenCast interface and by every
+/// per-session [`SessionImpl`] object, so a session Close can drop exactly
+/// its own stream and bookkeeping.
+struct Inner {
     picker: PickerHandle,
     sessions: Mutex<HashMap<String, Selection>>,
     streams: Mutex<HashMap<String, AnyStreamHandle>>,
     /// Per-session `cursor_mode & EMBEDDED != 0`. Filled by SelectSources,
     /// consumed by Start to configure the streaming pipeline.
     cursor_visibility: Mutex<HashMap<String, bool>>,
+    /// Per-session `persist_mode` requested at SelectSources. When non-zero,
+    /// Start returns `restore_data` so the portal frontend can hand the app a
+    /// restore token — that's what lets Chromium's repeated Go Live sessions
+    /// (and OBS on relaunch) skip the picker after the first approval.
+    persist_modes: Mutex<HashMap<String, u32>>,
     thumbnail_tx: tokio::sync::mpsc::UnboundedSender<ThumbnailUpdate>,
+}
+
+impl Inner {
+    /// Tear down everything a session owns. Dropping the stream handle stops
+    /// the capture thread and removes the PipeWire node.
+    fn cleanup_session(
+        &self,
+        session_key: &str,
+    ) {
+        let stream = self.streams
+            .lock()
+            .unwrap()
+            .remove(
+                session_key,
+            );
+        let had_stream = stream
+            .is_some();
+        drop(
+            stream,
+        );
+        self.sessions
+            .lock()
+            .unwrap()
+            .remove(
+                session_key,
+            );
+        self.cursor_visibility
+            .lock()
+            .unwrap()
+            .remove(
+                session_key,
+            );
+        self.persist_modes
+            .lock()
+            .unwrap()
+            .remove(
+                session_key,
+            );
+        tracing::info!(session_key, had_stream, "session closed and cleaned up");
+    }
+}
+
+pub struct ScreenCast {
+    inner: Arc<Inner>,
+}
+
+/// Per-session `org.freedesktop.impl.portal.Session` object, exported at the
+/// session handle path by CreateSession. Without it the portal frontend's
+/// Close calls fail with UnknownObject and our streams outlive their
+/// sessions — Chromium's Go Live opens and closes several sessions
+/// back-to-back, so the stale driver streams pile up on the output.
+struct SessionImpl {
+    session_key: String,
+    inner: Arc<Inner>,
+}
+
+#[zbus::interface(name = "org.freedesktop.impl.portal.Session")]
+impl SessionImpl {
+    #[zbus(property, name = "version")]
+    fn version(
+        &self
+    ) -> u32 {
+        1
+    }
+
+    async fn close(
+        &self,
+        #[zbus(object_server)] server: &zbus::ObjectServer,
+    ) -> zbus::fdo::Result<()> {
+        self.inner
+            .cleanup_session(
+                &self.session_key,
+            );
+        if let Ok(path) = ObjectPath::try_from(
+            self.session_key
+                .clone(),
+        ) {
+            let _ = server.remove::<Self, _>(&path).await;
+        }
+        Ok(())
+    }
+}
+
+/// Vendor tag inside the `(suv)` restore_data blob. The frontend gives the
+/// blob back verbatim on later sessions; the tag + version gate decoding.
+const RESTORE_VENDOR: &str = "shojiwm";
+const RESTORE_VERSION: u32 = 1;
+
+/// Encode a selection as the `v` payload of restore_data. Flat `(ssss)`:
+/// ("output", connector_name, "", "") or
+/// ("toplevel", identifier, app_id, title). Toplevel identifiers are not
+/// stable across compositor restarts, so app_id+title are carried as a
+/// fallback match key.
+fn encode_restore_data(selection: &Selection) -> Value<'static> {
+    let data = match selection {
+        Selection::Output(out) => Value::from((
+            "output"
+                .to_string(),
+            out.name
+                .clone(),
+            String::new(),
+            String::new(),
+        )),
+        Selection::Toplevel(top) => Value::from((
+            "toplevel"
+                .to_string(),
+            top.identifier
+                .clone(),
+            top.app_id
+                .clone(),
+            top.title
+                .clone(),
+        )),
+    };
+    Value::from((
+        RESTORE_VENDOR
+            .to_string(),
+        RESTORE_VERSION,
+        Value::new(data),
+    ))
+}
+
+/// Attach `restore_data` + granted `persist_mode` to Start results when the
+/// app asked for persistence. The portal frontend stores the blob in its
+/// permission store and hands the app a restore token in our stead.
+fn append_restore_results(
+    results: &mut HashMap<String, OwnedValue>,
+    persist_mode: u32,
+    selection: &Selection,
+) {
+    if persist_mode == 0 {
+        return;
+    }
+    match OwnedValue::try_from(encode_restore_data(selection)) {
+        Ok(blob) => {
+            results
+                .insert(
+                    "persist_mode"
+                        .to_string(), 
+                    OwnedValue::from(
+                        persist_mode,
+                    ),
+                );
+            results
+                .insert(
+                    "restore_data"
+                        .to_string(),
+                    blob,
+                );
+        }
+        Err(e) => tracing::warn!("failed to encode restore_data: {e}"),
+    }
+}
+
+/// Decoded restore request from a `(suv)` restore_data option.
+struct RestoreRequest {
+    kind: String,
+    key: String,
+    app_id: String,
+    title: String,
+}
+
+fn decode_restore_data(value: &OwnedValue) -> Option<RestoreRequest> {
+    let structure = match &**value {
+        Value::Structure(s) => s,
+        _ => return None,
+    };
+    let fields = structure
+        .fields();
+    let vendor = match fields
+        .first()? {
+        Value::Str(s) => s
+            .as_str(),
+        _ => return None,
+    };
+    let version = match fields.get(1)? {
+        Value::U32(v) => *v,
+        _ => return None,
+    };
+    if vendor != RESTORE_VENDOR || version != RESTORE_VERSION {
+        return None;
+    }
+    let mut inner = fields.get(2)?;
+    while let Value::Value(boxed) = inner {
+        inner = boxed;
+    }
+    let data = match inner {
+        Value::Structure(s) => s,
+        _ => return None,
+    };
+    let field_str = |i: usize| -> Option<String> {
+        match data.fields().get(i)? {
+            Value::Str(s) => Some(
+                s
+                    .to_string()
+            ),
+            _ => None,
+        }
+    };
+    Some(RestoreRequest {
+        kind: field_str(0)?,
+        key: field_str(1)?,
+        app_id: field_str(2)?,
+        title: field_str(3)?,
+    })
+}
+
+/// Match a restore request against the currently existing sources. Only a
+/// live match may skip the picker — a vanished output or closed window
+/// falls through to the normal dialog.
+fn match_restore(request: &RestoreRequest, sources: &[SourceInfo]) -> Option<Selection> {
+    match request.kind.as_str() {
+        "output" => sources.iter().find_map(|s| match &s.kind {
+            SourceKind::Output(out) if out.name == request.key => {
+                Some(
+                    Selection::Output(
+                        out
+                            .clone()
+                    )
+                )
+            }
+            _ => None,
+        }),
+        "toplevel" => {
+            let toplevels: Vec<&ToplevelInfo> = sources
+                .iter()
+                .filter_map(|s| match &s.kind {
+                    SourceKind::Toplevel(top) => Some(top),
+                    _ => None,
+                })
+                .collect();
+            // Identifier is exact within a compositor run; app_id+title is
+            // the cross-restart fallback; a unique app_id match handles
+            // title drift (documents, web pages).
+            if let Some(top) = toplevels.iter().find(|t| t.identifier == request.key) {
+                return Some(
+                    Selection::Toplevel(
+                        (
+                            *top
+                        ).clone()
+                    )
+                );
+            }
+            if !request.app_id.is_empty()
+                && let Some(top) = toplevels
+                    .iter()
+                    .find(|t| t.app_id == request.app_id && t.title == request.title)
+            {
+                return Some(
+                    Selection::Toplevel(
+                        (
+                            *top
+                        ).clone()
+                    )
+                );
+            }
+            if !request.app_id.is_empty() {
+                let mut by_app = toplevels
+                    .iter()
+                    .filter(
+                        |t| t.app_id == request.app_id,
+                    );
+                if let (Some(top), None) = (by_app.next(), by_app.next()) {
+                    return Some(
+                        Selection::Toplevel(
+                            (
+                                *top
+                            ).clone(),
+                        ),
+                    );
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 impl ScreenCast {
@@ -64,11 +351,16 @@ impl ScreenCast {
         thumbnail_tx: tokio::sync::mpsc::UnboundedSender<ThumbnailUpdate>,
     ) -> Self {
         Self {
-            picker,
-            sessions: Mutex::new(HashMap::new()),
-            streams: Mutex::new(HashMap::new()),
-            cursor_visibility: Mutex::new(HashMap::new()),
-            thumbnail_tx,
+            inner: Arc::new(Inner {
+                picker,
+                sessions: Mutex::new(HashMap::new()),
+                streams: Mutex::new(HashMap::new()),
+                cursor_visibility: Mutex::new(HashMap::new()),
+                persist_modes: Mutex::new(
+                    HashMap::new()
+                ),
+                thumbnail_tx,
+            }),
         }
     }
 }
@@ -101,12 +393,35 @@ impl ScreenCast {
         session_handle: ObjectPath<'_>,
         app_id: String,
         options: HashMap<String, OwnedValue>,
+        #[zbus(object_server)] server: &zbus::ObjectServer,
         #[zbus(signal_emitter)] _emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, OwnedValue>)> {
         tracing::info!(
             %handle, %session_handle, %app_id, option_keys = ?options.keys().collect::<Vec<_>>(),
             "CreateSession"
         );
+        // Export the impl Session object at the session handle so the portal
+        // frontend can Close() us — that's how a session's stream gets torn
+        // down when the app is done with it.
+        let session = SessionImpl {
+            session_key: session_handle
+                .to_string(),
+            inner: self.inner
+                .clone(),
+        };
+        server
+            .at(
+                &session_handle, 
+                session,
+            )
+            .await
+            .map_err(
+                |e| zbus::fdo::Error::Failed(
+                    format!(
+                        "export session object: {e}",
+                    ),
+                ),
+            )?;
         Ok((0, HashMap::new()))
     }
 
@@ -128,10 +443,34 @@ impl ScreenCast {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(cursor_modes::EMBEDDED);
         let cursor_visible = cursor_mode & cursor_modes::EMBEDDED != 0;
-        self.cursor_visibility
+        self.inner.cursor_visibility
             .lock()
             .unwrap()
             .insert(session_handle.to_string(), cursor_visible);
+        let persist_mode = options
+            .get(
+                "persist_mode",
+            )
+            .and_then(
+                |v| u32::try_from(v)
+                    .ok(),
+            )
+            .unwrap_or(0);
+        self.inner.persist_modes
+            .lock()
+            .unwrap()
+            .insert(
+                session_handle
+                    .to_string(),
+                persist_mode,
+            );
+        let restore_request = options
+            .get(
+                "restore_data",
+            )
+            .and_then(
+                decode_restore_data,
+            );
         tracing::info!(
             %handle, %session_handle, %app_id, requested_types = requested, cursor_mode, cursor_visible,
             "SelectSources: enumerating sources and prompting picker"
@@ -141,7 +480,7 @@ impl ScreenCast {
         // discovery + first thumbnails, then keeps refreshing each source in
         // round-robin until the returned handle is dropped.
         let (init_tx, init_rx) = tokio::sync::oneshot::channel();
-        let thumbnail_tx = self.thumbnail_tx.clone();
+        let thumbnail_tx = self.inner.thumbnail_tx.clone();
         let _stream_guard = tokio::task::spawn_blocking(move || {
             sources::start_thumbnail_stream(init_tx, thumbnail_tx)
         })
@@ -158,14 +497,46 @@ impl ScreenCast {
             .collect();
         tracing::info!(count = filtered.len(), "enumerated sources");
 
-        let pick = self.picker.pick(filtered).await;
+        // A valid restore_data blob that still matches a live source skips
+        // the picker entirely — this is what keeps Chromium's Go Live (which
+        // opens several sessions back-to-back) down to a single dialog.
+        if let Some(request) = restore_request {
+            if let Some(selection) = match_restore(&request, &filtered) {
+                tracing::info!(
+                    %session_handle, 
+                    ?selection,
+                    "restore_data matched a live source; skipping picker",
+                );
+                drop(_stream_guard);
+                self.inner.sessions
+                    .lock()
+                    .unwrap()
+                    .insert(
+                        session_handle
+                            .to_string(), 
+                        selection,
+                    );
+                return Ok(
+                    (
+                        0,
+                        HashMap::new(),
+                    )
+                );
+            }
+            tracing::info!(
+                %session_handle,
+                "restore_data no longer matches any source; prompting picker",
+            );
+        }
+
+        let pick = self.inner.picker.pick(filtered).await;
         drop(_stream_guard);
 
         match pick {
             PickResult::Source(src) => match src.kind {
                 SourceKind::Output(out) => {
                     tracing::info!(?out, %session_handle, "picker: selected output");
-                    self.sessions
+                    self.inner.sessions
                         .lock()
                         .unwrap()
                         .insert(session_handle.to_string(), Selection::Output(out));
@@ -173,7 +544,7 @@ impl ScreenCast {
                 }
                 SourceKind::Toplevel(top) => {
                     tracing::info!(?top, %session_handle, "picker: selected toplevel");
-                    self.sessions
+                    self.inner.sessions
                         .lock()
                         .unwrap()
                         .insert(session_handle.to_string(), Selection::Toplevel(top));
@@ -196,6 +567,7 @@ impl ScreenCast {
         _options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, OwnedValue>)> {
         let selection = self
+            .inner
             .sessions
             .lock()
             .unwrap()
@@ -205,12 +577,23 @@ impl ScreenCast {
 
         let session_key = session_handle.to_string();
         let cursor_visible = self
+            .inner
             .cursor_visibility
             .lock()
             .unwrap()
             .get(&session_key)
             .copied()
             .unwrap_or(true);
+        let persist_mode = self
+            .inner
+            .persist_modes
+            .lock()
+            .unwrap()
+            .get(
+                &session_key
+            )
+            .copied()
+            .unwrap_or(0);
         match selection {
             Some(Selection::Output(out)) => {
                 let framerate = {
@@ -236,7 +619,7 @@ impl ScreenCast {
                         return Ok((2, HashMap::new()));
                     }
                 };
-                self.streams
+                self.inner.streams
                     .lock()
                     .unwrap()
                     .insert(session_key, AnyStreamHandle::Output(handle_owned));
@@ -255,6 +638,11 @@ impl ScreenCast {
                 results.insert(
                     "streams".to_string(),
                     OwnedValue::try_from(Value::from(streams)).unwrap(),
+                );
+                append_restore_results(
+                    &mut results,
+                    persist_mode, 
+                    &Selection::Output(out),
                 );
                 Ok((0, results))
             }
@@ -282,7 +670,7 @@ impl ScreenCast {
                         return Ok((2, HashMap::new()));
                     }
                 };
-                self.streams
+                self.inner.streams
                     .lock()
                     .unwrap()
                     .insert(session_key, AnyStreamHandle::Toplevel(handle_owned));
@@ -294,6 +682,13 @@ impl ScreenCast {
                 results.insert(
                     "streams".to_string(),
                     OwnedValue::try_from(Value::from(streams)).unwrap(),
+                );
+                append_restore_results(
+                    &mut results, 
+                    persist_mode,
+                    &Selection::Toplevel(
+                        top,
+                    ),
                 );
                 Ok((0, results))
             }
