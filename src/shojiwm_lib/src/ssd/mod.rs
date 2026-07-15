@@ -320,8 +320,17 @@ impl ComputedDecorationTree {
                     .corner_width
                     .map(|width| ResolvedLayoutValue::from_logical(width as f64, scale))
                     .unwrap_or(inset + outset);
+                // Anchor the band on the WindowBorder node (the visible
+                // border), not the decoration root: chrome outside the
+                // border (e.g. a drag halo) must stay a move surface beyond
+                // the band. Without such chrome the border is the root and
+                // this is the plain frame band.
+                let border_rect = self
+                    .root
+                    .resolved_window_border_rect()
+                    .unwrap_or(self.root.resolved_rect);
                 if let Some(edges) = hit_test_resize_edges(
-                    self.root.resolved_rect,
+                    border_rect,
                     inset.raw(),
                     outset.raw(),
                     corner_width.raw(),
@@ -485,6 +494,16 @@ impl ComputedDecorationNode {
             Some(border) => Some(border.width),
             None => self.window_border_resize_hit_area().map(|_| 0.0),
         }
+    }
+
+    fn resolved_window_border_rect(&self) -> Option<ResolvedLogicalRect> {
+        if matches!(self.kind, DecorationNodeKind::WindowBorder) {
+            return Some(self.resolved_rect);
+        }
+
+        self.children
+            .iter()
+            .find_map(Self::resolved_window_border_rect)
     }
 
     fn window_border_resize_hit_area(&self) -> Option<WindowResizeHitArea> {
