@@ -142,7 +142,6 @@ import { ISLAND_GLASS } from "./effect/island-glass";
 import { createFlip3D } from "./flip-3d";
 import { createWindowGrid } from "./window-grid";
 import { installDragAndDrop } from "./drag-and-drop";
-import type { TitlebarButton } from "./window-switcher";
 
 COMPOSITOR.env.apply({
   QT_QPA_PLATFORM: "wayland;xcb",
@@ -188,8 +187,8 @@ const WINDOW_SWITCHER = (
     window.state[WINDOW_STATE_FULLSCREEN]()
       ? FULLSCREEN_Z_INDEX
       : windowZIndex(window),
-  // The grid's selected card: its title bar buttons work.
-  titlebarButtonAt,
+  // No titlebarButtonAt: this config's title bar has no buttons, so switcher
+  // cards must not map clicks to invisible ones.
 });
 
 // Drag and drop: the dragged image on a card with the action and the kind of
@@ -1253,17 +1252,8 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
       }}
     />
   );
-  const minimizeButton = <MinimizeButton window={window} />;
-  const maximizeButton = <MaximizeButton window={window} />;
-  const closeButton = <CloseButton window={window} />;
 
-  const titlebarContent = [
-    appIcon,
-    label,
-    minimizeButton,
-    maximizeButton,
-    closeButton,
-  ];
+  const titlebarContent = [appIcon, label];
   let innerComponents = (
     <Box direction="column">
       {blurSuspended ? (
@@ -1416,222 +1406,6 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         <Box direction="row">{innerComponents}</Box>
       </WindowBorder>
     </ManagedWindow>
-  );
-};
-
-/**
- * The title bar button at `(x, y)`, logical px from the top-left corner of
- * `window.rect` (the frame: border, then the title bar). From the right:
- * close, maximize, minimize. Each button takes the whole title bar height
- * and half the gap on both sides, so a scaled-down card still has a usable
- * target.
- */
-function titlebarButtonAt(window: WaylandWindow, x: number, y: number): TitlebarButton | null {
-  if (
-    window.state[WINDOW_STATE_FULLSCREEN].peek() ||
-    usesClientDecoration(window.decoration.peek())
-  ) {
-    return null;
-  }
-  if (y < WINDOW_BORDER_PX || y > WINDOW_BORDER_PX + TITLEBAR_HEIGHT) {
-    return null;
-  }
-  const buttons: TitlebarButton[] = ["close", "maximize", "minimize"];
-  const pitch = TITLEBAR_BUTTON_SIZE + TITLEBAR_GAP;
-  const right = window.rect.width - WINDOW_BORDER_PX - TITLEBAR_PADDING_X;
-  for (let i = 0; i < buttons.length; i++) {
-    const center = right - TITLEBAR_BUTTON_SIZE / 2 - i * pitch;
-    if (Math.abs(x - center) <= pitch / 2) {
-      return buttons[i];
-    }
-  }
-  return null;
-}
-
-const CloseButton = ({ window }: { window: WaylandWindow }) => {
-  const [hover, setHover] = useState(false);
-
-  const borderColor = hover((hover) => (hover ? "#00000000" : "#F0808030"));
-
-  let icon: CompositionRenderable | null = null;
-  if (hover()) {
-    icon = (
-      <Image
-        src="./assets/x.svg"
-        style={{
-          width: TITLEBAR_BUTTON_SIZE,
-          height: TITLEBAR_BUTTON_SIZE,
-          position: "absolute",
-          zIndex: 1,
-          pointerEvents: "none",
-        }}
-      />
-    );
-  }
-
-  return (
-    <Box style={{ position: "relative", flexShrink: 0 }}>
-      <Button
-        onHoverChange={setHover}
-        style={{
-          width: TITLEBAR_BUTTON_SIZE,
-          height: TITLEBAR_BUTTON_SIZE,
-          borderRadius: 8,
-          background: "#FFFFFF20",
-          border: { px: 1, color: borderColor },
-        }}
-        onClick={window.close}
-      />
-      {icon}
-    </Box>
-  );
-};
-
-/** How long the pointer has to rest on a title bar button before its tooltip shows. */
-const TOOLTIP_DELAY_MS = 500;
-
-/**
- * A small label under a title bar button, drawn above every window. It
- * opens once the pointer has rested on the button for `TOOLTIP_DELAY_MS` and
- * closes as soon as it leaves.
- */
-const TitlebarTooltip = ({
-  text,
-}: {
-  text: string | ReadonlySignal<string>;
-}) => (
-  <Popup
-    trigger="hover"
-    openDelay={TOOLTIP_DELAY_MS}
-    closeDelay={0}
-    placement="bottom"
-    offset={8}
-  >
-    <Box
-      style={{
-        background: "#1f2430e6",
-        borderRadius: 6,
-        paddingX: 8,
-        paddingY: 4,
-        border: { px: 1, color: "#ffffff1f" },
-        boxShadow: [{ y: 4, blur: 12, color: "#00000070" }],
-      }}
-    >
-      <Label
-        text={text}
-        style={{
-          color: "#e6e9ef",
-          fontFamily: ["Noto Sans CJK JP", "Noto Color Emoji"],
-          fontSize: 12,
-        }}
-      />
-    </Box>
-  </Popup>
-);
-
-const MaximizeButton = ({ window }: { window: WaylandWindow }) => {
-  const [hover, setHover] = useState(false);
-
-  const borderColor = computed(() => {
-    if (!window.isResizable()) {
-      return "#00000000";
-    }
-    return hover() ? "#00000000" : "#00BFFF30";
-  });
-  const shouldHover = computed(() => hover() && window.isResizable());
-
-  let icon: CompositionRenderable | null = null;
-  if (shouldHover()) {
-    const src = window.isMaximized((maximized) => {
-      return maximized ? "./assets/minimize-2.svg" : "./assets/maximize-2.svg";
-    });
-
-    icon = (
-      <Image
-        src={src}
-        style={{
-          width: TITLEBAR_BUTTON_SIZE,
-          height: TITLEBAR_BUTTON_SIZE,
-          position: "absolute",
-          zIndex: 1,
-          pointerEvents: "none",
-        }}
-      />
-    );
-  }
-
-  return (
-    <Box style={{ position: "relative", flexShrink: 0 }}>
-      <Button
-        onHoverChange={setHover}
-        style={{
-          width: TITLEBAR_BUTTON_SIZE,
-          height: TITLEBAR_BUTTON_SIZE,
-          borderRadius: 8,
-          background: "#FFFFFF20",
-          border: { px: 1, color: borderColor },
-        }}
-        onClick={() => {
-          if (!read(window.isResizable)) {
-            return;
-          }
-
-          if (read(window.isMaximized)) {
-            window.unmaximize();
-          } else {
-            window.maximize();
-          }
-        }}
-      />
-      {icon}
-      {window.isResizable() ? (
-        <TitlebarTooltip
-          text={window.isMaximized((maximized) =>
-            maximized ? "Restore" : "Maximize",
-          )}
-        />
-      ) : null}
-    </Box>
-  );
-};
-
-const MinimizeButton = ({ window }: { window: WaylandWindow }) => {
-  const [hover, setHover] = useState(false);
-
-  const borderColor = hover((hover) => (hover ? "#00000000" : "#F8FF7530"));
-
-  let icon: CompositionRenderable | null = null;
-  if (hover()) {
-    icon = (
-      <Image
-        src="./assets/minus.svg"
-        style={{
-          width: TITLEBAR_BUTTON_SIZE,
-          height: TITLEBAR_BUTTON_SIZE,
-          position: "absolute",
-          zIndex: 1,
-          pointerEvents: "none",
-        }}
-      />
-    );
-  }
-
-  return (
-    <Box style={{ position: "relative", flexShrink: 0 }}>
-      <Button
-        onHoverChange={setHover}
-        style={{
-          width: TITLEBAR_BUTTON_SIZE,
-          height: TITLEBAR_BUTTON_SIZE,
-          borderRadius: 8,
-          background: "#FFFFFF20",
-          border: { px: 1, color: borderColor },
-        }}
-        onClick={() => window.minimize()}
-      />
-      {icon}
-      <TitlebarTooltip text="Minimize" />
-    </Box>
   );
 };
 
