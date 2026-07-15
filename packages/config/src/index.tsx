@@ -1,9 +1,7 @@
 import {
   AppIcon,
   Box,
-  Button,
   ClientWindow,
-  Image,
   ShaderEffect,
   Label,
   COMPOSITOR,
@@ -15,7 +13,6 @@ import {
   type SSDStyle,
   type WaylandWindow,
   computed,
-  useState,
   shaderStage,
   loadShader,
   layerSource,
@@ -26,7 +23,6 @@ import {
   popupSource,
 } from "shoji_wm";
 import type {
-  CompositionRenderable,
   InputAccelProfile,
   InputScrollMethod,
   ManagedWindowRect,
