@@ -165,8 +165,35 @@ impl ComputedDecorationTree {
                     .unwrap_or_default();
                 let edge_width = hit_area.edge_width.unwrap_or(border.width);
                 let corner_width = hit_area.corner_width.unwrap_or(edge_width);
+                // Anchor the resize band on the WindowBorder node (the
+                // visible border), not the decoration root: chrome outside
+                // the border (e.g. a drag halo) must stay a move surface.
+                // When the border sits inside the root, center the band on
+                // it by inflating half the band width outward; a border at
+                // the root keeps the legacy inside-only band.
+                let border_rect = self.root
+                    .window_border_rect()
+                    .unwrap_or(
+                        self.root.rect,
+                    );
+                let resize_rect = if border_rect == self.root.rect {
+                    border_rect
+                } else {
+                    let outset = edge_width / 2;
+                    LogicalRect::new(
+                        border_rect.x - outset,
+                        border_rect.y - outset,
+                        border_rect.width + outset * 2,
+                        border_rect.height + outset * 2,
+                    )
+                };
                 if let Some(edges) =
-                    hit_test_resize_edges(self.root.rect, edge_width, corner_width, point)
+                    hit_test_resize_edges(
+                        resize_rect,
+                        edge_width,
+                        corner_width,
+                        point,
+                    )
                 {
                     return DecorationHitTestResult::Resize(edges);
                 }
@@ -255,6 +282,25 @@ impl ComputedDecorationNode {
         }
 
         self.children.iter().find_map(Self::window_border_style)
+    }
+
+    fn window_border_rect(
+        &self
+    ) -> Option<LogicalRect> {
+        if matches!(
+            self.kind,
+            DecorationNodeKind::WindowBorder,
+        ) {
+            return Some(
+                self.rect,
+            );
+        }
+
+        self.children
+            .iter()
+            .find_map(
+                Self::window_border_rect,
+            )
     }
 
     fn window_border_resize_hit_area(&self) -> Option<WindowResizeHitArea> {
