@@ -303,32 +303,49 @@ impl ComputedDecorationTree {
                     .root
                     .window_border_resize_hit_area()
                     .unwrap_or_default();
-                // The grab band is the visible border plus `edge_width` outside
-                // the frame, so it never covers client content near the edge,
-                // plus `inset_width` inside it for frames that decorate past
+                // The plain frame band's inset: the visible border plus
+                // `inset_width` inside it for frames that decorate past
                 // their border.
-                let inset = ResolvedLayoutValue::border_width(border_width, scale)
+                let frame_inset = ResolvedLayoutValue::border_width(border_width, scale)
                     + hit_area
                         .inset_width
                         .map(|width| ResolvedLayoutValue::from_logical(width.max(0) as f64, scale))
                         .unwrap_or(ResolvedLayoutValue::ZERO);
-                let outset = hit_area
-                    .edge_width
-                    .map(|width| ResolvedLayoutValue::from_logical(width as f64, scale))
-                    .unwrap_or(ResolvedLayoutValue::ZERO);
-                let corner_width = hit_area
-                    .corner_width
-                    .map(|width| ResolvedLayoutValue::from_logical(width as f64, scale))
-                    .unwrap_or(inset + outset);
                 // Anchor the band on the WindowBorder node (the visible
                 // border), not the decoration root: chrome outside the
                 // border (e.g. a drag halo) must stay a move surface beyond
-                // the band. Without such chrome the border is the root and
-                // this is the plain frame band.
+                // the band. A border at the root gets the plain frame band:
+                // the visible border plus `edge_width` outside the frame, so
+                // it never covers client content near the edge. A border
+                // inside the root instead straddles an `edge_width` band
+                // across the border, biased inward so the drag halo (and
+                // the tab attached to the border) keeps most of the
+                // outside. The bias is in logical px, snapped onto the
+                // physical grid.
+                const RESIZE_BAND_INWARD_BIAS: f64 = 2.0;
                 let border_rect = self
                     .root
                     .resolved_window_border_rect()
                     .unwrap_or(self.root.resolved_rect);
+                let edge_width = hit_area
+                    .edge_width
+                    .map(|width| ResolvedLayoutValue::from_logical(width as f64, scale));
+                let (inset, outset) = match edge_width {
+                    Some(edge) if border_rect != self.root.resolved_rect => {
+                        let inward_bias =
+                            ResolvedLayoutValue::from_logical(RESIZE_BAND_INWARD_BIAS, scale);
+                        let outset = (edge.raw() / 2 - inward_bias.raw()).max(0);
+                        (
+                            ResolvedLayoutValue::from_raw(edge.raw() - outset),
+                            ResolvedLayoutValue::from_raw(outset),
+                        )
+                    }
+                    _ => (frame_inset, edge_width.unwrap_or(ResolvedLayoutValue::ZERO)),
+                };
+                let corner_width = hit_area
+                    .corner_width
+                    .map(|width| ResolvedLayoutValue::from_logical(width as f64, scale))
+                    .unwrap_or(inset + outset);
                 if let Some(edges) = hit_test_resize_edges(
                     border_rect,
                     inset.raw(),
