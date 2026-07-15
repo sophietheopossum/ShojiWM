@@ -118,7 +118,7 @@ function loadMinkaSettings(): MinkaSettings {
 let activeSettings: MinkaSettings = loadMinkaSettings();
 import {
   HybridWindowManager,
-  TITLEBAR_HEIGHT,
+  EDGE_DRAG_HALO_PX,
   WINDOW_BORDER_PX,
   WINDOW_STATE_FULLSCREEN,
   WINDOW_STATE_MAXIMIZED,
@@ -1117,20 +1117,20 @@ function usesClientDecoration(decoration: WindowDecorationState): boolean {
 }
 
 // Must match the frame the composition below draws: a client-decorated window
-// gets only the border, so counting the title bar would size its client 30px
-// past what the layout meant (and past the client's own maximum). The border
-// is drawn for both, so it is counted for both; a config that drops the
-// border for client-decorated windows must drop WINDOW_BORDER_PX here too.
+// gets only the border, while a server-decorated one gets the drag halo ring
+// around the border on every side (there is no titlebar). The border is drawn
+// for both, so it is counted for both; a config that drops the border for
+// client-decorated windows must drop WINDOW_BORDER_PX here too.
 function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
   const client = window.position;
-  const titlebar = usesClientDecoration(window.decoration.peek())
-    ? 0
-    : TITLEBAR_HEIGHT;
+  const chrome = usesClientDecoration(window.decoration.peek())
+    ? WINDOW_BORDER_PX
+    : EDGE_DRAG_HALO_PX + WINDOW_BORDER_PX;
   return {
-    x: client.x - WINDOW_BORDER_PX,
-    y: client.y - titlebar - WINDOW_BORDER_PX,
-    width: client.width + WINDOW_BORDER_PX * 2,
-    height: client.height + titlebar + WINDOW_BORDER_PX * 2,
+    x: client.x - chrome,
+    y: client.y - chrome,
+    width: client.width + chrome * 2,
+    height: client.height + chrome * 2,
   };
 }
 
@@ -1184,20 +1184,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         ? [{ y: 10, blur: 32, spread: -2, color: "#00000090" }]
         : [{ y: 4, blur: 16, spread: -2, color: "#00000060" }],
   );
-  const titlebarBackground = window.isFocused((focused) =>
-    focused ? "#1f243080" : "#2a2f3a80",
-  );
-  const titleColor = window.isFocused((focused) =>
-    focused ? "#f5f7fa" : "#c9d1d9",
-  );
 
-  const titlebarStyle: SSDStyle = {
-    height: TITLEBAR_HEIGHT,
-    paddingX: TITLEBAR_PADDING_X,
-    gap: TITLEBAR_GAP,
-    alignItems: "center",
-    background: titlebarBackground,
-  };
 
   const backgroundShader = compileEffect({
     input: backdropSource(),
@@ -1220,69 +1207,20 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     alpha: "preserve",
   });
 
-  const titleOnlyShader = compileEffect({
-    input: backdropSource(),
-    capturePadding: 24,
-    invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
-    alpha: "preserve",
-    pipeline: [dualKawaseBlur({ radius: 4, passes: 2 }), backdropFade()],
-  });
   // No backdrop effects while the window switcher shows the windows as
   // textures: there is nothing under a window there to blur.
   const blurSuspended = WINDOW_SWITCHER.blurSuspended();
 
-  const appIcon = (
-    <AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />
-  );
-  const label = (
-    <Label
-      text={window.title}
-      style={{
-        color: titleColor,
-        fontFamily: ["Noto Sans CJK JP", "Noto Color Emoji"],
-        fontSize: 13,
-        fontWeight: 600,
-        flexGrow: 1,
-        flexShrink: 1,
-        minWidth: 0,
-      }}
-    />
-  );
-
-  const titlebarContent = [appIcon, label];
-  let innerComponents = (
-    <Box direction="column">
-      {blurSuspended ? (
-        <Box direction="row" style={titlebarStyle}>
-          {titlebarContent}
-        </Box>
-      ) : (
-        <ShaderEffect
-          shader={titleOnlyShader}
-          direction="row"
-          style={titlebarStyle}
-        >
-          {titlebarContent}
-        </ShaderEffect>
-      )}
-      <ClientWindow />
-    </Box>
-  );
+  let innerComponents = <ClientWindow />;
 
   const TERMINALS = ["kitty", "ghostty"];
 
   if (TERMINALS.includes(window.appId() ?? "")) {
-    const terminalContent = [
-      <Box direction="row" style={titlebarStyle}>
-        {titlebarContent}
-      </Box>,
-      <ClientWindow />,
-    ];
     innerComponents = blurSuspended ? (
-      <Box direction="column">{terminalContent}</Box>
+      <ClientWindow />
     ) : (
       <ShaderEffect shader={backgroundShader} direction="column">
-        {terminalContent}
+        <ClientWindow />
       </ShaderEffect>
     );
   }
@@ -1350,10 +1288,11 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     );
   }
 
-  // Maximized: keep the titlebar but drop the border, padding and rounded
-  // corners — square frame, edge to edge in the usable area
-  // (maximizedRectForWindow applies no inset to match). Floating windows
-  // below keep the full chrome.
+  // Maximized: no chrome at all
+    // — edge to edge in the usable area
+  // (maximizedRectForWindow applies no inset to match).
+    // Without the halo a maximized window is not pointer-draggable; unmaximize re-centres it, so
+  // it can never get stuck. Floating windows below keep the full chrome.
   if (window.state[WINDOW_STATE_MAXIMIZED]()) {
     return (
       <ManagedWindow
@@ -1371,6 +1310,29 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     );
   }
 
+  // The transparent halo ring around the window is decoration chrome: the SSD
+  // hit-test resolves clicks there to Move (outer resizeHitArea band wins for
+  // resize), so the whole ring drags the window. Hovering it reveals a tab at
+  // that edge as the visible affordance; the tab itself is plain chrome, so
+  // grabbing it drags too. Chrome can't render above the client surface,
+  // which is why the tab lives outside the window instead of overlapping it.
+  const [hoveredEdge, setHoveredEdge] = useState<
+    "top" | "bottom" | "left" | "right" | null
+  >(null);
+  const dragEdgeHover =
+    (edge: "top" | "bottom" | "left" | "right") => (inside: boolean) => {
+      if (inside) {
+        setHoveredEdge(edge);
+      } else if (read(hoveredEdge) === edge) {
+        setHoveredEdge(null);
+      }
+    };
+  const dragTabPill: SSDStyle = {
+    background: "#FFFFFF30",
+    border: { px: 1, color: borderColor },
+    borderRadius: 4,
+  };
+
   return (
     <ManagedWindow
       rect={managedRect}
@@ -1382,25 +1344,125 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
       idle={inactive}
       interactive={inactive((value) => !value)}
     >
-      <WindowBorder
-        style={{
-          border: { px: WINDOW_BORDER_PX, color: borderColor },
-          borderRadius: 10,
-          boxShadow: windowShadow,
-          background: "#10131900",
-          padding: 0,
-          paddingX: 0,
-          paddingRight: 0,
-        }}
-        interaction={{
-          resizeHitArea: {
-            edgePx: 8,
-            cornerPx: 14,
-          },
-        }}
-      >
-        <Box direction="row">{innerComponents}</Box>
-      </WindowBorder>
+      <Box style={{ position: "relative", padding: EDGE_DRAG_HALO_PX }}>
+        <WindowBorder
+          style={{
+            border: { px: WINDOW_BORDER_PX, color: borderColor },
+            borderRadius: 10,
+            boxShadow: windowShadow,
+            background: "#10131900",
+            padding: 0,
+            paddingX: 0,
+            paddingRight: 0,
+          }}
+          interaction={{
+            resizeHitArea: {
+              edgePx: 6,
+              cornerPx: 14,
+            },
+          }}
+        >
+          <Box direction="row">{innerComponents}</Box>
+        </WindowBorder>
+        <Box
+          onHoverChange={dragEdgeHover("top")}
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            right: 0,
+            height: EDGE_DRAG_HALO_PX,
+          }}
+        />
+        <Box
+          onHoverChange={dragEdgeHover("bottom")}
+          style={{
+            position: "absolute",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            height: EDGE_DRAG_HALO_PX,
+          }}
+        />
+        <Box
+          onHoverChange={dragEdgeHover("left")}
+          style={{
+            position: "absolute",
+            left: 0,
+            top: EDGE_DRAG_HALO_PX,
+            bottom: EDGE_DRAG_HALO_PX,
+            width: EDGE_DRAG_HALO_PX,
+          }}
+        />
+        <Box
+          onHoverChange={dragEdgeHover("right")}
+          style={{
+            position: "absolute",
+            right: 0,
+            top: EDGE_DRAG_HALO_PX,
+            bottom: EDGE_DRAG_HALO_PX,
+            width: EDGE_DRAG_HALO_PX,
+          }}
+        />
+        <Box
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            right: 0,
+            height: EDGE_DRAG_HALO_PX,
+            justifyContent: "center",
+            alignItems: "end",
+            visible: hoveredEdge((edge) => edge === "top"),
+          }}
+        >
+          <Box style={{ ...dragTabPill, width: 64, height: 8 }} />
+        </Box>
+        <Box
+          style={{
+            position: "absolute",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            height: EDGE_DRAG_HALO_PX,
+            justifyContent: "center",
+            alignItems: "start",
+            visible: hoveredEdge((edge) => edge === "bottom"),
+          }}
+        >
+          <Box style={{ ...dragTabPill, width: 64, height: 8 }} />
+        </Box>
+        <Box
+          direction="column"
+          style={{
+            position: "absolute",
+            left: 0,
+            top: 0,
+            bottom: 0,
+            width: EDGE_DRAG_HALO_PX,
+            justifyContent: "center",
+            alignItems: "end",
+            visible: hoveredEdge((edge) => edge === "left"),
+          }}
+        >
+          <Box style={{ ...dragTabPill, width: 8, height: 64 }} />
+        </Box>
+        <Box
+          direction="column"
+          style={{
+            position: "absolute",
+            right: 0,
+            top: 0,
+            bottom: 0,
+            width: EDGE_DRAG_HALO_PX,
+            justifyContent: "center",
+            alignItems: "start",
+            visible: hoveredEdge((edge) => edge === "right"),
+          }}
+        >
+          <Box style={{ ...dragTabPill, width: 8, height: 64 }} />
+        </Box>
+      </Box>
     </ManagedWindow>
   );
 };
