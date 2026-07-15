@@ -1,9 +1,7 @@
 import {
   AppIcon,
   Box,
-  Button,
   ClientWindow,
-  Image,
   ShaderEffect,
   Label,
   COMPOSITOR,
@@ -16,7 +14,6 @@ import {
   type WaylandWindow,
   type WindowDecorationState,
   computed,
-  useState,
   shaderStage,
   loadShader,
   layerSource,
@@ -30,7 +27,6 @@ import {
   DefaultComposition,
 } from "shoji_wm";
 import type {
-  CompositionRenderable,
   InputAccelProfile,
   InputScrollMethod,
   ManagedWindowRect,
