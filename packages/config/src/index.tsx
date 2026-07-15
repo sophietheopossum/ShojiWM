@@ -1024,6 +1024,10 @@ COMPOSITOR.event.onWindowActivateRequest((event) => {
   scheduleWorkspaceBroadcast();
 });
 
+// Window corner rounding; the drag tabs clamp their travel to the flat part
+// of each edge (between the corner arcs).
+const WINDOW_CORNER_RADIUS = 10;
+
 function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
   const client = window.position;
   const chrome = EDGE_DRAG_HALO_PX + WINDOW_BORDER_PX;
@@ -1215,17 +1219,32 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   // hovered, so idle windows never re-evaluate on mouse motion.
   const DRAG_TAB_LENGTH = 72;
   const DRAG_TAB_THICKNESS = 12;
+  // Travel limit: the tab slides along the flat part of the edge and pins at
+  // the corner arcs. While pinned it stays visible (visibility follows the
+  // hover strip, not the pointer-tab overlap) and stays draggable (the whole
+  // halo is move chrome).
+  const dragTabMin = EDGE_DRAG_HALO_PX + WINDOW_CORNER_RADIUS;
   const dragTabX = computed(() => {
     const edge = hoveredEdge();
     if (edge !== "top" && edge !== "bottom") {
       return 0;
     }
     const rect = managedRect();
-    const max = Math.max(2, read(rect.width) - DRAG_TAB_LENGTH - 2);
-    const centred = Math.round(
-      pointerPosition.value.x - read(rect.x) - DRAG_TAB_LENGTH / 2,
+    const max = Math.max(
+      dragTabMin,
+      read(rect.width) - 
+        dragTabMin - 
+        DRAG_TAB_LENGTH,
     );
-    return Math.min(max, Math.max(2, centred));
+    const centred = Math.round(
+      pointerPosition.value.x - read(rect.x) - 
+        DRAG_TAB_LENGTH 
+        / 2,
+    );
+    return Math.min(max, Math.max(
+        dragTabMin, 
+        centred,
+        ));
   });
   const dragTabY = computed(() => {
     const edge = hoveredEdge();
@@ -1233,11 +1252,19 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
       return 0;
     }
     const rect = managedRect();
-    const max = Math.max(2, read(rect.height) - DRAG_TAB_LENGTH - 2);
+    const max = Math.max(
+      dragTabMin,
+      read(rect.height) - 
+        dragTabMin -
+        DRAG_TAB_LENGTH,
+    );
     const centred = Math.round(
       pointerPosition.value.y - read(rect.y) - DRAG_TAB_LENGTH / 2,
     );
-    return Math.min(max, Math.max(2, centred));
+    return Math.min(max, Math.max(
+        dragTabMin,
+        centred,
+        ));
   });
 
   return (
@@ -1259,7 +1286,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         <WindowBorder
           style={{
             border: { px: WINDOW_BORDER_PX, color: borderColor },
-            borderRadius: 10,
+            borderRadius: WINDOW_CORNER_RADIUS,
             background: "#10131900",
             padding: 0,
             paddingX: 0,
