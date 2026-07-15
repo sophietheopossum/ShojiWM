@@ -369,7 +369,10 @@ const WORKSPACE_VISUAL_ANIMATION_CHANNEL = "workspace.visual";
 const WORKSPACE_VISUAL_RECT_ANIMATION_CHANNEL = `${WORKSPACE_VISUAL_ANIMATION_CHANNEL}.rect`;
 const WORKSPACE_VISUAL_OPACITY_ANIMATION_CHANNEL = `${WORKSPACE_VISUAL_ANIMATION_CHANNEL}.opacity`;
 export const WINDOW_BORDER_PX = 2;
-export const TITLEBAR_HEIGHT = 30;
+// Transparent chrome ring around each non-maximized window. It is the drag
+// surface (decoration chrome hit-tests as Move) and hosts the hover-revealed
+// drag tab; there is no titlebar.
+export const EDGE_DRAG_HALO_PX = 14;
 // Outer margin around the snap layout (halves/quarters). Maximized windows
 // deliberately get none — they fill the usable area edge to edge.
 export const SNAP_BASE_PADDING = {
@@ -2613,11 +2616,11 @@ export class HybridWindowManager {
     height: number,
   ): ManagedWindowRect {
     const pointer = event.currentPointer;
-    const titlebarCenterY = WINDOW_BORDER_PX + TITLEBAR_HEIGHT / 2;
+    const dragChromeCenterY = WINDOW_BORDER_PX + EDGE_DRAG_HALO_PX / 2;
     const pointerOffsetY =
       event.source === "modifier"
         ? height / 2
-        : Math.min(height / 2, titlebarCenterY);
+        : Math.min(height / 2, dragChromeCenterY);
 
     return {
       x: pointer.x - width / 2,
