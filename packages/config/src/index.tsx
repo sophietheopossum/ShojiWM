@@ -671,6 +671,9 @@ COMPOSITOR.key.bind("window-switcher", "Super+Tab", () => {
 COMPOSITOR.key.bind("close-focused-window", "Super+Q", () => {
   HYBRID_WINDOW_MANAGER.closeFocusedWindow();
 });
+COMPOSITOR.key.bind("close-focused-window-alt-f4", "Alt+F4", () => {
+  HYBRID_WINDOW_MANAGER.closeFocusedWindow();
+});
 COMPOSITOR.key.bind("toggle-focused-window-maximize", "Super+M", () => {
   HYBRID_WINDOW_MANAGER.toggleFocusedWindowMaximize();
 });
