@@ -218,8 +218,29 @@ impl ComputedDecorationTree {
                     .corner_width
                     .map(|width| ResolvedLayoutValue::from_logical(width as f64, scale))
                     .unwrap_or(edge_width);
+                // Anchor the resize band on the WindowBorder node (the
+                // visible border), not the decoration root: chrome outside
+                // the border (e.g. a drag halo) must stay a move surface.
+                // When the border sits inside the root, center the band on
+                // it by inflating half the band width outward; a border at
+                // the root keeps the legacy inside-only band.
+                let border_rect = self
+                    .root
+                    .resolved_window_border_rect()
+                    .unwrap_or(self.root.resolved_rect);
+                let resize_rect = if border_rect == self.root.resolved_rect {
+                    border_rect
+                } else {
+                    let outset = edge_width.raw() / 2;
+                    ResolvedLogicalRect::from_px(
+                        border_rect.x.raw() - outset,
+                        border_rect.y.raw() - outset,
+                        border_rect.width.raw() + outset * 2,
+                        border_rect.height.raw() + outset * 2,
+                    )
+                };
                 if let Some(edges) = hit_test_resize_edges(
-                    self.root.resolved_rect,
+                    resize_rect,
                     edge_width.raw(),
                     corner_width.raw(),
                     point,
@@ -347,6 +368,16 @@ impl ComputedDecorationNode {
         }
 
         self.children.iter().find_map(Self::window_border_style)
+    }
+
+    fn resolved_window_border_rect(&self) -> Option<ResolvedLogicalRect> {
+        if matches!(self.kind, DecorationNodeKind::WindowBorder) {
+            return Some(self.resolved_rect);
+        }
+
+        self.children
+            .iter()
+            .find_map(Self::resolved_window_border_rect)
     }
 
     fn window_border_resize_hit_area(&self) -> Option<WindowResizeHitArea> {
