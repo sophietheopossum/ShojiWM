@@ -1,9 +1,7 @@
 import {
-  AppIcon,
   Box,
   ClientWindow,
   ShaderEffect,
-  Label,
   COMPOSITOR,
   WindowBorder,
   backdropSource,
@@ -14,6 +12,7 @@ import {
   type WaylandWindow,
   type WindowDecorationState,
   computed,
+  useState,
   shaderStage,
   loadShader,
   layerSource,
