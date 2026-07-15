@@ -1,6 +1,7 @@
 import {
   Box,
   ClientWindow,
+  Image,
   ShaderEffect,
   COMPOSITOR,
   WindowBorder,
@@ -11,6 +12,7 @@ import {
   type SSDStyle,
   type WaylandWindow,
   computed,
+  signal,
   useState,
   shaderStage,
   loadShader,
@@ -954,7 +956,13 @@ COMPOSITOR.event.onFocus((window, focused) => {
   scheduleWorkspaceBroadcast();
 });
 
-COMPOSITOR.event.onPointerMove((event) => {
+// Global pointer position for the drag tabs: each tab centres on the mouse
+// along its edge. Only compositions with a hovered edge depend on this
+// signal, so idle windows do no work per pointer motion.
+const [pointerPosition, setPointerPosition] = signal({ x: 0, y: 0 });
+
+COMPOSITOR.event.onPointerMoveAsync((event) => {
+  setPointerPosition({ x: event.position.x, y: event.position.y });
   HYBRID_WINDOW_MANAGER.onPointerMove(event);
 
   // Dock proximity: update only the monitor the pointer is currently on,
@@ -1237,11 +1245,36 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         setHoveredEdge(null);
       }
     };
-  const dragTabPill: SSDStyle = {
-    background: "#FFFFFF30",
-    border: { px: 1, color: borderColor },
-    borderRadius: 4,
-  };
+  // Trapezium drag tabs (SVG assets, red stipple + border) attached to the
+  // window border, centred on the pointer along the hovered edge. The
+  // position computeds read pointerPosition only while their edge is
+  // hovered, so idle windows never re-evaluate on mouse motion.
+  const DRAG_TAB_LENGTH = 72;
+  const DRAG_TAB_THICKNESS = 12;
+  const dragTabX = computed(() => {
+    const edge = hoveredEdge();
+    if (edge !== "top" && edge !== "bottom") {
+      return 0;
+    }
+    const rect = managedRect();
+    const max = Math.max(2, read(rect.width) - DRAG_TAB_LENGTH - 2);
+    const centred = Math.round(
+      pointerPosition.value.x - read(rect.x) - DRAG_TAB_LENGTH / 2,
+    );
+    return Math.min(max, Math.max(2, centred));
+  });
+  const dragTabY = computed(() => {
+    const edge = hoveredEdge();
+    if (edge !== "left" && edge !== "right") {
+      return 0;
+    }
+    const rect = managedRect();
+    const max = Math.max(2, read(rect.height) - DRAG_TAB_LENGTH - 2);
+    const centred = Math.round(
+      pointerPosition.value.y - read(rect.y) - DRAG_TAB_LENGTH / 2,
+    );
+    return Math.min(max, Math.max(2, centred));
+  });
 
   return (
     <ManagedWindow
@@ -1317,64 +1350,50 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
             width: EDGE_DRAG_HALO_PX,
           }}
         />
-        <Box
+        <Image
+          src="./assets/drag-tab-top.svg"
           style={{
             position: "absolute",
-            top: 0,
-            left: 0,
-            right: 0,
-            height: EDGE_DRAG_HALO_PX,
-            justifyContent: "center",
-            alignItems: "start",
+            top: EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+            left: dragTabX,
+            width: DRAG_TAB_LENGTH,
+            height: DRAG_TAB_THICKNESS,
             visible: hoveredEdge((edge) => edge === "top"),
           }}
-        >
-          <Box style={{ ...dragTabPill, width: 64, height: 8 }} />
-        </Box>
-        <Box
+        />
+        <Image
+          src="./assets/drag-tab-bottom.svg"
           style={{
             position: "absolute",
-            bottom: 0,
-            left: 0,
-            right: 0,
-            height: EDGE_DRAG_HALO_PX,
-            justifyContent: "center",
-            alignItems: "end",
+            bottom: EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+            left: dragTabX,
+            width: DRAG_TAB_LENGTH,
+            height: DRAG_TAB_THICKNESS,
             visible: hoveredEdge((edge) => edge === "bottom"),
           }}
-        >
-          <Box style={{ ...dragTabPill, width: 64, height: 8 }} />
-        </Box>
-        <Box
-          direction="column"
+        />
+        <Image
+          src="./assets/drag-tab-left.svg"
           style={{
             position: "absolute",
-            left: 0,
-            top: 0,
-            bottom: 0,
-            width: EDGE_DRAG_HALO_PX,
-            justifyContent: "center",
-            alignItems: "start",
+            left: EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+            top: dragTabY,
+            width: DRAG_TAB_THICKNESS,
+            height: DRAG_TAB_LENGTH,
             visible: hoveredEdge((edge) => edge === "left"),
           }}
-        >
-          <Box style={{ ...dragTabPill, width: 8, height: 64 }} />
-        </Box>
-        <Box
-          direction="column"
+        />
+        <Image
+          src="./assets/drag-tab-right.svg"
           style={{
             position: "absolute",
-            right: 0,
-            top: 0,
-            bottom: 0,
-            width: EDGE_DRAG_HALO_PX,
-            justifyContent: "center",
-            alignItems: "end",
+            right: EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+            top: dragTabY,
+            width: DRAG_TAB_THICKNESS,
+            height: DRAG_TAB_LENGTH,
             visible: hoveredEdge((edge) => edge === "right"),
           }}
-        >
-          <Box style={{ ...dragTabPill, width: 8, height: 64 }} />
-        </Box>
+        />
       </Box>
     </ManagedWindow>
   );
