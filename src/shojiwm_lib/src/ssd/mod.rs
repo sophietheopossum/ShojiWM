@@ -221,9 +221,12 @@ impl ComputedDecorationTree {
                 // Anchor the resize band on the WindowBorder node (the
                 // visible border), not the decoration root: chrome outside
                 // the border (e.g. a drag halo) must stay a move surface.
-                // When the border sits inside the root, center the band on
-                // it by inflating half the band width outward; a border at
-                // the root keeps the legacy inside-only band.
+                // When the border sits inside the root,
+                // straddle the band across it — biased inward so the drag halo (and the tab
+                // attached to the border) keeps most of the outside — while
+                // a border at the root keeps the legacy inside-only band.
+                // The bias is in logical px, snapped onto the physical grid.
+                const RESIZE_BAND_INWARD_BIAS: f64 = 2.0;
                 let border_rect = self
                     .root
                     .resolved_window_border_rect()
@@ -231,7 +234,9 @@ impl ComputedDecorationTree {
                 let resize_rect = if border_rect == self.root.resolved_rect {
                     border_rect
                 } else {
-                    let outset = edge_width.raw() / 2;
+                    let inward_bias =
+                        ResolvedLayoutValue::from_logical(RESIZE_BAND_INWARD_BIAS, scale);
+                    let outset = (edge_width.raw() / 2 - inward_bias.raw()).max(0);
                     ResolvedLogicalRect::from_px(
                         border_rect.x.raw() - outset,
                         border_rect.y.raw() - outset,
