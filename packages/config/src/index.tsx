@@ -1384,7 +1384,11 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
       idle={inactive}
       interactive={inactive((value) => !value)}
     >
-      <Box style={{ position: "relative", padding: EDGE_DRAG_HALO_PX }}>
+      {/* No `position` here: the halo box must NOT establish a containing
+          block, so its absolute children (strips + tabs) anchor to the
+          decoration root's full rect — the halo's outer edge — instead of
+          the padding-inset content box at the window border. */}
+      <Box style={{ padding: EDGE_DRAG_HALO_PX }}>
         <WindowBorder
           style={{
             border: { px: WINDOW_BORDER_PX, color: borderColor },
@@ -1397,7 +1401,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
           }}
           interaction={{
             resizeHitArea: {
-              edgePx: 6,
+              edgePx: 8,
               cornerPx: 14,
             },
           }}
@@ -1452,7 +1456,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
             right: 0,
             height: EDGE_DRAG_HALO_PX,
             justifyContent: "center",
-            alignItems: "end",
+            alignItems: "start",
             visible: hoveredEdge((edge) => edge === "top"),
           }}
         >
@@ -1466,7 +1470,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
             right: 0,
             height: EDGE_DRAG_HALO_PX,
             justifyContent: "center",
-            alignItems: "start",
+            alignItems: "end",
             visible: hoveredEdge((edge) => edge === "bottom"),
           }}
         >
@@ -1481,7 +1485,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
             bottom: 0,
             width: EDGE_DRAG_HALO_PX,
             justifyContent: "center",
-            alignItems: "end",
+            alignItems: "start",
             visible: hoveredEdge((edge) => edge === "left"),
           }}
         >
@@ -1496,7 +1500,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
             bottom: 0,
             width: EDGE_DRAG_HALO_PX,
             justifyContent: "center",
-            alignItems: "start",
+            alignItems: "end",
             visible: hoveredEdge((edge) => edge === "right"),
           }}
         >
