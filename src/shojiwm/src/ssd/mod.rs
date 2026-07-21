@@ -1528,6 +1528,34 @@ impl ResolvedLogicalRect {
         self.y + self.height
     }
 
+    // Test-only accessors: production layout reads x/y directly, but the
+    // fractional-scale snapping regression tests exercise these.
+    #[cfg(test)]
+    fn left(self) -> ResolvedLayoutValue {
+        self.x
+    }
+
+    #[cfg(test)]
+    fn top(self) -> ResolvedLayoutValue {
+        self.y
+    }
+
+    #[cfg(test)]
+    fn snapped_size(
+        self,
+        scale_x: f64,
+        scale_y: f64,
+    ) -> (ResolvedLayoutValue, ResolvedLayoutValue) {
+        let left = self.left().snap_edge(scale_x);
+        let top = self.top().snap_edge(scale_y);
+        let right = self.right().snap_edge(scale_x);
+        let bottom = self.bottom().snap_edge(scale_y);
+        (
+            ResolvedLayoutValue::from_raw((right.raw() - left.raw()).max(0)),
+            ResolvedLayoutValue::from_raw((bottom.raw() - top.raw()).max(0)),
+        )
+    }
+
     fn inset(self, edges: ResolvedLayoutEdges) -> Self {
         let left = self.x + edges.left;
         let top = self.y + edges.top;
