@@ -235,8 +235,20 @@ export interface WorkspacesViewWindow {
   focused: boolean;
   maximized: boolean;
   minimized: boolean;
+  fullscreen: boolean;
   /** epoch ms — most recent focus time for MRU ordering. 0 if never focused. */
   lastFocusedAt: number;
+  /**
+   * Layout-space frame rect, sampled at view-build time (animated rects
+   * report their current position). Added for MinkaMon's leader-line
+   * overlay, which cannot learn its own window positions from Wayland.
+   */
+  rect: { 
+      x: number;
+      y: number; 
+      width: number;
+      height: number
+  };
 }
 
 export interface WorkspacesViewWorkspace {
@@ -1481,15 +1493,25 @@ export class HybridWindowManager {
       const list = byMonitor.get(workspace.monitor) ?? [];
       const windows: WorkspacesViewWindow[] = workspace
         .listWindows()
-        .map((window) => ({
-          id: window.id,
-          appId: window.appId(),
-          title: window.title(),
-          focused: window.isFocused(),
-          maximized: window.state[WINDOW_STATE_MAXIMIZED](),
-          minimized: window.state[WINDOW_STATE_MINIMIZED](),
-          lastFocusedAt: this.lastFocusedAt.get(window.id) ?? 0,
-        }));
+        .map((window) => {
+          const rect = window.state[WINDOW_STATE_RECT]();
+          return {
+            id: window.id,
+            appId: window.appId(),
+            title: window.title(),
+            focused: window.isFocused(),
+            maximized: window.state[WINDOW_STATE_MAXIMIZED](),
+            minimized: window.state[WINDOW_STATE_MINIMIZED](),
+            fullscreen: window.state[WINDOW_STATE_FULLSCREEN](),
+            lastFocusedAt: this.lastFocusedAt.get(window.id) ?? 0,
+            rect: {
+              x: read(rect.x),
+              y: read(rect.y),
+              width: read(rect.width),
+              height: read(rect.height),
+            },
+          };
+        });
       list.push({
         index: workspace.index,
         windowCount: workspace.windowCount(),
