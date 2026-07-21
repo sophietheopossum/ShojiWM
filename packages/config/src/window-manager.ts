@@ -266,12 +266,24 @@ export interface WorkspacesViewWindow {
    * report their current position). Added for MinkaMon's leader-line
    * overlay, which cannot learn its own window positions from Wayland.
    */
-  rect: { 
+  rect: {
       x: number;
-      y: number; 
+      y: number;
       width: number;
       height: number
   };
+  /**
+   * Hover-revealed drag tab currently shown for this window (layout
+   * coords). Attached by the decoration layer in index.tsx at IPC view
+   * build time; null when no tab is up. MinkaMon's leader lines clip
+   * beneath it.
+   */
+  dragTab?: {
+      x: number;
+      y: number;
+      width: number;
+      height: number 
+  } | null;
 }
 
 export interface WorkspacesViewWorkspace {

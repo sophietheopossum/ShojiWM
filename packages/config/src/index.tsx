@@ -131,6 +131,9 @@ import {
   WINDOW_STATE_WORKSPACE_OFFSET_Y,
   WINDOW_STATE_WORKSPACE_OPACITY,
 } from "./window-manager";
+import type { 
+    WorkspacesView,
+} from "./window-manager";
 
 COMPOSITOR.env.apply({
   QT_QPA_PLATFORM: "wayland;xcb",
@@ -215,8 +218,37 @@ const WORKSPACE_IPC = createIpcServer();
 let lastWorkspacesJson = "";
 let workspaceBroadcastQueued = false;
 
+// Live drag-tab geometry per window id, registered by the decoration
+// composition below. Entries are lazy computeds, so hover/pointer state is
+// only sampled when a view is actually built (MinkaMon's poll) — idle
+// windows still never re-evaluate on mouse motion.
+const DRAG_TAB_RECTS = new Map<
+  string,
+  () => { x: number; y: number; width: number; height: number } | null
+>();
+
+function attachDragTabs(view: WorkspacesView): WorkspacesView {
+  const live = new Set<string>();
+  for (const monitor of view.monitors) {
+    for (const workspace of monitor.workspaces) {
+      for (const win of workspace.windows) {
+        live.add(win.id);
+        win.dragTab = DRAG_TAB_RECTS.get(win.id)?.() ?? null;
+      }
+    }
+  }
+  for (const id of DRAG_TAB_RECTS.keys()) {
+    if (!live.has(id)) {
+      DRAG_TAB_RECTS.delete(id);
+    }
+  }
+  return view;
+}
+
 function broadcastWorkspaces() {
-  const view = HYBRID_WINDOW_MANAGER.viewForIpc();
+  const view = attachDragTabs(
+      HYBRID_WINDOW_MANAGER.viewForIpc(),
+  );
   const json = JSON.stringify(view);
   if (json === lastWorkspacesJson) {
     return;
@@ -273,7 +305,9 @@ COMPOSITOR.workspace.event.onActivate((event) => {
 });
 
 WORKSPACE_IPC.handle("workspaces.get", () =>
-  HYBRID_WINDOW_MANAGER.viewForIpc(),
+  attachDragTabs(
+      HYBRID_WINDOW_MANAGER.viewForIpc(),
+  ),
 );
 WORKSPACE_IPC.handle("workspaces.switch", (params) => {
   const direction = (params as { direction?: number } | undefined)?.direction;
@@ -1265,6 +1299,47 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         dragTabMin,
         centred,
         ));
+  });
+
+  // Published to the workspace IPC view (see attachDragTabs): the tab's
+  // layout-space rect while an edge is hovered, null otherwise. Lazy — only
+  // evaluated when a view is built.
+  DRAG_TAB_RECTS.set(window.id, () => {
+    const edge = read(hoveredEdge);
+    if (!edge) {
+      return null;
+    }
+    const rect = managedRect();
+    switch (edge) {
+      case "top":
+        return {
+          x: rect.x + dragTabX(),
+          y: rect.y + EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+          width: DRAG_TAB_LENGTH,
+          height: DRAG_TAB_THICKNESS,
+        };
+      case "bottom":
+        return {
+          x: rect.x + dragTabX(),
+          y: rect.y + rect.height - EDGE_DRAG_HALO_PX,
+          width: DRAG_TAB_LENGTH,
+          height: DRAG_TAB_THICKNESS,
+        };
+      case "left":
+        return {
+          x: rect.x + EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+          y: rect.y + dragTabY(),
+          width: DRAG_TAB_THICKNESS,
+          height: DRAG_TAB_LENGTH,
+        };
+      case "right":
+        return {
+          x: rect.x + rect.width - EDGE_DRAG_HALO_PX,
+          y: rect.y + dragTabY(),
+          width: DRAG_TAB_THICKNESS,
+          height: DRAG_TAB_LENGTH,
+        };
+    }
   });
 
   return (
