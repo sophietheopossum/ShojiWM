@@ -1513,14 +1513,6 @@ impl ResolvedLogicalRect {
         }
     }
 
-    fn left(self) -> ResolvedLayoutValue {
-        self.x
-    }
-
-    fn top(self) -> ResolvedLayoutValue {
-        self.y
-    }
-
     fn right(self) -> ResolvedLayoutValue {
         self.x + self.width
     }
@@ -1540,21 +1532,6 @@ impl ResolvedLogicalRect {
             width: ResolvedLayoutValue::from_raw((right.raw() - left.raw()).max(0)),
             height: ResolvedLayoutValue::from_raw((bottom.raw() - top.raw()).max(0)),
         }
-    }
-
-    fn snapped_size(
-        self,
-        scale_x: f64,
-        scale_y: f64,
-    ) -> (ResolvedLayoutValue, ResolvedLayoutValue) {
-        let left = self.left().snap_edge(scale_x);
-        let top = self.top().snap_edge(scale_y);
-        let right = self.right().snap_edge(scale_x);
-        let bottom = self.bottom().snap_edge(scale_y);
-        (
-            ResolvedLayoutValue::from_raw((right.raw() - left.raw()).max(0)),
-            ResolvedLayoutValue::from_raw((bottom.raw() - top.raw()).max(0)),
-        )
     }
 
     fn round_to_logical_rect(self) -> LogicalRect {
@@ -1588,15 +1565,6 @@ impl ResolvedLogicalRect {
             height: ResolvedLayoutValue::from_f32((max_y - min_y).max(0.0)),
         }
     }
-
-    pub(crate) fn to_precise_logical_rect(self) -> crate::backend::visual::PreciseLogicalRect {
-        crate::backend::visual::PreciseLogicalRect {
-            x: self.x.to_f32(),
-            y: self.y.to_f32(),
-            width: self.width.to_f32(),
-            height: self.height.to_f32(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1616,17 +1584,6 @@ impl From<DecorationValidationError> for DecorationLayoutError {
     fn from(value: DecorationValidationError) -> Self {
         Self::Validation(value)
     }
-}
-
-// kept: lower-level entry point, not currently called directly
-#[allow(dead_code)]
-pub(super) fn layout_node(
-    node: &DecorationNode,
-    rect: LogicalRect,
-    inherited_clip: Option<DecorationClip>,
-    window_slot_size: Option<(i32, i32)>,
-) -> Result<ComputedDecorationNode, DecorationLayoutError> {
-    layout_node_with_scale(node, rect, inherited_clip, window_slot_size, 1.0)
 }
 
 pub(super) fn layout_node_with_scale(
@@ -2240,31 +2197,6 @@ impl DecorationNode {
         self.style.clamp_main_resolved(direction, fallback, scale)
     }
 
-    fn preferred_main_size(
-        &self,
-        direction: LayoutDirection,
-        window_slot_size: Option<(i32, i32)>,
-    ) -> i32 {
-        let explicit = match direction {
-            LayoutDirection::Row => self.style.width,
-            LayoutDirection::Column => self.style.height,
-        };
-
-        let fallback = explicit.unwrap_or_else(|| {
-            self.auto_size(window_slot_size)
-                .map(|(width, height)| match direction {
-                    LayoutDirection::Row => width,
-                    LayoutDirection::Column => height,
-                })
-                .unwrap_or_else(|| match self.kind {
-                    DecorationNodeKind::WindowSlot => 0,
-                    _ => 0,
-                })
-        });
-
-        self.style.clamp_main(direction, fallback)
-    }
-
     fn preferred_cross_size_resolved(
         &self,
         direction: LayoutDirection,
@@ -2296,36 +2228,6 @@ impl DecorationNode {
             });
 
         self.style.clamp_cross_resolved(direction, fallback, scale)
-    }
-
-    fn preferred_cross_size(
-        &self,
-        direction: LayoutDirection,
-        available_cross: i32,
-        align: Option<AlignItems>,
-        window_slot_size: Option<(i32, i32)>,
-    ) -> i32 {
-        let explicit = match direction {
-            LayoutDirection::Row => self.style.height,
-            LayoutDirection::Column => self.style.width,
-        };
-
-        let fallback = explicit.unwrap_or_else(|| {
-            if matches!(align.unwrap_or(AlignItems::Stretch), AlignItems::Stretch)
-                && available_cross > 0
-            {
-                return available_cross;
-            }
-
-            self.auto_size(window_slot_size)
-                .map(|(width, height)| match direction {
-                    LayoutDirection::Row => height,
-                    LayoutDirection::Column => width,
-                })
-                .unwrap_or(available_cross)
-        });
-
-        self.style.clamp_cross(direction, fallback)
     }
 
     fn flex_grow_for_layout(&self) -> f32 {
@@ -2412,11 +2314,6 @@ impl DecorationNode {
             })
     }
 
-    fn auto_size(&self, window_slot_size: Option<(i32, i32)>) -> Option<(i32, i32)> {
-        self.intrinsic_size(window_slot_size)
-            .or_else(|| self.content_based_size(window_slot_size))
-    }
-
     fn auto_size_resolved(
         &self,
         window_slot_size: Option<(i32, i32)>,
@@ -2424,19 +2321,6 @@ impl DecorationNode {
     ) -> Option<(ResolvedLayoutValue, ResolvedLayoutValue)> {
         self.intrinsic_size_resolved(window_slot_size)
             .or_else(|| self.content_based_size_resolved(window_slot_size, scale))
-    }
-
-    fn content_based_size(&self, window_slot_size: Option<(i32, i32)>) -> Option<(i32, i32)> {
-        match &self.kind {
-            DecorationNodeKind::Box(layout) => {
-                Some(self.stack_content_size(layout.direction, window_slot_size))
-            }
-            DecorationNodeKind::ShaderEffect(effect) => {
-                Some(self.stack_content_size(effect.direction, window_slot_size))
-            }
-            DecorationNodeKind::WindowBorder => Some(self.overlay_content_size(window_slot_size)),
-            _ => None,
-        }
     }
 
     fn content_based_size_resolved(
@@ -2455,56 +2339,6 @@ impl DecorationNode {
                 Some(self.overlay_content_size_resolved(window_slot_size, scale))
             }
             _ => None,
-        }
-    }
-
-    fn stack_content_size(
-        &self,
-        direction: LayoutDirection,
-        window_slot_size: Option<(i32, i32)>,
-    ) -> (i32, i32) {
-        let inset = self.style.content_inset();
-        if self.children.is_empty() {
-            return (inset.left + inset.right, inset.top + inset.bottom);
-        }
-
-        let flow_children = self
-            .children
-            .iter()
-            .filter(|child| !child.style.is_absolute_positioned())
-            .collect::<Vec<_>>();
-        if flow_children.is_empty() {
-            return (inset.left + inset.right, inset.top + inset.bottom);
-        }
-
-        let gap = self.style.gap.unwrap_or(0).max(0);
-        let mut main_sum = 0;
-        let mut cross_max = 0;
-
-        for child in &flow_children {
-            let child_main = child
-                .preferred_main_size(direction, window_slot_size)
-                .max(0)
-                + direction.main_margin(child.style.margin);
-            let child_cross = child
-                .preferred_cross_size(direction, 0, child.style.align_items, window_slot_size)
-                .max(0)
-                + direction.cross_margin(child.style.margin);
-            main_sum += child_main;
-            cross_max = cross_max.max(child_cross);
-        }
-
-        main_sum += gap * flow_children.len().saturating_sub(1) as i32;
-
-        match direction {
-            LayoutDirection::Row => (
-                main_sum + inset.left + inset.right,
-                cross_max + inset.top + inset.bottom,
-            ),
-            LayoutDirection::Column => (
-                cross_max + inset.left + inset.right,
-                main_sum + inset.top + inset.bottom,
-            ),
         }
     }
 
@@ -2564,36 +2398,6 @@ impl DecorationNode {
                 main_sum + inset.top + inset.bottom,
             ),
         }
-    }
-
-    fn overlay_content_size(&self, window_slot_size: Option<(i32, i32)>) -> (i32, i32) {
-        let inset = self.style.content_inset();
-        let mut width = 0;
-        let mut height = 0;
-
-        for child in self
-            .children
-            .iter()
-            .filter(|child| !child.style.is_absolute_positioned())
-        {
-            width = width.max(
-                child
-                    .preferred_main_size(LayoutDirection::Row, window_slot_size)
-                    .max(0)
-                    + LayoutDirection::Row.main_margin(child.style.margin),
-            );
-            height = height.max(
-                child
-                    .preferred_main_size(LayoutDirection::Column, window_slot_size)
-                    .max(0)
-                    + LayoutDirection::Column.main_margin(child.style.margin),
-            );
-        }
-
-        (
-            width + inset.left + inset.right,
-            height + inset.top + inset.bottom,
-        )
     }
 
     fn overlay_content_size_resolved(
@@ -2671,23 +2475,6 @@ impl DecorationStyle {
         ResolvedLayoutValue::from_i32(self.gap.unwrap_or(0).max(0)).snap_edge(scale)
     }
 
-    fn content_inset(&self) -> Edges {
-        let border = self.border.map(|border| border.width).unwrap_or(0).max(0);
-        Edges {
-            top: self.padding.top + border,
-            right: self.padding.right + border,
-            bottom: self.padding.bottom + border,
-            left: self.padding.left + border,
-        }
-    }
-
-    fn clamp_main(&self, direction: LayoutDirection, value: i32) -> i32 {
-        match direction {
-            LayoutDirection::Row => clamp_size(value, self.min_width, self.max_width),
-            LayoutDirection::Column => clamp_size(value, self.min_height, self.max_height),
-        }
-    }
-
     fn clamp_main_resolved(
         &self,
         direction: LayoutDirection,
@@ -2706,13 +2493,6 @@ impl DecorationStyle {
             },
             scale,
         )
-    }
-
-    fn clamp_cross(&self, direction: LayoutDirection, value: i32) -> i32 {
-        match direction {
-            LayoutDirection::Row => clamp_size(value, self.min_height, self.max_height),
-            LayoutDirection::Column => clamp_size(value, self.min_width, self.max_width),
-        }
     }
 
     fn clamp_cross_resolved(
@@ -2793,19 +2573,6 @@ fn layout_style_equivalent(left: &DecorationStyle, right: &DecorationStyle) -> b
         && left.visible == right.visible
 }
 
-// kept: non-`_resolved` counterpart of clamp_size_resolved
-#[allow(dead_code)]
-fn clamp_size(value: i32, min: Option<i32>, max: Option<i32>) -> i32 {
-    let mut value = value.max(0);
-    if let Some(min) = min {
-        value = value.max(min.max(0));
-    }
-    if let Some(max) = max {
-        value = value.min(max.max(0));
-    }
-    value
-}
-
 fn clamp_size_resolved(
     value: ResolvedLayoutValue,
     min: Option<i32>,
@@ -2853,20 +2620,6 @@ impl LayoutDirection {
         }
     }
 
-    fn main_margin(self, margin: Edges) -> i32 {
-        match self {
-            LayoutDirection::Row => margin.left + margin.right,
-            LayoutDirection::Column => margin.top + margin.bottom,
-        }
-    }
-
-    fn cross_margin(self, margin: Edges) -> i32 {
-        match self {
-            LayoutDirection::Row => margin.top + margin.bottom,
-            LayoutDirection::Column => margin.left + margin.right,
-        }
-    }
-
     fn main_origin_resolved(self, rect: ResolvedLogicalRect) -> ResolvedLayoutValue {
         match self {
             LayoutDirection::Row => rect.x,
@@ -2885,47 +2638,6 @@ impl LayoutDirection {
         match self {
             LayoutDirection::Row => rect.height,
             LayoutDirection::Column => rect.width,
-        }
-    }
-
-    fn main_origin(self, rect: LogicalRect) -> i32 {
-        match self {
-            LayoutDirection::Row => rect.x,
-            LayoutDirection::Column => rect.y,
-        }
-    }
-
-    fn main_len(self, rect: LogicalRect) -> i32 {
-        match self {
-            LayoutDirection::Row => rect.width,
-            LayoutDirection::Column => rect.height,
-        }
-    }
-
-    fn cross_len(self, rect: LogicalRect) -> i32 {
-        match self {
-            LayoutDirection::Row => rect.height,
-            LayoutDirection::Column => rect.width,
-        }
-    }
-
-    fn cross_origin_for_child(
-        self,
-        rect: LogicalRect,
-        align: Option<AlignItems>,
-        child_cross_size: i32,
-    ) -> i32 {
-        let align = align.unwrap_or(AlignItems::Stretch);
-        let available = self.cross_len(rect);
-        let remaining = (available - child_cross_size).max(0);
-
-        match (self, align) {
-            (LayoutDirection::Row, AlignItems::Center) => rect.y + remaining / 2,
-            (LayoutDirection::Row, AlignItems::End) => rect.y + remaining,
-            (LayoutDirection::Row, _) => rect.y,
-            (LayoutDirection::Column, AlignItems::Center) => rect.x + remaining / 2,
-            (LayoutDirection::Column, AlignItems::End) => rect.x + remaining,
-            (LayoutDirection::Column, _) => rect.x,
         }
     }
 
@@ -2991,23 +2703,6 @@ impl LayoutDirection {
                 width: cross_len,
                 height: main_len,
             },
-        }
-    }
-
-    fn rect(
-        self,
-        main_origin: i32,
-        cross_origin: i32,
-        main_len: i32,
-        cross_len: i32,
-    ) -> LogicalRect {
-        match self {
-            LayoutDirection::Row => {
-                LogicalRect::new(main_origin, cross_origin, main_len, cross_len)
-            }
-            LayoutDirection::Column => {
-                LogicalRect::new(cross_origin, main_origin, cross_len, main_len)
-            }
         }
     }
 }
@@ -3254,25 +2949,6 @@ fn hit_test_resize_edges(
     (!edges.is_empty()).then_some(edges)
 }
 
-// kept: non-resolved counterpart of effective_clip_for_node_resolved
-#[allow(dead_code)]
-fn effective_clip_for_node(
-    node: &DecorationNode,
-    inherited_clip: Option<DecorationClip>,
-    content_rect: LogicalRect,
-) -> Option<DecorationClip> {
-    effective_clip_for_node_resolved(
-        node,
-        inherited_clip.map(|clip| ResolvedDecorationClip {
-            rect: ResolvedLogicalRect::from_logical(clip.rect),
-            radius: ResolvedLayoutValue::from_i32(clip.radius),
-        }),
-        ResolvedLogicalRect::from_logical(content_rect),
-        1.0,
-    )
-    .map(|clip| clip.round_to_logical_clip())
-}
-
 fn effective_clip_for_node_resolved(
     node: &DecorationNode,
     inherited_clip: Option<ResolvedDecorationClip>,
@@ -3308,76 +2984,6 @@ fn node_clips_children(node: &DecorationNode) -> bool {
     // placement marker rather than an SSD container.
     node.style.clips_children()
         || (node.style.border.is_some() && !matches!(node.style.overflow, Some(Overflow::Visible)))
-}
-
-// kept: used by effective_clip_for_node above
-#[allow(dead_code)]
-fn intersect_decoration_clips(
-    left: DecorationClip,
-    right: DecorationClip,
-) -> Option<DecorationClip> {
-    let x1 = left.rect.x.max(right.rect.x);
-    let y1 = left.rect.y.max(right.rect.y);
-    let x2 = (left.rect.x + left.rect.width).min(right.rect.x + right.rect.width);
-    let y2 = (left.rect.y + left.rect.height).min(right.rect.y + right.rect.height);
-
-    if x2 <= x1 || y2 <= y1 {
-        return None;
-    }
-
-    if rect_contains_logical(left.rect, right.rect) {
-        return Some(right);
-    }
-
-    if rect_contains_logical(right.rect, left.rect) {
-        return Some(left);
-    }
-
-    Some(DecorationClip {
-        rect: LogicalRect::new(x1, y1, x2 - x1, y2 - y1),
-        radius: left.radius.min(right.radius),
-    })
-}
-
-fn intersect_resolved_decoration_clips(
-    left: ResolvedDecorationClip,
-    right: ResolvedDecorationClip,
-) -> Option<ResolvedDecorationClip> {
-    let x1 = left.rect.x.max(right.rect.x);
-    let y1 = left.rect.y.max(right.rect.y);
-    let x2 = left.rect.right().min(right.rect.right());
-    let y2 = left.rect.bottom().min(right.rect.bottom());
-
-    if x2.raw() <= x1.raw() || y2.raw() <= y1.raw() {
-        return None;
-    }
-
-    if resolved_rect_contains(left.rect, right.rect) {
-        return Some(right);
-    }
-
-    if resolved_rect_contains(right.rect, left.rect) {
-        return Some(left);
-    }
-
-    Some(ResolvedDecorationClip {
-        rect: ResolvedLogicalRect {
-            x: x1,
-            y: y1,
-            width: ResolvedLayoutValue::from_raw(x2.raw() - x1.raw()),
-            height: ResolvedLayoutValue::from_raw(y2.raw() - y1.raw()),
-        },
-        radius: left.radius.min(right.radius),
-    })
-}
-
-// kept: used by the non-resolved clip path above
-#[allow(dead_code)]
-fn rect_contains_logical(outer: LogicalRect, inner: LogicalRect) -> bool {
-    outer.x <= inner.x
-        && outer.y <= inner.y
-        && outer.x + outer.width >= inner.x + inner.width
-        && outer.y + outer.height >= inner.y + inner.height
 }
 
 fn resolved_rect_contains(outer: ResolvedLogicalRect, inner: ResolvedLogicalRect) -> bool {
