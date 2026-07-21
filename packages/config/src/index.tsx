@@ -78,7 +78,7 @@ interface MinkaSettings {
 // runtime (input/output factories re-run, no config reload). A missing or
 // unparseable file falls back to defaults so a fresh machine boots before
 // MinkaConf has ever written anything.
-const MINKA_SETTINGS_PATH = `${process.env.HOME}/.config/shojiwm/src/minka-settings.json`;
+const MINKA_SETTINGS_PATH = `${process.env.HOME}/.config/minka-settings.json`;
 
 // 8/7/2026 defaults per Sophie: adaptive accel, natural scroll off.
 const MINKA_SETTINGS_DEFAULTS: MinkaSettings = {
