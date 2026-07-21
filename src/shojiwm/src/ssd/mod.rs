@@ -2944,6 +2944,38 @@ fn node_clips_children(node: &DecorationNode) -> bool {
             && !matches!(node.style.overflow, Some(Overflow::Visible)))
 }
 
+fn intersect_resolved_decoration_clips(
+    left: ResolvedDecorationClip,
+    right: ResolvedDecorationClip,
+) -> Option<ResolvedDecorationClip> {
+    let x1 = left.rect.x.max(right.rect.x);
+    let y1 = left.rect.y.max(right.rect.y);
+    let x2 = left.rect.right().min(right.rect.right());
+    let y2 = left.rect.bottom().min(right.rect.bottom());
+
+    if x2.raw() <= x1.raw() || y2.raw() <= y1.raw() {
+        return None;
+    }
+
+    if resolved_rect_contains(left.rect, right.rect) {
+        return Some(right);
+    }
+
+    if resolved_rect_contains(right.rect, left.rect) {
+        return Some(left);
+    }
+
+    Some(ResolvedDecorationClip {
+        rect: ResolvedLogicalRect {
+            x: x1,
+            y: y1,
+            width: ResolvedLayoutValue::from_raw(x2.raw() - x1.raw()),
+            height: ResolvedLayoutValue::from_raw(y2.raw() - y1.raw()),
+        },
+        radius: left.radius.min(right.radius),
+    })
+}
+
 fn resolved_rect_contains(outer: ResolvedLogicalRect, inner: ResolvedLogicalRect) -> bool {
     outer.x.raw() <= inner.x.raw()
         && outer.y.raw() <= inner.y.raw()
