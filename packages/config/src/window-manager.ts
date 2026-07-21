@@ -1614,6 +1614,34 @@ export class HybridWindowManager {
     return undefined;
   }
 
+  /**
+   * Externally-driven move/resize (IPC `windows.setRect`, used by
+   * MinkaMon's full-overview arrangement): places a floating window at an
+   * exact layout-space rect. Tiled windows are left to the tiler;
+   * maximized windows are restored first so the rect sticks.
+   */
+  public setWindowRectById(
+    windowId: string,
+    rect: ManagedWindowRect,
+  ): boolean {
+    const window = this.findWindowById(windowId);
+    if (!window) {
+      return false;
+    }
+    const workspace = this.findWorkspaceForWindow(window);
+    if (workspace?.isTiled && workspace.shouldTile(window)) {
+      return false;
+    }
+    if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+      window.unmaximize();
+    }
+    stopRectAnimation(window, WINDOW_STATE_RECT);
+    window.state[WINDOW_STATE_RECT].set(rect);
+    workspace?.syncFloatingWindowRect(window, rect);
+    this.applyWorkspaceStackPolicy(workspace);
+    return true;
+  }
+
   /** Every managed window across all workspaces (debug/IPC use). */
   public listWindows(): WaylandWindow[] {
     const windows: WaylandWindow[] = [];

@@ -205,6 +205,7 @@ COMPOSITOR.onEnable((event) => {
 //   workspaces.toggleTiling  { monitor?: string }                  (command)
 //   workspaces.changed       -> WorkspacesView                     (broadcast)
 //   windows.activate         { windowId: string }                  (command)
+//   windows.setRect          { windowId, x, y, width, height }     (request/response)
 //   dock.proximity           { monitor: string, inside: bool }    (broadcast)
 // ---------------------------------------------------------------------------
 const WORKSPACE_IPC = createIpcServer();
@@ -356,6 +357,37 @@ WORKSPACE_IPC.handle("windows.maximize", (params) => {
     window.maximize();
   }
   scheduleWorkspaceBroadcast();
+});
+
+// Externally-driven move/resize (MinkaMon's full-overview arrangement).
+WORKSPACE_IPC.handle("windows.setRect", (params) => {
+  const request = params as
+    | {
+        windowId?: string;
+        x?: number;
+        y?: number;
+        width?: number;
+        height?: number;
+      }
+    | undefined;
+  if (
+    !request ||
+    typeof request.windowId !== "string" ||
+    typeof request.x !== "number" ||
+    typeof request.y !== "number" ||
+    typeof request.width !== "number" ||
+    typeof request.height !== "number"
+  ) {
+    return { ok: false };
+  }
+  const ok = HYBRID_WINDOW_MANAGER.setWindowRectById(request.windowId, {
+    x: request.x,
+    y: request.y,
+    width: request.width,
+    height: request.height,
+  });
+  scheduleWorkspaceBroadcast();
+  return { ok };
 });
 
 // Bar window-controls: minimize the window (restore goes through
