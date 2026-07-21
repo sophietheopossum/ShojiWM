@@ -239,6 +239,34 @@ function attachDragTabs(view: WorkspacesView): WorkspacesView {
   return view;
 }
 
+// Live rect stream for MinkaMon's leader lines: pushed on every window
+// move/resize event batch so the lines track drags at event rate instead
+// of the client's fallback poll. Minimal payload (id + rect + drag tab),
+// coalesced per tick; clients that don't know the event ignore it.
+let rectsBroadcastQueued = false;
+function scheduleRectsBroadcast() {
+  if (rectsBroadcastQueued) {
+    return;
+  }
+  rectsBroadcastQueued = true;
+  void Promise.resolve().then(() => {
+    rectsBroadcastQueued = false;
+    const windows = [];
+    for (const window of HYBRID_WINDOW_MANAGER.listWindows()) {
+      const rect = window.state[WINDOW_STATE_RECT]();
+      windows.push({
+        id: window.id,
+        x: read(rect.x),
+        y: read(rect.y),
+        width: read(rect.width),
+        height: read(rect.height),
+        dragTab: DRAG_TAB_RECTS.get(window.id)?.() ?? null,
+      });
+    }
+    WORKSPACE_IPC.broadcast("windows.rects", { windows });
+  });
+}
+
 function broadcastWorkspaces() {
   const view = attachDragTabs(
       HYBRID_WINDOW_MANAGER.viewForIpc(),
@@ -1043,6 +1071,7 @@ COMPOSITOR.event.onDestroyLayer(() => {
 
 COMPOSITOR.event.onWindowResize((event) => {
   HYBRID_WINDOW_MANAGER.onWindowResize(event);
+  scheduleRectsBroadcast();
 });
 
 COMPOSITOR.pointer.bindWindowMoveModifier("Super");
@@ -1050,6 +1079,7 @@ COMPOSITOR.pointer.bindWindowResizeModifier("Super");
 
 COMPOSITOR.event.onWindowMove((event) => {
   HYBRID_WINDOW_MANAGER.onWindowMove(event);
+  scheduleRectsBroadcast();
   // A drag can hand the window to another monitor's workspace (adoption in
   // onWindowMove); without a broadcast the dock keeps listing it on the old
   // output until some unrelated event refreshes the view.
