@@ -32,7 +32,10 @@ import type {
   InputScrollMethod,
   ManagedWindowRect,
 } from "shoji_wm/types";
-import { createIpcServer } from "shoji_wm/ipc";
+import { 
+    createIpcServer, 
+    wakeRust
+} from "shoji_wm/ipc";
 import { readFileSync } from "node:fs";
 
 // Full per-display schema MinkaConf's visual page writes.
@@ -310,6 +313,11 @@ function scheduleRectsBroadcast() {
   rectsBroadcastQueued = true;
   void Promise.resolve().then(() => {
     rectsBroadcastQueued = false;
+    // No listeners, no work: with MinkaMon closed this path costs nothing
+    // and the runtime behaves exactly as if the tap didn't exist.
+    if (WORKSPACE_IPC.clientCount() === 0) {
+      return;
+    }
     const windows = [];
     for (const window of HYBRID_WINDOW_MANAGER.listWindows()) {
       const rect = window.state[WINDOW_STATE_RECT]();
@@ -323,6 +331,13 @@ function scheduleRectsBroadcast() {
       });
     }
     WORKSPACE_IPC.broadcast("windows.rects", { windows });
+    // This microtask runs AFTER the triggering event's request/response
+    // cycle has been drained, so anything it touched in runtime state is
+    // invisible to the compositor's scheduler until the next poll — which
+    // otherwise only comes with further input ("updates only when the
+    // mouse moves", regressed in 0.16.10). Same contract as IPC handlers:
+    // wake the compositor explicitly.
+    wakeRust();
   });
 }
 
