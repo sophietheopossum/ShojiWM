@@ -712,6 +712,12 @@ COMPOSITOR.key.bind("screenshot-freeze", "Super+Ctrl+P", () => {
     command: "hyprshot -m region --freeze --raw | swappy -f -",
   });
 });
+// MinkaShot: freeze-frame capture UI (MinkaDE/MinkaShot). The running app
+// listens for this broadcast on the IPC socket, same pattern as the start
+// menu.
+COMPOSITOR.key.bind("minkashot", "Print", () => {
+  WORKSPACE_IPC.broadcast("ui.minkashot", { action: "interactive" });
+});
 COMPOSITOR.key.bind("cycle-windows", "Alt+Tab", () => {
   HYBRID_WINDOW_MANAGER.cycleWorkspaceFocus(1);
   scheduleWorkspaceBroadcast();
