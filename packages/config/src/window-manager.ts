@@ -239,6 +239,13 @@ export interface WorkspacesViewWindow {
   /** epoch ms — most recent focus time for MRU ordering. 0 if never focused. */
   lastFocusedAt: number;
   /**
+   * Client-declared semantic identity ("typed segment" in the Arcan/SHMIF
+   * sense, e.g. "minkamon.disk"), claimed via the windows.identify IPC
+   * method. Lets consumers match windows by what they are instead of what
+   * their title string happens to say. null while unclaimed.
+   */
+  role?: string | null;
+  /**
    * Layout-space frame rect, sampled at view-build time (animated rects
    * report their current position). Added for MinkaMon's leader-line
    * overlay, which cannot learn its own window positions from Wayland.
@@ -391,6 +398,9 @@ export class HybridWindowManager {
   // Tracks MRU focus time per window id so the dock can pick "the most recent
   // window of an app" deterministically. Updated by recordFocus().
   private readonly lastFocusedAt = new Map<string, number>();
+  // windowId -> client-declared role; same lifecycle as lastFocusedAt (no
+  // pruning on close — ids are not reused within a session).
+  private readonly windowRoles = new Map<string, string>();
   private readonly pendingInitialFocusByWindowId = new Map<string, number>();
   private currentMonitor: string;
   private isGrabbing = false;
@@ -1516,6 +1526,7 @@ export class HybridWindowManager {
             minimized: window.state[WINDOW_STATE_MINIMIZED](),
             fullscreen: window.state[WINDOW_STATE_FULLSCREEN](),
             lastFocusedAt: this.lastFocusedAt.get(window.id) ?? 0,
+            role: this.windowRoles.get(window.id) ?? null,
             rect: {
               x: read(rect.x),
               y: read(rect.y),
@@ -1566,6 +1577,19 @@ export class HybridWindowManager {
    */
   public recordFocus(windowId: string) {
     this.lastFocusedAt.set(windowId, Date.now());
+  }
+
+  /**
+   * Attach a client-declared semantic role to a window (the Arcan/SHMIF
+   * "typed segment" idea): consumers then match on role rather than title
+   * strings. Empty/null role revokes the claim.
+   */
+  public setWindowRole(windowId: string, role: string | null) {
+    if (role === null || role === "") {
+      this.windowRoles.delete(windowId);
+    } else {
+      this.windowRoles.set(windowId, role);
+    }
   }
 
   private trackPendingInitialFocus(window: WaylandWindow) {

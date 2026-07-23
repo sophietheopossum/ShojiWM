@@ -381,6 +381,22 @@ WORKSPACE_IPC.handle("windows.close", (params) => {
     scheduleWorkspaceBroadcast();
   }
 });
+// Client-declared semantic window roles ("typed segments", ported from
+// Arcan's SHMIF idea), for example: Minka apps claim what a window *is* — e.g.
+// "minkamon.disk" — so consumers (leader lines, overview arrangement,
+// MinkaShot's window capture) stop matching on mutable title strings.
+WORKSPACE_IPC.handle("windows.identify", (params) => {
+  const request = params as
+    | { windowId?: string; role?: string | null }
+    | undefined;
+  if (typeof request?.windowId === "string") {
+    HYBRID_WINDOW_MANAGER.setWindowRole(
+      request.windowId,
+      typeof request.role === "string" ? request.role : null,
+    );
+    scheduleWorkspaceBroadcast();
+  }
+});
 // Debug helper (Rio maximize investigation): drive the same maximize path a
 // client CSD button takes, addressable by window id from outside the session.
 WORKSPACE_IPC.handle("windows.maximize", (params) => {
