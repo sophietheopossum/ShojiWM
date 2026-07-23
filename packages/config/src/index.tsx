@@ -627,6 +627,13 @@ COMPOSITOR.process.once("shell", {
   command: "qs -p \"${MINKA_SHELL_DIR:-/usr/share/minka/MinkaShell}\" > /tmp/minkashell.log 2>&1",
   runPolicy: "once-per-session",
 });
+// MinkaShot: freeze-frame screenshot tool. Runs as a daemon so the Print
+// keybind's ui.minkashot broadcast always has a listener; overlays are
+// pre-declared and hidden until armed, same philosophy as the shell.
+COMPOSITOR.process.once("minkashot", {
+  command: "qs -p \"${MINKA_SHOT_DIR:-/usr/share/minka/MinkaShot}\" > /tmp/minkashot.log 2>&1",
+  runPolicy: "once-per-session",
+});
 // MinkaFX: the Guido-style wgpu overlay process (snap preview, future OSDs).
 // Guarded so a missing/not-yet-built binary is a silent no-op instead of a
 // failure. MINKA_FX_BIN overrides the installed path for repo-checkout runs.
