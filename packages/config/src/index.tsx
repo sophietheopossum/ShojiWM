@@ -1,11 +1,8 @@
 import {
-  AppIcon,
   Box,
-  Button,
   ClientWindow,
   Image,
   ShaderEffect,
-  Label,
   COMPOSITOR,
   WindowBorder,
   backdropSource,
@@ -15,6 +12,7 @@ import {
   type SSDStyle,
   type WaylandWindow,
   computed,
+  signal,
   useState,
   shaderStage,
   loadShader,
@@ -25,13 +23,105 @@ import {
   compilePopupEffect,
   popupSource,
 } from "shoji_wm";
-import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
-import { createIpcServer } from "shoji_wm/ipc";
+import type {
+  InputAccelProfile,
+  InputScrollMethod,
+  ManagedWindowRect,
+} from "shoji_wm/types";
+import { 
+    createIpcServer, 
+    wakeRust
+} from "shoji_wm/ipc";
+import { readFileSync } from "node:fs";
+
+// Full per-display schema MinkaConf's visual page writes.
+interface MinkaDisplaySettings {
+  scale?: number;
+  position?: { x: number; y: number };
+  resolution?: { width: number; height: number; refreshRate?: number } | "best";
+  enabled?: boolean;
+  mirror?: string | null;
+  hdr?: boolean;
+}
+
+interface MinkaInputSettings {
+  pointerAccel: number;
+  accelProfile: string;
+  naturalScroll: boolean;
+  touchpad: {
+    naturalScroll: boolean;
+    tapToClick: boolean;
+    scrollMethod: string;
+    scrollFactor: number;
+    disableWhileTyping: boolean;
+  };
+  // Optional: settings files written before the keyboard section lack it.
+  keyboard?: {
+    layout?: string;
+    variant?: string;
+  };
+}
+
+interface MinkaSettings {
+  input: MinkaInputSettings;
+  displays: Record<string, MinkaDisplaySettings | undefined>;
+  // XCursor theme + size, owned by MinkaConf's cursor page. Optional so
+  // settings files from before revision 3 still parse.
+  cursor?: { theme?: string; size?: number };
+  // Shell-side keys (e.g. shell.layout) ride along untouched: MinkaConf owns
+  // the whole file and MinkaShell reads it directly.
+  shell?: { layout?: string };
+}
+
+// User-facing settings owned by MinkaConf. Read at runtime, NOT imported as
+// a module: this config can live anywhere (repo checkout via SHOJI_CONFIG,
+// symlink, installed copy) and ESM resolves relative imports against the
+// module's realpath, while MinkaConf and MinkaShell always use the path
+// below. Boot reads the file once; `settings.apply` over IPC swaps values at
+// runtime (input/output factories re-run, no config reload). A missing or
+// unparseable file falls back to defaults so a fresh machine boots before
+// MinkaConf has ever written anything.
+const MINKA_SETTINGS_PATH = `${process.env.HOME}/.config/minka-settings.json`;
+
+// 8/7/2026 defaults per Sophie: adaptive accel, natural scroll off.
+const MINKA_SETTINGS_DEFAULTS: MinkaSettings = {
+  input: {
+    pointerAccel: 0.4,
+    accelProfile: "adaptive",
+    naturalScroll: false,
+    touchpad: {
+      naturalScroll: false,
+      tapToClick: true,
+      scrollMethod: "twoFinger",
+      scrollFactor: 1,
+      disableWhileTyping: false,
+    },
+    keyboard: {
+      layout: "us",
+      variant: "",
+    },
+  },
+  displays: {},
+};
+
+function loadMinkaSettings(): MinkaSettings {
+  try {
+    return JSON.parse(readFileSync(MINKA_SETTINGS_PATH, "utf8")) as MinkaSettings;
+  } catch (error) {
+    console.warn(
+      `minka-settings: using defaults (cannot read ${MINKA_SETTINGS_PATH}: ${error})`,
+    );
+    return MINKA_SETTINGS_DEFAULTS;
+  }
+}
+
+let activeSettings: MinkaSettings = loadMinkaSettings();
 import {
   HybridWindowManager,
-  TITLEBAR_HEIGHT,
+  EDGE_DRAG_HALO_PX,
   WINDOW_BORDER_PX,
   WINDOW_STATE_FULLSCREEN,
+  WINDOW_STATE_MAXIMIZED,
   WINDOW_STATE_MINIMIZED,
   WINDOW_STATE_MINIMIZE_VISUAL_IDLE,
   WINDOW_STATE_TILE_DRAGGING,
@@ -42,15 +132,21 @@ import {
   WINDOW_STATE_WORKSPACE_OFFSET_Y,
   WINDOW_STATE_WORKSPACE_OPACITY,
 } from "./window-manager";
+import type { 
+    WorkspacesView,
+} from "./window-manager";
 
 COMPOSITOR.env.apply({
   QT_QPA_PLATFORM: "wayland;xcb",
   QT_QPA_PLATFORMTHEME: "qt6ct",
-  QT_IM_MODULE: "fcitx",
-  XMODIFIERS: "@im=fcitx",
-  SDL_IM_MODULE: "fcitx",
   GLFW_IM_MODULE: "ibus",
   ELECTRON_OZONE_PLATFORM_HINT: "wayland",
+  // Firefox/hellfire was running through XWayland here (8/7/2026), where
+  // fractional scaling makes click hit-testing unreliable — "some clicks
+  // don't work". Force native Wayland for this session only; KDE keeps
+  // whatever it was doing.
+  MOZ_ENABLE_WAYLAND: "1",
+  MOZ_DBUS_REMOTE: "1",
 });
 COMPOSITOR.env.publish();
 
@@ -112,14 +208,84 @@ COMPOSITOR.onEnable((event) => {
 //   workspaces.toggleTiling  { monitor?: string }                  (command)
 //   workspaces.changed       -> WorkspacesView                     (broadcast)
 //   windows.activate         { windowId: string }                  (command)
+//   windows.setRect          { windowId, x, y, width, height }     (request/response)
 //   dock.proximity           { monitor: string, inside: bool }    (broadcast)
 // ---------------------------------------------------------------------------
 const WORKSPACE_IPC = createIpcServer();
 let lastWorkspacesJson = "";
 let workspaceBroadcastQueued = false;
 
+// Live drag-tab geometry per window id, registered by the decoration
+// composition below. Entries are lazy computeds, so hover/pointer state is
+// only sampled when a view is actually built (MinkaMon's poll) — idle
+// windows still never re-evaluate on mouse motion.
+const DRAG_TAB_RECTS = new Map<
+  string,
+  () => { x: number; y: number; width: number; height: number } | null
+>();
+
+function attachDragTabs(view: WorkspacesView): WorkspacesView {
+  const live = new Set<string>();
+  for (const monitor of view.monitors) {
+    for (const workspace of monitor.workspaces) {
+      for (const win of workspace.windows) {
+        live.add(win.id);
+        win.dragTab = DRAG_TAB_RECTS.get(win.id)?.() ?? null;
+      }
+    }
+  }
+  for (const id of DRAG_TAB_RECTS.keys()) {
+    if (!live.has(id)) {
+      DRAG_TAB_RECTS.delete(id);
+    }
+  }
+  return view;
+}
+
+// Live rect stream for MinkaMon's leader lines: pushed on every window
+// move/resize event batch so the lines track drags at event rate instead
+// of the client's fallback poll. Minimal payload (id + rect + drag tab),
+// coalesced per tick; clients that don't know the event ignore it.
+let rectsBroadcastQueued = false;
+function scheduleRectsBroadcast() {
+  if (rectsBroadcastQueued) {
+    return;
+  }
+  rectsBroadcastQueued = true;
+  void Promise.resolve().then(() => {
+    rectsBroadcastQueued = false;
+    // No listeners, no work: with MinkaMon closed this path costs nothing
+    // and the runtime behaves exactly as if the tap didn't exist.
+    if (WORKSPACE_IPC.clientCount() === 0) {
+      return;
+    }
+    const windows = [];
+    for (const window of HYBRID_WINDOW_MANAGER.listWindows()) {
+      const rect = window.state[WINDOW_STATE_RECT]();
+      windows.push({
+        id: window.id,
+        x: read(rect.x),
+        y: read(rect.y),
+        width: read(rect.width),
+        height: read(rect.height),
+        dragTab: DRAG_TAB_RECTS.get(window.id)?.() ?? null,
+      });
+    }
+    WORKSPACE_IPC.broadcast("windows.rects", { windows });
+    // This microtask runs AFTER the triggering event's request/response
+    // cycle has been drained, so anything it touched in runtime state is
+    // invisible to the compositor's scheduler until the next poll — which
+    // otherwise only comes with further input ("updates only when the
+    // mouse moves", regressed in 0.16.10). Same contract as IPC handlers:
+    // wake the compositor explicitly.
+    wakeRust();
+  });
+}
+
 function broadcastWorkspaces() {
-  const view = HYBRID_WINDOW_MANAGER.viewForIpc();
+  const view = attachDragTabs(
+      HYBRID_WINDOW_MANAGER.viewForIpc(),
+  );
   const json = JSON.stringify(view);
   if (json === lastWorkspacesJson) {
     return;
@@ -176,7 +342,9 @@ COMPOSITOR.workspace.event.onActivate((event) => {
 });
 
 WORKSPACE_IPC.handle("workspaces.get", () =>
-  HYBRID_WINDOW_MANAGER.viewForIpc(),
+  attachDragTabs(
+      HYBRID_WINDOW_MANAGER.viewForIpc(),
+  ),
 );
 WORKSPACE_IPC.handle("workspaces.switch", (params) => {
   const direction = (params as { direction?: number } | undefined)?.direction;
@@ -205,6 +373,165 @@ WORKSPACE_IPC.handle("windows.activate", (params) => {
     HYBRID_WINDOW_MANAGER.activateWindowById(windowId);
     scheduleWorkspaceBroadcast();
   }
+});
+WORKSPACE_IPC.handle("windows.close", (params) => {
+  const windowId = (params as { windowId?: string } | undefined)?.windowId;
+  if (typeof windowId === "string") {
+    HYBRID_WINDOW_MANAGER.closeWindowById(windowId);
+    scheduleWorkspaceBroadcast();
+  }
+});
+// Client-declared semantic window roles ("typed segments", ported from
+// Arcan's SHMIF idea), for example: Minka apps claim what a window *is* — e.g.
+// "minkamon.disk" — so consumers (leader lines, overview arrangement,
+// MinkaShot's window capture) stop matching on mutable title strings.
+WORKSPACE_IPC.handle("windows.identify", (params) => {
+  const request = params as
+    | { windowId?: string; role?: string | null }
+    | undefined;
+  if (typeof request?.windowId === "string") {
+    HYBRID_WINDOW_MANAGER.setWindowRole(
+      request.windowId,
+      typeof request.role === "string" ? request.role : null,
+    );
+    scheduleWorkspaceBroadcast();
+  }
+});
+// Debug helper (Rio maximize investigation): drive the same maximize path a
+// client CSD button takes, addressable by window id from outside the session.
+WORKSPACE_IPC.handle("windows.maximize", (params) => {
+  const request = params as
+    | { windowId?: string; maximized?: boolean }
+    | undefined;
+  if (!request?.windowId) {
+    return;
+  }
+  const window = HYBRID_WINDOW_MANAGER.findWindowById(request.windowId);
+  if (!window) {
+    return;
+  }
+  if (request.maximized === false) {
+    window.unmaximize();
+  } else {
+    window.maximize();
+  }
+  scheduleWorkspaceBroadcast();
+});
+
+// Externally-driven move/resize (MinkaMon's full-overview arrangement).
+WORKSPACE_IPC.handle("windows.setRect", (params) => {
+  const request = params as
+    | {
+        windowId?: string;
+        x?: number;
+        y?: number;
+        width?: number;
+        height?: number;
+      }
+    | undefined;
+  if (
+    !request ||
+    typeof request.windowId !== "string" ||
+    typeof request.x !== "number" ||
+    typeof request.y !== "number" ||
+    typeof request.width !== "number" ||
+    typeof request.height !== "number"
+  ) {
+    return { ok: false };
+  }
+  const ok = HYBRID_WINDOW_MANAGER.setWindowRectById(request.windowId, {
+    x: request.x,
+    y: request.y,
+    width: request.width,
+    height: request.height,
+  });
+  scheduleWorkspaceBroadcast();
+  return { ok };
+});
+
+// Bar window-controls: minimize the window (restore goes through
+// windows.activate, which unminimizes and focuses).
+WORKSPACE_IPC.handle("windows.minimize", (params) => {
+  const request = params as { windowId?: string } | undefined;
+  if (!request?.windowId) {
+    return;
+  }
+  const window = HYBRID_WINDOW_MANAGER.findWindowById(request.windowId);
+  if (!window) {
+    return;
+  }
+  window
+      .minimize();
+  scheduleWorkspaceBroadcast();
+});
+
+// Diagnostic dump for the window-sizing investigation (7/2026): everything
+// the runtime believes about outputs, layer exclusive zones, and the usable
+// areas derived from them. Queryable from another session while the
+// compositor is still running (VT switch, not logout):
+//   printf '{"id":1,"method":"debug.geometry"}\n' \
+//     | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/shojiwm-<display>.sock
+// Config-schema revision handshake. Bump whenever the settings schema or
+// the factories consuming it change, so MinkaConf can tell the user the
+// running session predates the edit ("reload with Super+Shift+R") instead
+// of silently half-applying. History: 1 = input + display scale;
+// 2 = full display schema (position/mode/enabled/mirror/hdr);
+// 3 = cursor theme + size.
+const MINKA_CONFIG_REVISION = 3;
+WORKSPACE_IPC.handle("minka.revision", () => ({
+  revision: MINKA_CONFIG_REVISION,
+}));
+
+// Effective user settings, for MinkaConf to display.
+WORKSPACE_IPC.handle("settings.get", () => activeSettings);
+// Live-apply from MinkaConf: swap the active settings and re-run the input
+// and output factories. No config reload; takes effect immediately.
+WORKSPACE_IPC.handle("settings.apply", (params) => {
+  if (!params || typeof params !== "object") {
+    return { ok: false, error: "expected a settings object" };
+  }
+  activeSettings = params as MinkaSettings;
+  COMPOSITOR.input.reconfigure();
+  COMPOSITOR.output.reconfigure();
+  applyCursorSettings();
+  return { ok: true };
+});
+
+// Cursor theme + size come from minka-settings.json (MinkaConf's cursor
+// page). configure() applies live and also exports XCURSOR_THEME /
+// XCURSOR_SIZE to the systemd and D-Bus activation environments, so apps
+// launched afterwards agree with the compositor. Feature-detected so this
+// config still evaluates on a ShojiWM build without the cursor API.
+function applyCursorSettings() {
+  const cursorApi = (
+    COMPOSITOR as {
+      cursor?: { configure(config: { theme: string; size: number }): void };
+    }
+  ).cursor;
+  const cursor = activeSettings.cursor;
+  if (!cursorApi || !cursor?.theme) {
+    return;
+  }
+  cursorApi.configure({
+    theme: cursor.theme,
+    size: cursor.size ?? 24,
+  });
+}
+applyCursorSettings();
+
+WORKSPACE_IPC.handle("debug.geometry", () => {
+  const usable: Record<string, unknown> = {};
+  const insets: Record<string, unknown> = {};
+  for (const name of COMPOSITOR.output.list) {
+    usable[name] = COMPOSITOR.layer.usableArea(name);
+    insets[name] = COMPOSITOR.layer.reservedInsets(name);
+  }
+  return {
+    outputs: COMPOSITOR.output.current,
+    usable,
+    insets,
+    layers: COMPOSITOR.layer.current,
+  };
 });
 
 // ---------------------------------------------------------------------------
@@ -293,18 +620,45 @@ COMPOSITOR.onDisable(() => {
   WORKSPACE_IPC.close();
 });
 
+
 COMPOSITOR.process.once("fcitx5", {
   command: "fcitx5 -d",
   runPolicy: "once-per-session",
 });
 
-// GTK_A11Y=none disables the AT-SPI accessibility bridge for the bar. A status
-// bar never needs a screen reader, and GTK 4.22's accessibility relation
-// handling can melt down into a recursive notify storm (100% CPU) when a
-// GMenuModel-backed popover's model is destroyed while open — e.g. quitting an
-// app from its system-tray menu. Must be set before GTK init, hence here.
+
+// MinkaShell (Quickshell-based) is the session shell now; shoji-bar-2 is retired.
+// Logs go to /tmp/minkashell.log so warnings and crashes survive the session
+// for later inspection.
+// MINKA_SHELL_DIR overrides the installed location for repo-checkout sessions
+// (set in shojiwm-env.fish); tarball installs land in /usr/share/minka.
 COMPOSITOR.process.once("shell", {
-  command: "cd ~/.config/shoji-bar-2 && GTK_A11Y=none ags run app.tsx",
+  command: "qs -p \"${MINKA_SHELL_DIR:-/usr/share/minka/MinkaShell}\" > /tmp/minkashell.log 2>&1",
+  runPolicy: "once-per-session",
+});
+// MinkaShot: freeze-frame screenshot tool. Runs as a daemon so the Print
+// keybind's ui.minkashot broadcast always has a listener; overlays are
+// pre-declared and hidden until armed, same philosophy as the shell.
+COMPOSITOR.process.once("minkashot", {
+  command: "qs -p \"${MINKA_SHOT_DIR:-/usr/share/minka/MinkaShot}\" > /tmp/minkashot.log 2>&1",
+  runPolicy: "once-per-session",
+});
+// MinkaFX: the Guido-style wgpu overlay process (snap preview, future OSDs).
+// Guarded so a missing/not-yet-built binary is a silent no-op instead of a
+// failure. MINKA_FX_BIN overrides the installed path for repo-checkout runs.
+COMPOSITOR.process.once("MinkaFX", {
+  command: "MINKA_FX=\"${MINKA_FX_BIN:-/usr/bin/MinkaFX}\"; [ -x \"$MINKA_FX\" ] && exec \"$MINKA_FX\" > /tmp/minkafx.log 2>&1",
+  runPolicy: "once-per-session",
+});
+// Polkit authentication agent: without one, anything that needs privilege
+// escalation (pamac, GParted, systemd prompts…) fails silently because
+// polkit has nowhere to send the password dialog. KDE sessions start their
+// own; ours must too. `once` rather than a restarting service: polkit
+// permits one agent per session, so a duplicate spawn exits immediately
+// and a restart-on-exit policy would loop on that.
+// TODO(Minka): replace with a themed MinkaConf-family agent eventually.
+COMPOSITOR.process.once("polkit-agent", {
+  command: "/usr/lib/polkit-kde-authentication-agent-1",
   runPolicy: "once-per-session",
 });
 // cliphist clipboard history watchers. Text and image need separate watchers;
@@ -354,11 +708,45 @@ COMPOSITOR.key.bind("prev", "XF86AudioPrev", () => {
   COMPOSITOR.process.spawn({ command: "playerctl previous" });
 });
 
-// Resolve the monitor under the cursor and toggle shoji-bar-2's StartMenu via ags request.
+// Backlight (Fn+F4 / Fn+F5 emit the XF86MonBrightness* keysyms).
+//
+// The Duo has two panels with independent backlights, so the keys act on
+// whichever one currently holds focus: eDP-1 is the 1920x1080 main panel,
+// while the ScreenPad Plus enumerates as an internal DisplayPort output
+// (DP-1, 1920x515) rather than a second eDP. Anything else — an external
+// monitor, which has no sysfs backlight anyway — falls back to the main
+// panel so the keys always do something predictable.
+//
+// brightnessctl writes through logind's D-Bus session interface, so no setuid
+// binary or udev rule is needed. `-n 1` keeps a floor of one step: with no
+// OSD yet, a fully black panel is indistinguishable from a crash.
+const BACKLIGHT_BY_CONNECTOR: Record<string, string> = {
+  "eDP-1": "intel_backlight",
+  "DP-1": "asus_screenpad",
+};
+
+function adjustBrightness(delta: string) {
+  const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
+  const device = BACKLIGHT_BY_CONNECTOR[monitor] ?? "intel_backlight";
+  COMPOSITOR.process.spawn({
+    command: `brightnessctl -d ${device} -n 1 set ${delta}`,
+  });
+}
+
+COMPOSITOR.key.bind("brightness-up", "XF86MonBrightnessUp", () => {
+  adjustBrightness("5%+");
+});
+COMPOSITOR.key.bind("brightness-down", "XF86MonBrightnessDown", () => {
+  adjustBrightness("5%-");
+});
+
+// Resolve the monitor under the cursor and toggle the start menu.
+// MinkaShell listens for the ui.startMenu broadcast on the IPC socket.
 function toggleStartMenu() {
   const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
-  COMPOSITOR.process.spawn({
-    command: ["ags", "request", "-i", "ags", "start-menu", "toggle", monitor],
+  WORKSPACE_IPC.broadcast("ui.startMenu", {
+    connector: monitor,
+    action: "toggle",
   });
 }
 COMPOSITOR.key.bind("start-menu", "Super+A", toggleStartMenu);
@@ -366,13 +754,9 @@ COMPOSITOR.key.bind("start-menu", "Super+A", toggleStartMenu);
 COMPOSITOR.key.bind("start-menu-tap", "Super", toggleStartMenu, {
   on: "release",
 });
-// Toggle shoji-bar-2's clipboard history on the monitor under the cursor.
-COMPOSITOR.key.bind("clipboard", "Super+V", () => {
-  const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
-  COMPOSITOR.process.spawn({
-    command: ["ags", "request", "-i", "ags", "clipboard", "toggle", monitor],
-  });
-});
+// Clipboard UI was dropped with shoji-bar-2 (Sophie's call); the cliphist
+// watchers above keep collecting history for a future picker, so Super+V is
+// intentionally unbound for now.
 COMPOSITOR.key.bind("screenshot", "Super+P", () => {
   COMPOSITOR.process.spawn({
     command: "hyprshot -m region --raw | swappy -f -",
@@ -383,11 +767,28 @@ COMPOSITOR.key.bind("screenshot-freeze", "Super+Ctrl+P", () => {
     command: "hyprshot -m region --freeze --raw | swappy -f -",
   });
 });
+// MinkaShot: freeze-frame capture UI (MinkaDE/MinkaShot). The running app
+// listens for this broadcast on the IPC socket, same pattern as the start
+// menu.
+COMPOSITOR.key.bind("minkashot", "Print", () => {
+  WORKSPACE_IPC.broadcast("ui.minkashot", { action: "interactive" });
+});
+COMPOSITOR.key.bind("cycle-windows", "Alt+Tab", () => {
+  HYBRID_WINDOW_MANAGER.cycleWorkspaceFocus(1);
+  scheduleWorkspaceBroadcast();
+});
+COMPOSITOR.key.bind("cycle-windows-back", "Alt+Shift+Tab", () => {
+  HYBRID_WINDOW_MANAGER.cycleWorkspaceFocus(-1);
+  scheduleWorkspaceBroadcast();
+});
 COMPOSITOR.key.bind("toggle-tiling-mode", "Super+S", () => {
   HYBRID_WINDOW_MANAGER.toggleCurrentWorkspaceTiling();
   scheduleWorkspaceBroadcast();
 });
 COMPOSITOR.key.bind("close-focused-window", "Super+Q", () => {
+  HYBRID_WINDOW_MANAGER.closeFocusedWindow();
+});
+COMPOSITOR.key.bind("close-focused-window-alt-f4", "Alt+F4", () => {
   HYBRID_WINDOW_MANAGER.closeFocusedWindow();
 });
 COMPOSITOR.key.bind("toggle-focused-window-maximize", "Super+M", () => {
@@ -436,6 +837,11 @@ COMPOSITOR.key.bind("fps", "Super+Shift+F", () => {
   COMPOSITOR.debug.fpsCounter = fpsCounter;
 });
 
+// Displays are fully user-managed through MinkaConf (minka-settings.json):
+// scale, explicit position, mode, enable/disable, mirroring, and the HDR
+// opt-in (HDR only engages when the sink's EDID advertises PQ support).
+// Connectors with no entry get KDE-parity defaults: best mode, auto
+// position, scale 1.0.
 let profileEnabled = false;
 COMPOSITOR.key.bind("profile", "Super+Shift+T", () => {
   profileEnabled = !profileEnabled;
@@ -445,43 +851,31 @@ COMPOSITOR.key.bind("profile", "Super+Shift+T", () => {
 COMPOSITOR.output.configure((context) => {
   const display: DisplayConfigDraft = {};
 
-  display["eDP-1"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.8,
-  };
-  display["eDP-2"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.8,
-  };
-  display["HDMI-A-1"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.5,
-  };
-  display["DP-1"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.5,
-  };
-  display["DP-4"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.5,
-  };
-  display["DP-2"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.6,
-  };
+  const names = new Set<string>(Object.keys(activeSettings.displays));
+  for (const output of context.connected) {
+    names.add(output.name);
+  }
 
+  for (const name of names) {
+    const entry = activeSettings.displays[name];
+    if (entry?.enabled === false) {
+      display[name] = { mode: "disabled" };
+      continue;
+    }
+    if (entry?.mirror) {
+      display[name] = { mode: "mirror", source: entry.mirror };
+      continue;
+    }
+    display[name] = {
+      mode: "extend",
+      resolution: entry?.resolution ?? "best",
+      position: entry?.position ?? "auto",
+      scale: entry?.scale ?? 1.0,
+      hdr: entry?.hdr === true,
+    };
+  }
+
+  // Lid-closed docked mode: the external monitor replaces the built-ins.
   const isDocked = context.connected.some(
     (output) => output.name === "HDMI-A-1",
   );
@@ -490,23 +884,77 @@ COMPOSITOR.output.configure((context) => {
     display["eDP-2"] = { mode: "disabled" };
   }
 
+  // Keep the live layout's bounding box anchored at (0,0), like xrandr does.
+  // X11 toolkits reading RandR through the Xwayland bridge assume the screen
+  // starts at the top-left monitor corner (GTK clips menu workareas against
+  // it). MinkaConf normalizes the arrangement it saves, but only across the
+  // displays connected at the time — so a disconnect (e.g. the TV owning the
+  // top-left corner) can leave the remaining subset with a floating origin.
+  // Translating every output by the same delta preserves the arrangement and
+  // is invisible to the user; "auto" positions are left to the compositor.
+  const connectedNames = new Set(
+      context.connected
+          .map(
+              (output) => output.name
+          )
+  );
+  const positioned: { x: number; y: number }[] = [];
+  for (const [name, entry] of Object.entries(display)) {
+    if (
+      entry.mode === "extend" &&
+      typeof entry.position === "object" &&
+      connectedNames
+          .has(
+              name
+          )
+    ) {
+      positioned
+          .push(
+              entry.position
+          );
+    }
+  }
+  if (positioned.length > 0) {
+    const minX = Math
+        .min(...positioned.map((position) => position.x));
+    const minY = Math
+        .min(...positioned.map((position) => position.y));
+    if (minX !== 0 || minY !== 0) {
+      for (const position of positioned) {
+        position.x -= minX;
+        position.y -= minY;
+      }
+    }
+  }
+
   return display;
 });
 
+// Pointer/touchpad behavior comes from minka-settings.json (MinkaConf).
+// 8/7/2026 defaults per Sophie: adaptive accel at +0.4 (the old flat/0.0
+// was "acceleration too low") and natural scroll off everywhere.
 COMPOSITOR.input.configure((input, _context) => {
+  const inputSettings = activeSettings.input;
   input.global = {
     touchpad: {
-      tapToClick: true,
-      naturalScroll: true,
-      scrollMethod: "twoFinger",
-      disableWhileTyping: true,
-      scrollFactor: 0.3,
+      tapToClick: inputSettings.touchpad.tapToClick,
+      naturalScroll: inputSettings.touchpad.naturalScroll,
+      scrollMethod: inputSettings.touchpad.scrollMethod as InputScrollMethod,
+      disableWhileTyping: inputSettings.touchpad.disableWhileTyping,
+      scrollFactor: inputSettings.touchpad.scrollFactor,
+      pointerAccel: inputSettings.pointerAccel,
+      accelProfile: inputSettings.accelProfile as InputAccelProfile,
     },
     pointer: {
-      pointerAccel: 0.0,
-      accelProfile: "flat",
+      pointerAccel: inputSettings.pointerAccel,
+      accelProfile: inputSettings.accelProfile as InputAccelProfile,
+      naturalScroll: inputSettings.naturalScroll,
     },
     keyboard: {
+      layout: inputSettings.keyboard?.layout || "us",
+      ...(inputSettings.keyboard?.variant
+        ? { variant: inputSettings.keyboard.variant }
+        : {}),
       options: "caps:ctrl_modifier",
       repeatRate: 60,
       repeatDelay: 250,
@@ -608,8 +1056,17 @@ COMPOSITOR.rendering.surfacePolicy = (surface) => {
   return null;
 };
 
+// The dock displays live window titles, so a title change must refresh the
+// IPC view. The broadcast is JSON-diffed and coalesced per tick, so noisy
+// title churn (terminals) only goes out when the string actually changed.
+const titleSubscriptions = new Map<string, () => void>();
+
 COMPOSITOR.event.onOpen((window) => {
   HYBRID_WINDOW_MANAGER.onOpen(window);
+  titleSubscriptions.set(
+    window.id,
+    window.title.subscribe(() => scheduleWorkspaceBroadcast()),
+  );
 });
 
 COMPOSITOR.event.onFirstCommit((window) => {
@@ -624,6 +1081,8 @@ COMPOSITOR.event.onStartClose((window) => {
 
 COMPOSITOR.event.onClose((window) => {
   HYBRID_WINDOW_MANAGER.onClose(window);
+  titleSubscriptions.get(window.id)?.();
+  titleSubscriptions.delete(window.id);
   scheduleWorkspaceBroadcast();
 });
 
@@ -631,11 +1090,21 @@ COMPOSITOR.event.onFocus((window, focused) => {
   HYBRID_WINDOW_MANAGER.onFocus(window, focused);
   if (focused) {
     HYBRID_WINDOW_MANAGER.recordFocus(window.id);
-    scheduleWorkspaceBroadcast();
   }
+  // Broadcast on loss of focus too: when the unfocus event lands in a later
+  // tick than the gain, a gain-only broadcast snapshots BOTH windows as
+  // focused and nothing ever corrects it — the dock/bar keep highlighting
+  // the previously focused window (Sophie's "selection border persists").
+  scheduleWorkspaceBroadcast();
 });
 
+// Global pointer position for the drag tabs: each tab centres on the mouse
+// along its edge. Only compositions with a hovered edge depend on this
+// signal, so idle windows do no work per pointer motion.
+const [pointerPosition, setPointerPosition] = signal({ x: 0, y: 0 });
+
 COMPOSITOR.event.onPointerMoveAsync((event) => {
+  setPointerPosition({ x: event.position.x, y: event.position.y });
   HYBRID_WINDOW_MANAGER.onPointerMove(event);
 
   // Dock proximity: update only the monitor the pointer is currently on,
@@ -678,6 +1147,7 @@ COMPOSITOR.event.onDestroyLayer(() => {
 
 COMPOSITOR.event.onWindowResize((event) => {
   HYBRID_WINDOW_MANAGER.onWindowResize(event);
+  scheduleRectsBroadcast();
 });
 
 COMPOSITOR.pointer.bindWindowMoveModifier("Super");
@@ -685,14 +1155,25 @@ COMPOSITOR.pointer.bindWindowResizeModifier("Super");
 
 COMPOSITOR.event.onWindowMove((event) => {
   HYBRID_WINDOW_MANAGER.onWindowMove(event);
+  scheduleRectsBroadcast();
+  // A drag can hand the window to another monitor's workspace (adoption in
+  // onWindowMove); without a broadcast the dock keeps listing it on the old
+  // output until some unrelated event refreshes the view.
+  if (event.phase === "end" || event.phase === "cancel") {
+    scheduleWorkspaceBroadcast();
+  }
 });
 
 COMPOSITOR.event.onWindowMaximizeRequest((event) => {
   HYBRID_WINDOW_MANAGER.onWindowMaximizeRequest(event);
+  // The workspaces view carries maximized/minimized per window (the bar's
+  // window controls render from it), so state changes must broadcast.
+  scheduleWorkspaceBroadcast();
 });
 
 COMPOSITOR.event.onWindowMinimizeRequest((event) => {
   HYBRID_WINDOW_MANAGER.onWindowMinimizeRequest(event);
+  scheduleWorkspaceBroadcast();
 });
 
 COMPOSITOR.event.onWindowFullscreenRequest((event) => {
@@ -704,13 +1185,22 @@ COMPOSITOR.event.onWindowActivateRequest((event) => {
   scheduleWorkspaceBroadcast();
 });
 
+// Window corner rounding; the drag tabs clamp their travel to the flat part
+// of each edge (between the corner arcs).
+const WINDOW_CORNER_RADIUS = 10;
+
 function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
   const client = window.position;
+  const chrome = EDGE_DRAG_HALO_PX + WINDOW_BORDER_PX;
   return {
-    x: client.x - WINDOW_BORDER_PX,
-    y: client.y - TITLEBAR_HEIGHT - WINDOW_BORDER_PX,
-    width: client.width + WINDOW_BORDER_PX * 2,
-    height: client.height + TITLEBAR_HEIGHT + WINDOW_BORDER_PX * 2,
+    x: client.x - 
+        chrome,
+    y: client.y - 
+        chrome,
+    width: client.width + 
+        chrome * 2,
+    height: client.height + 
+        chrome * 2,
   };
 }
 
@@ -739,23 +1229,10 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     () => minimizeVisualIdle() || (!workspaceVisible() && !tileDragging()),
   );
 
+  // Eternal Darkness red (Theme.red / Theme.redDim until shared theme.json).
   const borderColor = window.isFocused((focused) =>
-    focused ? "#d7ba7d" : "#4f5666",
+    focused ? "#e0263c" : "#8f1e2d",
   );
-  const titlebarBackground = window.isFocused((focused) =>
-    focused ? "#1f243080" : "#2a2f3a80",
-  );
-  const titleColor = window.isFocused((focused) =>
-    focused ? "#f5f7fa" : "#c9d1d9",
-  );
-
-  const titlebarStyle: SSDStyle = {
-    height: TITLEBAR_HEIGHT,
-    paddingX: 8,
-    gap: 8,
-    alignItems: "center",
-    background: titlebarBackground,
-  };
 
   const backgroundShader = compileEffect({
     input: backdropSource(),
@@ -775,63 +1252,14 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     ],
   });
 
-  const titleOnlyShader = compileEffect({
-    input: backdropSource(),
-    capturePadding: 24,
-    invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
-    pipeline: [dualKawaseBlur({ radius: 4, passes: 2 })],
-  });
 
-  const appIcon = (
-    <AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />
-  );
-  const label = (
-    <Label
-      text={window.title}
-      style={{
-        color: titleColor,
-        fontFamily: ["Noto Sans CJK JP", "Noto Color Emoji"],
-        fontSize: 13,
-        fontWeight: 600,
-        flexGrow: 1,
-        flexShrink: 1,
-        minWidth: 0,
-      }}
-    />
-  );
-  const minimizeButton = <MinimizeButton window={window} />;
-  const maximizeButton = <MaximizeButton window={window} />;
-  const closeButton = <CloseButton window={window} />;
-
-  var innerComponents = (
-    <Box direction="column">
-      <ShaderEffect
-        shader={titleOnlyShader}
-        direction="row"
-        style={titlebarStyle}
-      >
-        {appIcon}
-        {label}
-        {minimizeButton}
-        {maximizeButton}
-        {closeButton}
-      </ShaderEffect>
-      <ClientWindow />
-    </Box>
-  );
+  let innerComponents = <ClientWindow />;
 
   const TERMINALS = ["kitty", "ghostty"];
 
   if (TERMINALS.includes(window.appId() ?? "")) {
     innerComponents = (
       <ShaderEffect shader={backgroundShader} direction="column">
-        <Box direction="row" style={titlebarStyle}>
-          {appIcon}
-          {label}
-          {minimizeButton}
-          {maximizeButton}
-          {closeButton}
-        </Box>
         <ClientWindow />
       </ShaderEffect>
     );
@@ -881,6 +1309,140 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     );
   }
 
+  // Maximized: no chrome at all
+    // — edge to edge in the usable area
+  // (maximizedRectForWindow applies no inset to match).
+    // Without the halo a maximized window is not pointer-draggable; unmaximize re-centres it, so
+  // it can never get stuck. Floating windows below keep the full chrome.
+  if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+    return (
+      <ManagedWindow
+        rect={managedRect}
+        zIndex={HYBRID_WINDOW_MANAGER.getWindowZIndex(window)}
+        visibleOutputs={window.state[WINDOW_STATE_VISIBLE_OUTPUTS]}
+        opacity={workspaceOpacity}
+        forceRectSize={forceRectSize}
+        tiled={tiled}
+        idle={inactive}
+        interactive={inactive((value) => !value)}
+      >
+        <Box direction="row">{innerComponents}</Box>
+      </ManagedWindow>
+    );
+  }
+
+  // The transparent halo ring around the window is decoration chrome: the SSD
+  // hit-test resolves clicks there to Move (outer resizeHitArea band wins for
+  // resize), so the whole ring drags the window. Hovering it reveals a tab at
+  // that edge as the visible affordance; the tab itself is plain chrome, so
+  // grabbing it drags too. Chrome can't render above the client surface,
+  // which is why the tab lives outside the window instead of overlapping it.
+  const [hoveredEdge, setHoveredEdge] = useState<
+    "top" | "bottom" | "left" | "right" | null
+  >(null);
+  const dragEdgeHover =
+    (edge: "top" | "bottom" | "left" | "right") => (inside: boolean) => {
+      if (inside) {
+        setHoveredEdge(edge);
+      } else if (read(hoveredEdge) === edge) {
+        setHoveredEdge(null);
+      }
+    };
+  // Trapezium drag tabs (SVG assets, red stipple + border) attached to the
+  // window border, centred on the pointer along the hovered edge. The
+  // position computeds read pointerPosition only while their edge is
+  // hovered, so idle windows never re-evaluate on mouse motion.
+  const DRAG_TAB_LENGTH = 72;
+  const DRAG_TAB_THICKNESS = 12;
+  // Travel limit: the tab slides along the flat part of the edge and pins at
+  // the corner arcs. While pinned it stays visible (visibility follows the
+  // hover strip, not the pointer-tab overlap) and stays draggable (the whole
+  // halo is move chrome).
+  const dragTabMin = EDGE_DRAG_HALO_PX + WINDOW_CORNER_RADIUS;
+  const dragTabX = computed(() => {
+    const edge = hoveredEdge();
+    if (edge !== "top" && edge !== "bottom") {
+      return 0;
+    }
+    const rect = managedRect();
+    const max = Math.max(
+      dragTabMin,
+      read(rect.width) - 
+        dragTabMin - 
+        DRAG_TAB_LENGTH,
+    );
+    const centred = Math.round(
+      pointerPosition.value.x - read(rect.x) - 
+        DRAG_TAB_LENGTH 
+        / 2,
+    );
+    return Math.min(max, Math.max(
+        dragTabMin, 
+        centred,
+        ));
+  });
+  const dragTabY = computed(() => {
+    const edge = hoveredEdge();
+    if (edge !== "left" && edge !== "right") {
+      return 0;
+    }
+    const rect = managedRect();
+    const max = Math.max(
+      dragTabMin,
+      read(rect.height) - 
+        dragTabMin -
+        DRAG_TAB_LENGTH,
+    );
+    const centred = Math.round(
+      pointerPosition.value.y - read(rect.y) - DRAG_TAB_LENGTH / 2,
+    );
+    return Math.min(max, Math.max(
+        dragTabMin,
+        centred,
+        ));
+  });
+
+  // Published to the workspace IPC view (see attachDragTabs): the tab's
+  // layout-space rect while an edge is hovered, null otherwise. Lazy — only
+  // evaluated when a view is built.
+  DRAG_TAB_RECTS.set(window.id, () => {
+    const edge = read(hoveredEdge);
+    if (!edge) {
+      return null;
+    }
+    const rect = managedRect();
+    switch (edge) {
+      case "top":
+        return {
+          x: rect.x + dragTabX(),
+          y: rect.y + EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+          width: DRAG_TAB_LENGTH,
+          height: DRAG_TAB_THICKNESS,
+        };
+      case "bottom":
+        return {
+          x: rect.x + dragTabX(),
+          y: rect.y + rect.height - EDGE_DRAG_HALO_PX,
+          width: DRAG_TAB_LENGTH,
+          height: DRAG_TAB_THICKNESS,
+        };
+      case "left":
+        return {
+          x: rect.x + EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+          y: rect.y + dragTabY(),
+          width: DRAG_TAB_THICKNESS,
+          height: DRAG_TAB_LENGTH,
+        };
+      case "right":
+        return {
+          x: rect.x + rect.width - EDGE_DRAG_HALO_PX,
+          y: rect.y + dragTabY(),
+          width: DRAG_TAB_THICKNESS,
+          height: DRAG_TAB_LENGTH,
+        };
+    }
+  });
+
   return (
     <ManagedWindow
       rect={managedRect}
@@ -892,162 +1454,115 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
       idle={inactive}
       interactive={inactive((value) => !value)}
     >
-      <WindowBorder
-        style={{
-          border: { px: WINDOW_BORDER_PX, color: borderColor },
-          borderRadius: 10,
-          background: "#10131900",
-          padding: 0,
-          paddingX: 0,
-          paddingRight: 0,
-        }}
-        interaction={{
-          resizeHitArea: {
-            edgePx: 8,
-            cornerPx: 14,
-          },
-        }}
-      >
-        <Box direction="row">{innerComponents}</Box>
-      </WindowBorder>
+      {/* No `position` here: the halo box must NOT establish a containing
+          block, so its absolute children (strips + tabs) anchor to the
+          decoration root's full rect — the halo's outer edge — instead of
+          the padding-inset content box at the window border. */}
+      <Box style={{ padding: EDGE_DRAG_HALO_PX }}>
+        <WindowBorder
+          style={{
+            border: { px: WINDOW_BORDER_PX, color: borderColor },
+            borderRadius: WINDOW_CORNER_RADIUS,
+            background: "#10131900",
+            padding: 0,
+            paddingX: 0,
+            paddingRight: 0,
+          }}
+          interaction={{
+            resizeHitArea: {
+              edgePx: 8,
+              cornerPx: 14,
+            },
+          }}
+        >
+          <Box direction="row">{innerComponents}</Box>
+        </WindowBorder>
+        <Box
+          onHoverChange={dragEdgeHover("top")}
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            right: 0,
+            height: EDGE_DRAG_HALO_PX,
+          }}
+        />
+        <Box
+          onHoverChange={dragEdgeHover("bottom")}
+          style={{
+            position: "absolute",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            height: EDGE_DRAG_HALO_PX,
+          }}
+        />
+        <Box
+          onHoverChange={dragEdgeHover("left")}
+          style={{
+            position: "absolute",
+            left: 0,
+            top: EDGE_DRAG_HALO_PX,
+            bottom: EDGE_DRAG_HALO_PX,
+            width: EDGE_DRAG_HALO_PX,
+          }}
+        />
+        <Box
+          onHoverChange={dragEdgeHover("right")}
+          style={{
+            position: "absolute",
+            right: 0,
+            top: EDGE_DRAG_HALO_PX,
+            bottom: EDGE_DRAG_HALO_PX,
+            width: EDGE_DRAG_HALO_PX,
+          }}
+        />
+        <Image
+          src="./assets/drag-tab-top.svg"
+          style={{
+            position: "absolute",
+            top: EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+            left: dragTabX,
+            width: DRAG_TAB_LENGTH,
+            height: DRAG_TAB_THICKNESS,
+            visible: hoveredEdge((edge) => edge === "top"),
+          }}
+        />
+        <Image
+          src="./assets/drag-tab-bottom.svg"
+          style={{
+            position: "absolute",
+            bottom: EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+            left: dragTabX,
+            width: DRAG_TAB_LENGTH,
+            height: DRAG_TAB_THICKNESS,
+            visible: hoveredEdge((edge) => edge === "bottom"),
+          }}
+        />
+        <Image
+          src="./assets/drag-tab-left.svg"
+          style={{
+            position: "absolute",
+            left: EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+            top: dragTabY,
+            width: DRAG_TAB_THICKNESS,
+            height: DRAG_TAB_LENGTH,
+            visible: hoveredEdge((edge) => edge === "left"),
+          }}
+        />
+        <Image
+          src="./assets/drag-tab-right.svg"
+          style={{
+            position: "absolute",
+            right: EDGE_DRAG_HALO_PX - DRAG_TAB_THICKNESS,
+            top: dragTabY,
+            width: DRAG_TAB_THICKNESS,
+            height: DRAG_TAB_LENGTH,
+            visible: hoveredEdge((edge) => edge === "right"),
+          }}
+        />
+      </Box>
     </ManagedWindow>
-  );
-};
-
-const CloseButton = ({ window }: { window: WaylandWindow }) => {
-  const [hover, setHover] = useState(false);
-
-  const borderColor = hover((hover) => (hover ? "#00000000" : "#F0808030"));
-
-  var icon: CompositionRenderable | null = null;
-  if (hover()) {
-    icon = (
-      <Image
-        src="./assets/x.svg"
-        style={{
-          width: 16,
-          height: 16,
-          position: "absolute",
-          zIndex: 1,
-          pointerEvents: "none",
-        }}
-      />
-    );
-  }
-
-  return (
-    <Box style={{ position: "relative", flexShrink: 0 }}>
-      <Button
-        onHoverChange={setHover}
-        style={{
-          width: 16,
-          height: 16,
-          borderRadius: 8,
-          background: "#FFFFFF20",
-          border: { px: 1, color: borderColor },
-        }}
-        onClick={window.close}
-      />
-      {icon}
-    </Box>
-  );
-};
-
-const MaximizeButton = ({ window }: { window: WaylandWindow }) => {
-  const [hover, setHover] = useState(false);
-
-  const borderColor = computed(() => {
-    if (!window.isResizable()) {
-      return "#00000000";
-    }
-    return hover() ? "#00000000" : "#00BFFF30";
-  });
-  const shouldHover = computed(() => hover() && window.isResizable());
-
-  var icon: CompositionRenderable | null = null;
-  if (shouldHover()) {
-    const src = window.isMaximized((maximized) => {
-      return maximized ? "./assets/minimize-2.svg" : "./assets/maximize-2.svg";
-    });
-
-    icon = (
-      <Image
-        src={src}
-        style={{
-          width: 16,
-          height: 16,
-          position: "absolute",
-          zIndex: 1,
-          pointerEvents: "none",
-        }}
-      />
-    );
-  }
-
-  return (
-    <Box style={{ position: "relative", flexShrink: 0 }}>
-      <Button
-        onHoverChange={setHover}
-        style={{
-          width: 16,
-          height: 16,
-          borderRadius: 8,
-          background: "#FFFFFF20",
-          border: { px: 1, color: borderColor },
-        }}
-        onClick={() => {
-          if (!read(window.isResizable)) {
-            return;
-          }
-
-          if (read(window.isMaximized)) {
-            window.unmaximize();
-          } else {
-            window.maximize();
-          }
-        }}
-      />
-      {icon}
-    </Box>
-  );
-};
-
-const MinimizeButton = ({ window }: { window: WaylandWindow }) => {
-  const [hover, setHover] = useState(false);
-
-  const borderColor = hover((hover) => (hover ? "#00000000" : "#F8FF7530"));
-
-  var icon: CompositionRenderable | null = null;
-  if (hover()) {
-    icon = (
-      <Image
-        src="./assets/minus.svg"
-        style={{
-          width: 16,
-          height: 16,
-          position: "absolute",
-          zIndex: 1,
-          pointerEvents: "none",
-        }}
-      />
-    );
-  }
-
-  return (
-    <Box style={{ position: "relative", flexShrink: 0 }}>
-      <Button
-        onHoverChange={setHover}
-        style={{
-          width: 16,
-          height: 16,
-          borderRadius: 8,
-          background: "#FFFFFF20",
-          border: { px: 1, color: borderColor },
-        }}
-        onClick={() => window.minimize()}
-      />
-      {icon}
-    </Box>
   );
 };
 

@@ -233,8 +233,41 @@ export interface WorkspacesViewWindow {
   appId?: string;
   title: string;
   focused: boolean;
+  maximized: boolean;
+  minimized: boolean;
+  fullscreen: boolean;
   /** epoch ms — most recent focus time for MRU ordering. 0 if never focused. */
   lastFocusedAt: number;
+  /**
+   * Client-declared semantic identity ("typed segment" in the Arcan/SHMIF
+   * sense, e.g. "minkamon.disk"), claimed via the windows.identify IPC
+   * method. Lets consumers match windows by what they are instead of what
+   * their title string happens to say. null while unclaimed.
+   */
+  role?: string | null;
+  /**
+   * Layout-space frame rect, sampled at view-build time (animated rects
+   * report their current position). Added for MinkaMon's leader-line
+   * overlay, which cannot learn its own window positions from Wayland.
+   */
+  rect: {
+      x: number;
+      y: number;
+      width: number;
+      height: number
+  };
+  /**
+   * Hover-revealed drag tab currently shown for this window (layout
+   * coords). Attached by the decoration layer in index.tsx at IPC view
+   * build time; null when no tab is up. MinkaMon's leader lines clip
+   * beneath it.
+   */
+  dragTab?: {
+      x: number;
+      y: number;
+      width: number;
+      height: number 
+  } | null;
 }
 
 export interface WorkspacesViewWorkspace {
@@ -344,8 +377,13 @@ const WORKSPACE_VISUAL_ANIMATION_CHANNEL = "workspace.visual";
 const WORKSPACE_VISUAL_RECT_ANIMATION_CHANNEL = `${WORKSPACE_VISUAL_ANIMATION_CHANNEL}.rect`;
 const WORKSPACE_VISUAL_OPACITY_ANIMATION_CHANNEL = `${WORKSPACE_VISUAL_ANIMATION_CHANNEL}.opacity`;
 export const WINDOW_BORDER_PX = 2;
-export const TITLEBAR_HEIGHT = 30;
-export const MAXIMIZED_WINDOW_PADDING = {
+// Transparent chrome ring around each non-maximized window. It is the drag
+// surface (decoration chrome hit-tests as Move) and hosts the hover-revealed
+// drag tab; there is no titlebar.
+export const EDGE_DRAG_HALO_PX = 14;
+// Outer margin around the snap layout (halves/quarters). Maximized windows
+// deliberately get none — they fill the usable area edge to edge.
+export const SNAP_BASE_PADDING = {
   top: 8,
   right: 8,
   bottom: 8,
@@ -360,6 +398,9 @@ export class HybridWindowManager {
   // Tracks MRU focus time per window id so the dock can pick "the most recent
   // window of an app" deterministically. Updated by recordFocus().
   private readonly lastFocusedAt = new Map<string, number>();
+  // windowId -> client-declared role; same lifecycle as lastFocusedAt (no
+  // pruning on close — ids are not reused within a session).
+  private readonly windowRoles = new Map<string, string>();
   private readonly pendingInitialFocusByWindowId = new Map<string, number>();
   private currentMonitor: string;
   private isGrabbing = false;
@@ -651,6 +692,8 @@ export class HybridWindowManager {
       );
       window.state[WINDOW_STATE_RECT].set(this.maximizedRectForWindow(window));
       window.state[WINDOW_STATE_MAXIMIZED].set(true);
+    } else {
+      this.clampInitialFloatingRect(window, workspace);
     }
     if (!restoredExistingWindow) {
       scheduleOpenAnimation(window);
@@ -664,6 +707,62 @@ export class HybridWindowManager {
       restoredExistingWindow,
       scheduledOpenAnimation: !restoredExistingWindow,
     });
+  }
+
+  /**
+   * Panels are a forbidden zone for new floating windows. Clients that get
+   * no size guidance (we configure 0x0 and bounds 0x0) may size themselves
+   * to the full output — Rio does — which legally overlaps the bar since
+   * floating windows are unconstrained. Clamp the initial rect into the
+   * usable area; no-ops for windows that already fit.
+   */
+  private clampInitialFloatingRect(
+    window: WaylandWindow,
+    workspace: Workspace | undefined,
+  ) {
+    if (workspace?.isTiled && workspace.shouldTile(window)) {
+      return;
+    }
+    if (window.state[WINDOW_STATE_FULLSCREEN]()) {
+      return;
+    }
+    const rect = window.state[WINDOW_STATE_RECT]();
+    const x = read(rect.x);
+    const y = read(rect.y);
+    const width = read(rect.width);
+    const height = read(rect.height);
+    if (width <= 1 || height <= 1) {
+      return;
+    }
+    const monitor =
+      this.outputNameAt(x + width / 2, y + height / 2) ?? this.currentMonitor;
+    const usable = monitor ? COMPOSITOR.layer.usableArea(monitor) : null;
+    if (!usable) {
+      return;
+    }
+    const clampedWidth = Math.min(width, usable.width);
+    const clampedHeight = Math.min(height, usable.height);
+    const clampedX = Math.min(
+      Math.max(x, usable.x),
+      usable.x + usable.width - clampedWidth,
+    );
+    const clampedY = Math.min(
+      Math.max(y, usable.y),
+      usable.y + usable.height - clampedHeight,
+    );
+    if (
+      clampedWidth !== width ||
+      clampedHeight !== height ||
+      clampedX !== x ||
+      clampedY !== y
+    ) {
+      window.state[WINDOW_STATE_RECT].set({
+        x: clampedX,
+        y: clampedY,
+        width: clampedWidth,
+        height: clampedHeight,
+      });
+    }
   }
 
   public onStartClose(window: WaylandWindow) {
@@ -1029,8 +1128,23 @@ export class HybridWindowManager {
     }
 
     if (!event.maximized) {
-      const restoreRect = window.state[WINDOW_STATE_RESTORE_RECT]();
-      if (restoreRect) {
+      // Unmaximize always lands centred at half the screen's dimensions
+      // rather than restoring the pre-maximize rect: a remembered rect can
+      // put the titlebar out of reach (display changes, panel moves), and a
+      // deterministic centred rect means the titlebar is always recoverable.
+      // The stored restore rect is only a signal now — the snap and
+      // interactive-drag paths clear it first to request a silent
+      // unmaximize because they place the window themselves.
+      if (
+          window
+              .state[
+                  WINDOW_STATE_RESTORE_RECT
+              ]()
+      ) {
+        const restoreRect = this
+            .centeredHalfRectForWindow(
+                window,
+            );
         workspace?.syncFloatingWindowRect(window, restoreRect);
         playRectAnimation(
           window,
@@ -1221,6 +1335,53 @@ export class HybridWindowManager {
     }
   }
 
+  /**
+   * Alt+Tab: cycle focus through the current workspace's windows in stack
+   * order. Fixed order (not MRU) so repeated presses reach every window
+   * without a hold-to-cycle switcher UI (that's an M4 nicety).
+   */
+  public cycleWorkspaceFocus(direction: 1 | -1) {
+    const workspace = this.getCurrentWorkspace();
+    if (!workspace) {
+      return;
+    }
+    const windows = workspace
+      .listWindows()
+      .filter((window) => !window.state[WINDOW_STATE_MINIMIZED]());
+    if (windows.length === 0) {
+      return;
+    }
+    const focused = workspace.focusedWindow();
+    const index = focused
+      ? windows.findIndex((window) => window.id === focused.id)
+      : -1;
+    const next =
+      windows[(index + direction + windows.length) % windows.length];
+    if (!next) {
+      return;
+    }
+    if (workspace.isTiled && workspace.shouldTile(next)) {
+      workspace.focusWindow(next);
+    } else {
+      this.windowStack.raise(next);
+    }
+    next.focus();
+  }
+
+  public closeWindowById(
+      windowId: string,
+  ): boolean {
+    const window = this.findWindowById(windowId);
+    if (
+        !window
+    ) {
+      return false;
+    }
+    window
+        .close();
+    return true;
+  }
+
   public toggleFocusedWindowMaximize() {
     for (const workspace of this.workspaces.values()) {
       const focused = workspace.focusedWindow();
@@ -1354,13 +1515,26 @@ export class HybridWindowManager {
       const list = byMonitor.get(workspace.monitor) ?? [];
       const windows: WorkspacesViewWindow[] = workspace
         .listWindows()
-        .map((window) => ({
-          id: window.id,
-          appId: window.appId(),
-          title: window.title(),
-          focused: window.isFocused(),
-          lastFocusedAt: this.lastFocusedAt.get(window.id) ?? 0,
-        }));
+        .map((window) => {
+          const rect = window.state[WINDOW_STATE_RECT]();
+          return {
+            id: window.id,
+            appId: window.appId(),
+            title: window.title(),
+            focused: window.isFocused(),
+            maximized: window.state[WINDOW_STATE_MAXIMIZED](),
+            minimized: window.state[WINDOW_STATE_MINIMIZED](),
+            fullscreen: window.state[WINDOW_STATE_FULLSCREEN](),
+            lastFocusedAt: this.lastFocusedAt.get(window.id) ?? 0,
+            role: this.windowRoles.get(window.id) ?? null,
+            rect: {
+              x: read(rect.x),
+              y: read(rect.y),
+              width: read(rect.width),
+              height: read(rect.height),
+            },
+          };
+        });
       list.push({
         index: workspace.index,
         windowCount: workspace.windowCount(),
@@ -1403,6 +1577,19 @@ export class HybridWindowManager {
    */
   public recordFocus(windowId: string) {
     this.lastFocusedAt.set(windowId, Date.now());
+  }
+
+  /**
+   * Attach a client-declared semantic role to a window (the Arcan/SHMIF
+   * "typed segment" idea): consumers then match on role rather than title
+   * strings. Empty/null role revokes the claim.
+   */
+  public setWindowRole(windowId: string, role: string | null) {
+    if (role === null || role === "") {
+      this.windowRoles.delete(windowId);
+    } else {
+      this.windowRoles.set(windowId, role);
+    }
   }
 
   private trackPendingInitialFocus(window: WaylandWindow) {
@@ -1449,6 +1636,34 @@ export class HybridWindowManager {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Externally-driven move/resize (IPC `windows.setRect`, used by
+   * MinkaMon's full-overview arrangement): places a floating window at an
+   * exact layout-space rect. Tiled windows are left to the tiler;
+   * maximized windows are restored first so the rect sticks.
+   */
+  public setWindowRectById(
+    windowId: string,
+    rect: ManagedWindowRect,
+  ): boolean {
+    const window = this.findWindowById(windowId);
+    if (!window) {
+      return false;
+    }
+    const workspace = this.findWorkspaceForWindow(window);
+    if (workspace?.isTiled && workspace.shouldTile(window)) {
+      return false;
+    }
+    if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+      window.unmaximize();
+    }
+    stopRectAnimation(window, WINDOW_STATE_RECT);
+    window.state[WINDOW_STATE_RECT].set(rect);
+    workspace?.syncFloatingWindowRect(window, rect);
+    this.applyWorkspaceStackPolicy(workspace);
+    return true;
   }
 
   /** Every managed window across all workspaces (debug/IPC use). */
@@ -2113,6 +2328,23 @@ export class HybridWindowManager {
     };
   }
 
+  /** Half the screen's dimensions, centred in the usable area. */
+  private centeredHalfRectForWindow(window: WaylandWindow): ManagedWindowRect {
+    const full = this.maximizedRectForWindow(window);
+    const fullX = read(full.x);
+    const fullY = read(full.y);
+    const fullWidth = read(full.width);
+    const fullHeight = read(full.height);
+    const width = Math.round(fullWidth / 2);
+    const height = Math.round(fullHeight / 2);
+    return {
+      x: fullX + Math.round((fullWidth - width) / 2),
+      y: fullY + Math.round((fullHeight - height) / 2),
+      width,
+      height,
+    };
+  }
+
   private maximizedRectForWindow(
     window: WaylandWindow,
     preferredOutput?: string,
@@ -2131,27 +2363,23 @@ export class HybridWindowManager {
       ? COMPOSITOR.layer.usableArea(outputName)
       : undefined;
 
+    // Maximized fills the usable area edge to edge — no padding; the
+    // composition also drops the border and rounded corners for this state.
     if (usable) {
-      return insetRect(
-        {
-          x: usable.x,
-          y: usable.y,
-          width: usable.width,
-          height: usable.height,
-        },
-        MAXIMIZED_WINDOW_PADDING,
-      );
+      return {
+        x: usable.x,
+        y: usable.y,
+        width: usable.width,
+        height: usable.height,
+      };
     }
     if (output?.resolution) {
-      return insetRect(
-        {
-          x: output.position.x,
-          y: output.position.y,
-          width: output.resolution.width / output.scale,
-          height: output.resolution.height / output.scale,
-        },
-        MAXIMIZED_WINDOW_PADDING,
-      );
+      return {
+        x: output.position.x,
+        y: output.position.y,
+        width: output.resolution.width / output.scale,
+        height: output.resolution.height / output.scale,
+      };
     }
     return rect;
   }
@@ -2265,11 +2493,11 @@ export class HybridWindowManager {
     height: number,
   ): ManagedWindowRect {
     const pointer = event.currentPointer;
-    const titlebarCenterY = WINDOW_BORDER_PX + TITLEBAR_HEIGHT / 2;
+    const dragChromeCenterY = WINDOW_BORDER_PX + EDGE_DRAG_HALO_PX / 2;
     const pointerOffsetY =
       event.source === "modifier"
         ? height / 2
-        : Math.min(height / 2, titlebarCenterY);
+        : Math.min(height / 2, dragChromeCenterY);
 
     return {
       x: pointer.x - width / 2,
@@ -2329,7 +2557,7 @@ export class HybridWindowManager {
     };
   }
 
-  /** Usable area inset by the maximized padding — the base for all snap rects. */
+  /** Usable area inset by the snap margin — the base for all snap rects. */
   private monitorSnapBaseRect(monitor: string): ManagedWindowRect | null {
     const usable =
       COMPOSITOR.layer.usableArea(monitor) ??
@@ -2337,7 +2565,7 @@ export class HybridWindowManager {
     if (!usable) {
       return null;
     }
-    return insetRect(usable, MAXIMIZED_WINDOW_PADDING);
+    return insetRect(usable, SNAP_BASE_PADDING);
   }
 
   /** Resolve the snap zone for a pointer near the physical screen edges. */
