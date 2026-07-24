@@ -708,6 +708,38 @@ COMPOSITOR.key.bind("prev", "XF86AudioPrev", () => {
   COMPOSITOR.process.spawn({ command: "playerctl previous" });
 });
 
+// Backlight (Fn+F4 / Fn+F5 emit the XF86MonBrightness* keysyms).
+//
+// The Duo has two panels with independent backlights, so the keys act on
+// whichever one currently holds focus: eDP-1 is the 1920x1080 main panel,
+// while the ScreenPad Plus enumerates as an internal DisplayPort output
+// (DP-1, 1920x515) rather than a second eDP. Anything else — an external
+// monitor, which has no sysfs backlight anyway — falls back to the main
+// panel so the keys always do something predictable.
+//
+// brightnessctl writes through logind's D-Bus session interface, so no setuid
+// binary or udev rule is needed. `-n 1` keeps a floor of one step: with no
+// OSD yet, a fully black panel is indistinguishable from a crash.
+const BACKLIGHT_BY_CONNECTOR: Record<string, string> = {
+  "eDP-1": "intel_backlight",
+  "DP-1": "asus_screenpad",
+};
+
+function adjustBrightness(delta: string) {
+  const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
+  const device = BACKLIGHT_BY_CONNECTOR[monitor] ?? "intel_backlight";
+  COMPOSITOR.process.spawn({
+    command: `brightnessctl -d ${device} -n 1 set ${delta}`,
+  });
+}
+
+COMPOSITOR.key.bind("brightness-up", "XF86MonBrightnessUp", () => {
+  adjustBrightness("5%+");
+});
+COMPOSITOR.key.bind("brightness-down", "XF86MonBrightnessDown", () => {
+  adjustBrightness("5%-");
+});
+
 // Resolve the monitor under the cursor and toggle the start menu.
 // MinkaShell listens for the ui.startMenu broadcast on the IPC socket.
 function toggleStartMenu() {
