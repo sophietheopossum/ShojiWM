@@ -711,8 +711,11 @@ COMPOSITOR.key.bind("prev", "XF86AudioPrev", () => {
 // panel so the keys always do something predictable.
 //
 // brightnessctl writes through logind's D-Bus session interface, so no setuid
-// binary or udev rule is needed. `-n 1` keeps a floor of one step: with no
-// OSD yet, a fully black panel is indistinguishable from a crash.
+// binary or udev rule is needed. `-n` keeps a floor of one step: with no OSD
+// yet, a fully black panel is indistinguishable from a crash.
+// Its value must stay unwritten — the flag takes an *optional* argument, so a spaced `-n 1`
+// leaves the 1 as a positional, which brightnessctl reads as an unknown
+// operation and quietly downgrades the whole run to `info` (exit 0, no write).
 const BACKLIGHT_BY_CONNECTOR: Record<string, string> = {
   "eDP-1": "intel_backlight",
   "DP-1": "asus_screenpad",
@@ -722,7 +725,7 @@ function adjustBrightness(delta: string) {
   const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
   const device = BACKLIGHT_BY_CONNECTOR[monitor] ?? "intel_backlight";
   COMPOSITOR.process.spawn({
-    command: `brightnessctl -d ${device} -n 1 set ${delta}`,
+    command: `brightnessctl -d ${device} -n set ${delta}`,
   });
 }
 
