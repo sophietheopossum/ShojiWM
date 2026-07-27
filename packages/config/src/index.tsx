@@ -19,6 +19,7 @@ import {
   layerSource,
   ManagedWindow,
   read,
+  readTextFile,
   type DisplayConfigDraft,
   compilePopupEffect,
   popupSource,
@@ -32,7 +33,6 @@ import {
     createIpcServer, 
     wakeRust
 } from "shoji_wm/ipc";
-import { readFileSync } from "node:fs";
 
 // Full per-display schema MinkaConf's visual page writes.
 interface MinkaDisplaySettings {
@@ -106,7 +106,7 @@ const MINKA_SETTINGS_DEFAULTS: MinkaSettings = {
 
 function loadMinkaSettings(): MinkaSettings {
   try {
-    return JSON.parse(readFileSync(MINKA_SETTINGS_PATH, "utf8")) as MinkaSettings;
+    return JSON.parse(readTextFile(MINKA_SETTINGS_PATH)) as MinkaSettings;
   } catch (error) {
     console.warn(
       `minka-settings: using defaults (cannot read ${MINKA_SETTINGS_PATH}: ${error})`,
