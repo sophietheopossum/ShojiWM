@@ -896,18 +896,16 @@ COMPOSITOR.output.configure((context) => {
   );
   const positioned: { x: number; y: number }[] = [];
   for (const [name, entry] of Object.entries(display)) {
-    if (
-      entry.mode === "extend" &&
-      typeof entry.position === "object" &&
-      connectedNames
-          .has(
-              name
-          )
-    ) {
+    // `DisplayConfigDraft` values are nullable, and only the extend variant
+    // carries a position at all — narrow both before reading it.
+    if (entry == null || entry.mode !== "extend" || !connectedNames.has(name)) {
+      continue;
+    }
+    // "auto" is left to the compositor; only explicit coordinates translate.
+    const position = entry.position;
+    if (typeof position === "object") {
       positioned
-          .push(
-              entry.position
-          );
+          .push(position);
     }
   }
   if (positioned.length > 0) {
