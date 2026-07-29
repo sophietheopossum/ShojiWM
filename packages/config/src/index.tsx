@@ -161,9 +161,40 @@ COMPOSITOR.process.once("GTK-CSD-control-buttons", {
   command: "gsettings set org.gnome.desktop.wm.preferences button-layout ':minimize,maximize,close'",
   runPolicy: "once-per-session",
 });
+COMPOSITOR.window.decoration.configure((window, context) => {
+  const appId = (window.appId() ?? "").toLowerCase();
+  // `firefox-default` is what Gecko actually reports here — the suffix is the
+  // remoting/profile name, so forks and profiles produce `firefox-<something>`
+  // rather than a bare `firefox`. Matching only the bare form left hellfire
+  // falling through to SSD, which is exactly the renegotiation loop the comment
+  // below warns about (`duplicate_requests=8`, then suppressed).
+  const isFirefox =
+    appId === "firefox" ||
+    appId.startsWith("firefox-") ||
+    appId.endsWith(".firefox") ||
+    appId.includes("firefoxdeveloperedition");
 
 COMPOSITOR.window.decoration.configure((_window, context) => {
   return { mode: context.clientPreference ?? "server" };
+  // The KDE manager advertises CSD before per-window metadata is available.
+  // Keep that baseline while appId is unknown: sending an early SSD response
+  // makes some Firefox/Chromium versions permanently build reduced chrome.
+  if (appId.length === 0) {
+    return { mode: context.clientPreference ?? "client" };
+  }
+
+  // Firefox can repeatedly renegotiate when CSD is rejected. Keep CSD even
+  // when it relies on the manager default and sends no explicit preference.
+  if (isFirefox) {
+    // Honour an explicit request rather than pinning CSD: GTK asks for client
+    // today (Gecko has no decoration protocol of its own — `libgdk-3` owns the
+    // negotiation), so this is a no-op unless Firefox is persuaded to ask for
+    // server, at which point hardcoding "client" would have silently overridden
+    // it. The `?? "client"` keeps the original intent for the no-preference case.
+    return { mode: context.clientPreference ?? "client" };
+  }
+
+  return { mode: "server" };
 });
 
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
