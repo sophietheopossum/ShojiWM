@@ -1024,6 +1024,14 @@ pub fn clipped_surface_elements(
             let mut output = Vec::with_capacity(elements.len());
             for element in elements {
                 if Element::id(&element) == &root_id {
+                    // Resolve before the move: `element` is consumed below.
+                    let element_description =
+                        surface_descriptions
+                            .get(
+                                Element::id(
+                                    &element,
+                                ),
+                            ).copied();
                     output.push(WindowClipElement::Clipped(ClippedSurfaceElement::new(
                         renderer,
                         element,
@@ -1033,7 +1041,7 @@ pub fn clipped_surface_elements(
                         clip,
                         geometry,
                         debug_label.clone(),
-                        image_description,
+                        element_description,
                     )?));
                 } else {
                     output.push(WindowClipElement::Raw(element));
