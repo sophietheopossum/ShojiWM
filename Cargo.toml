@@ -14,6 +14,11 @@ members = [
 smithay = { git = "https://github.com/bea4dev/smithay.git", rev = "1a49398f573ad2bf11fa14c70b0fa1dbcc7e3172" }
 smithay-drm-extras = { git = "https://github.com/bea4dev/smithay.git", rev = "1a49398f573ad2bf11fa14c70b0fa1dbcc7e3172", default-features = false }
 
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
 # Iteration profile for the edit-test loop: same optimization level, but
 # parallel codegen, no LTO, and incremental rebuilds. Runtime perf is close
 # enough for testing; benchmark and tag releases with `release` only.
