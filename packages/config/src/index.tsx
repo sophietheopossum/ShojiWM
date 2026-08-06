@@ -661,6 +661,27 @@ COMPOSITOR.process.once("minkashot", {
   command: "qs -p \"${MINKA_SHOT_DIR:-/usr/share/minka/MinkaShot}\" > /tmp/minkashot.log 2>&1",
   runPolicy: "once-per-session",
 });
+// MinkaMon: the system monitor. Started with the session because duo mode
+// designs it in — the ScreenPad's side panel and dock reserve their exclusive
+// zones and MinkaMon's schematic fills whatever is left, so without it that
+// zone is bare desktop rather than a missing app.
+// Launched via its wrapper rather than qs directly so autostarted and
+// start-menu launches share one rolling log (~/.local/state/minka/minkamon.log);
+// that is the wrapper's whole job, hence no redirect here. Guarded like
+// MinkaFX so an install that predates the wrapper is a no-op, not an error.
+//
+// The `sleep` is load-bearing, not politeness: it MUST bind its layer surface
+// after MinkaShell binds the ScreenPad wallpaper. ShojiWM sorts Background and
+// Bottom into one bucket ordered by bind order rather than by layer
+// (backend/window.rs, layer_surfaces_for_output — smithay's LayerMap is an
+// IndexSet and layers() never sorts by kind), so whichever binds later wins.
+// Start them together and the schematic loses the race and vanishes behind the
+// wallpaper: running, correctly placed, invisible. Remove this only once the
+// compositor orders those two layers properly.
+COMPOSITOR.process.once("minkamon", {
+  command: "MINKA_MON=\"${MINKA_MON_BIN:-/usr/bin/minkamon}\"; [ -x \"$MINKA_MON\" ] || exit 0; sleep 5; exec \"$MINKA_MON\" \"${MINKA_MON_DIR:-/usr/share/minka/MinkaMon}\"",
+  runPolicy: "once-per-session",
+});
 // MinkaFX: the Guido-style wgpu overlay process (snap preview, future OSDs).
 // Guarded so a missing/not-yet-built binary is a silent no-op instead of a
 // failure. MINKA_FX_BIN overrides the installed path for repo-checkout runs.
