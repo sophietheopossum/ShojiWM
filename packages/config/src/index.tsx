@@ -619,7 +619,7 @@ function updateDockProximity(monitor: string, inside: boolean) {
 
 // Snap-zone preview: broadcast the active snap rect (floating edge zones, or the
 // opened tiling slot) to the bar, which renders the rounded preview overlay.
-//   snap.preview  { monitor, rect: {x,y,w,h} | null, kind: "floating"|"tiling" }
+//   snap.preview  { monitor, rect: {x,y,width,height} | null, kind: "floating"|"tiling" }
 let lastSnapJson = "";
 HYBRID_WINDOW_MANAGER.setSnapPreviewBroadcaster((preview) => {
   const json = JSON.stringify(preview);
