@@ -4,6 +4,7 @@ import {
   op_shoji_environment,
   op_shoji_path_exists,
   op_shoji_process_id,
+  op_shoji_read_text_file,
   op_shoji_remove_unix_socket,
   op_shoji_wake_compositor,
 } from "ext:core/ops";
@@ -11,6 +12,7 @@ import {
 globalThis.ShojiRuntimeBridge = ShojiRuntimeBridge;
 globalThis.__SHOJI_EMBEDDED_RUNTIME__ = true;
 globalThis.__SHOJI_PATH_EXISTS__ = op_shoji_path_exists;
+globalThis.__SHOJI_READ_TEXT_FILE__ = op_shoji_read_text_file;
 globalThis.__SHOJI_REMOVE_UNIX_SOCKET__ = op_shoji_remove_unix_socket;
 globalThis.__SHOJI_WAKE_COMPOSITOR__ = op_shoji_wake_compositor;
 
