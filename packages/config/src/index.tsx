@@ -656,8 +656,12 @@ COMPOSITOR.process.once("fcitx5", {
 // for later inspection.
 // MINKA_SHELL_DIR overrides the installed location for repo-checkout sessions
 // (set in shojiwm-env.fish); tarball installs land in /usr/share/minka.
+// --log-times so window-creation lines can be matched against kernel events:
+// MinkaShell has been hanging its first GPU job on newly created contexts
+// (xe GT0 engine reset, always seqno 0xFFFFFF81), and without timestamps
+// there is nothing to correlate the reset against. MinkaMon already does this.
 COMPOSITOR.process.once("shell", {
-  command: "qs -p \"${MINKA_SHELL_DIR:-/usr/share/minka/MinkaShell}\" > /tmp/minkashell.log 2>&1",
+  command: "qs --log-times -p \"${MINKA_SHELL_DIR:-/usr/share/minka/MinkaShell}\" > /tmp/minkashell.log 2>&1",
   runPolicy: "once-per-session",
 });
 // MinkaShot: freeze-frame screenshot tool. Runs as a daemon so the Print
