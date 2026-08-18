@@ -717,13 +717,12 @@ pub fn ordered_background_elements_for_window_with_framebuffer_backdrops(
 
     for cached in decoration.shader_buffers.clone() {
         if cached.shader.supports_framebuffer_backdrop() {
-            if include_framebuffer_backdrops {
-                if let Some(element) = backdrop_shader_effect_element(
+            if include_framebuffer_backdrops
+                && let Some(element) = backdrop_shader_effect_element(
                     renderer, decoration, &cached, output_geo, scale, alpha,
                 )? {
                     items.push((cached.order, DecorationSceneElements::Backdrop(element)));
                 }
-            }
             // When framebuffer backdrops are excluded (full-window snapshot
             // and offscreen source passes) there is no framebuffer to sample.
             // Falling through to the generic pixel element used to draw the
