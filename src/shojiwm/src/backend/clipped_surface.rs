@@ -387,11 +387,11 @@ impl ClippedSurfaceElement {
                 * output_scale_y)
                 .round();
             SnappedLogicalRect {
-                x: snapped_slot_rect.x + left_px as f32 * logical_per_px_x,
-                y: snapped_slot_rect.y + top_px as f32 * logical_per_px_y,
-                width: (snapped_slot_rect.width + (right_px - left_px) as f32 * logical_per_px_x)
+                x: snapped_slot_rect.x + left_px * logical_per_px_x,
+                y: snapped_slot_rect.y + top_px * logical_per_px_y,
+                width: (snapped_slot_rect.width + (right_px - left_px) * logical_per_px_x)
                     .max(0.0),
-                height: (snapped_slot_rect.height + (bottom_px - top_px) as f32 * logical_per_px_y)
+                height: (snapped_slot_rect.height + (bottom_px - top_px) * logical_per_px_y)
                     .max(0.0),
             }
         } else {
