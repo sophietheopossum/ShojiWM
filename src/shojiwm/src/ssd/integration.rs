@@ -2160,7 +2160,7 @@ impl ShojiWM {
 
     fn reset_managed_window_animation_state_to_static(&mut self, window_id: &str) {
         let mut reset_live = false;
-        for (_, decoration) in self.window_decorations.iter_mut() {
+        for decoration in self.window_decorations.values_mut() {
             if decoration.snapshot.id != window_id {
                 continue;
             }
@@ -2221,7 +2221,7 @@ impl ShojiWM {
     }
 
     fn set_managed_window_animation_active(&mut self, window_id: &str, active: bool) {
-        for (_, decoration) in self.window_decorations.iter_mut() {
+        for decoration in self.window_decorations.values_mut() {
             if decoration.snapshot.id == window_id {
                 decoration.managed_window_animation_active = active;
                 break;
