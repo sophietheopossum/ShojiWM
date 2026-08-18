@@ -6271,6 +6271,7 @@ COMPOSITOR.window.composition = () => <Box />;
                 height: 1080,
                 refresh_rate: 60.0,
             }),
+            hdr_supported: false,
             position: OutputPositionSnapshot { x: 0, y: 0 },
             scale: 1.0,
             available_modes: Vec::new(),
