@@ -2364,7 +2364,7 @@ impl ShojiWM {
                 dirty_rect_window_ids.insert(window_id.clone());
             }
 
-            for (_, decoration) in self.window_decorations.iter_mut() {
+            for decoration in self.window_decorations.values_mut() {
                 if decoration.snapshot.id != window_id {
                     continue;
                 }
