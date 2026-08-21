@@ -2972,7 +2972,7 @@ mod pointer_motion_space_tests {
         // pixel steps — the judder this setting exists to remove.
         let steps = step_sizes(1.0, 1.5, 8);
         assert_eq!(steps, vec![2, 1, 2, 1, 2, 1, 2, 1]);
-        assert!(steps.iter().any(|step| *step == 2));
+        assert!(steps.contains(&2));
     }
 
     #[test]
