@@ -1671,175 +1671,6 @@ fn rounded_rect_element(
     Ok(Some(element))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ssd::{BoxNode, DecorationNodeKind, DecorationStyle};
-
-    fn computed_node(
-        stable_id: &str,
-        kind: DecorationNodeKind,
-        style: DecorationStyle,
-        children: Vec<ComputedDecorationNode>,
-    ) -> ComputedDecorationNode {
-        ComputedDecorationNode {
-            stable_id: Some(stable_id.to_string()),
-            interaction: Default::default(),
-            window_border_interaction: Default::default(),
-            kind,
-            style,
-            rect: LogicalRect::new(0, 0, 10, 10),
-            resolved_rect: Default::default(),
-            resolved_content_rect: Default::default(),
-            resolved_border_width: Default::default(),
-            resolved_border_radius: Default::default(),
-            effective_clip: None,
-            resolved_effective_clip: None,
-            children,
-        }
-    }
-
-    #[test]
-    fn square_clip_covering_local_rect_is_treated_as_noop() {
-        let clip = RoundedClip {
-            rect: crate::backend::visual::SnappedLogicalRect {
-                x: -20.0,
-                y: 0.0,
-                width: 140.0,
-                height: 100.0,
-            },
-            radius: 0.0,
-        };
-        let local_rect = Rectangle::new(Point::from((0, 0)), (100, 30).into());
-
-        assert!(!clip_affects_local_rect(clip, local_rect));
-    }
-
-    #[test]
-    fn rounded_ancestor_clip_covering_local_rect_is_preserved() {
-        let clip = RoundedClip {
-            rect: crate::backend::visual::SnappedLogicalRect {
-                x: -82.0,
-                y: 0.0,
-                width: 100.0,
-                height: 200.0,
-            },
-            radius: 18.0,
-        };
-        let local_rect = Rectangle::new(Point::from((0, 0)), (18, 18).into());
-
-        assert!(clip_affects_local_rect(clip, local_rect));
-    }
-
-    #[test]
-    fn partial_clip_is_preserved_even_without_radius() {
-        let clip = RoundedClip {
-            rect: crate::backend::visual::SnappedLogicalRect {
-                x: 0.0,
-                y: 0.0,
-                width: 80.0,
-                height: 20.0,
-            },
-            radius: 0.0,
-        };
-        let local_rect = Rectangle::new(Point::from((0, 0)), (100, 30).into());
-
-        assert!(clip_affects_local_rect(clip, local_rect));
-    }
-
-    #[test]
-    fn local_clip_from_physical_geometry_preserves_negative_offsets() {
-        let geometry = Rectangle::new(Point::from((1841, 13)), (23, 23).into());
-        let clip_geometry = Rectangle::new(Point::from((16, 6)), (1891, 1208).into());
-
-        let clip = local_clip_from_physical_geometry(clip_geometry, geometry, 18.0);
-
-        assert!(clip.rect.x < 0.0);
-        assert!(clip.rect.y < 0.0);
-        assert_eq!(clip.rect.width, 1891.0);
-        assert_eq!(clip.rect.height, 1208.0);
-        assert_eq!(clip.radius, 18.0);
-    }
-
-    #[test]
-    fn border_anchor_hole_is_clamped_to_declared_inner_hole() {
-        let declared_hole = Rectangle::<i32, Physical>::new(Point::from((3, 3)), (100, 80).into());
-        let overflowing_anchor =
-            Rectangle::<i32, Physical>::new(Point::from((3, 3)), (130, 80).into());
-        let contained_anchor =
-            Rectangle::<i32, Physical>::new(Point::from((10, 12)), (40, 20).into());
-
-        assert_eq!(
-            clamp_anchor_hole_to_declared_hole(overflowing_anchor, Some(declared_hole)),
-            declared_hole
-        );
-        assert_eq!(
-            clamp_anchor_hole_to_declared_hole(contained_anchor, Some(declared_hole)),
-            contained_anchor
-        );
-    }
-
-    #[test]
-    fn border_fit_anchor_skips_only_absolute_descendant_owners() {
-        let flow_child = computed_node(
-            "root.flow",
-            DecorationNodeKind::Box(BoxNode::default()),
-            DecorationStyle::default(),
-            Vec::new(),
-        );
-        let absolute_leaf = computed_node(
-            "root.absolute.leaf",
-            DecorationNodeKind::Box(BoxNode::default()),
-            DecorationStyle::default(),
-            Vec::new(),
-        );
-        let absolute_child = computed_node(
-            "root.absolute",
-            DecorationNodeKind::Box(BoxNode::default()),
-            DecorationStyle {
-                position: Some(StylePosition::Absolute),
-                ..Default::default()
-            },
-            vec![absolute_leaf],
-        );
-        let root = computed_node(
-            "root",
-            DecorationNodeKind::WindowBorder,
-            DecorationStyle::default(),
-            vec![flow_child, absolute_child],
-        );
-
-        assert!(!owner_is_absolute_border_fit_descendant(
-            &root,
-            Some("root"),
-            "root",
-            false,
-            false,
-        ));
-        assert!(!owner_is_absolute_border_fit_descendant(
-            &root,
-            Some("root"),
-            "root.flow",
-            false,
-            false,
-        ));
-        assert!(owner_is_absolute_border_fit_descendant(
-            &root,
-            Some("root"),
-            "root.absolute",
-            false,
-            false,
-        ));
-        assert!(owner_is_absolute_border_fit_descendant(
-            &root,
-            Some("root"),
-            "root.absolute.leaf",
-            false,
-            false,
-        ));
-    }
-}
-
 fn backdrop_shader_effect_element(
     renderer: &mut GlesRenderer,
     decoration: &mut crate::ssd::WindowDecorationState,
@@ -2094,4 +1925,173 @@ fn intersect_logical_rect(
     let bottom = (rect.y + rect.height).min(output_geo.loc.y + output_geo.size.h);
 
     (right > left && bottom > top).then(|| LogicalRect::new(left, top, right - left, bottom - top))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ssd::{BoxNode, DecorationNodeKind, DecorationStyle};
+
+    fn computed_node(
+        stable_id: &str,
+        kind: DecorationNodeKind,
+        style: DecorationStyle,
+        children: Vec<ComputedDecorationNode>,
+    ) -> ComputedDecorationNode {
+        ComputedDecorationNode {
+            stable_id: Some(stable_id.to_string()),
+            interaction: Default::default(),
+            window_border_interaction: Default::default(),
+            kind,
+            style,
+            rect: LogicalRect::new(0, 0, 10, 10),
+            resolved_rect: Default::default(),
+            resolved_content_rect: Default::default(),
+            resolved_border_width: Default::default(),
+            resolved_border_radius: Default::default(),
+            effective_clip: None,
+            resolved_effective_clip: None,
+            children,
+        }
+    }
+
+    #[test]
+    fn square_clip_covering_local_rect_is_treated_as_noop() {
+        let clip = RoundedClip {
+            rect: crate::backend::visual::SnappedLogicalRect {
+                x: -20.0,
+                y: 0.0,
+                width: 140.0,
+                height: 100.0,
+            },
+            radius: 0.0,
+        };
+        let local_rect = Rectangle::new(Point::from((0, 0)), (100, 30).into());
+
+        assert!(!clip_affects_local_rect(clip, local_rect));
+    }
+
+    #[test]
+    fn rounded_ancestor_clip_covering_local_rect_is_preserved() {
+        let clip = RoundedClip {
+            rect: crate::backend::visual::SnappedLogicalRect {
+                x: -82.0,
+                y: 0.0,
+                width: 100.0,
+                height: 200.0,
+            },
+            radius: 18.0,
+        };
+        let local_rect = Rectangle::new(Point::from((0, 0)), (18, 18).into());
+
+        assert!(clip_affects_local_rect(clip, local_rect));
+    }
+
+    #[test]
+    fn partial_clip_is_preserved_even_without_radius() {
+        let clip = RoundedClip {
+            rect: crate::backend::visual::SnappedLogicalRect {
+                x: 0.0,
+                y: 0.0,
+                width: 80.0,
+                height: 20.0,
+            },
+            radius: 0.0,
+        };
+        let local_rect = Rectangle::new(Point::from((0, 0)), (100, 30).into());
+
+        assert!(clip_affects_local_rect(clip, local_rect));
+    }
+
+    #[test]
+    fn local_clip_from_physical_geometry_preserves_negative_offsets() {
+        let geometry = Rectangle::new(Point::from((1841, 13)), (23, 23).into());
+        let clip_geometry = Rectangle::new(Point::from((16, 6)), (1891, 1208).into());
+
+        let clip = local_clip_from_physical_geometry(clip_geometry, geometry, 18.0);
+
+        assert!(clip.rect.x < 0.0);
+        assert!(clip.rect.y < 0.0);
+        assert_eq!(clip.rect.width, 1891.0);
+        assert_eq!(clip.rect.height, 1208.0);
+        assert_eq!(clip.radius, 18.0);
+    }
+
+    #[test]
+    fn border_anchor_hole_is_clamped_to_declared_inner_hole() {
+        let declared_hole = Rectangle::<i32, Physical>::new(Point::from((3, 3)), (100, 80).into());
+        let overflowing_anchor =
+            Rectangle::<i32, Physical>::new(Point::from((3, 3)), (130, 80).into());
+        let contained_anchor =
+            Rectangle::<i32, Physical>::new(Point::from((10, 12)), (40, 20).into());
+
+        assert_eq!(
+            clamp_anchor_hole_to_declared_hole(overflowing_anchor, Some(declared_hole)),
+            declared_hole
+        );
+        assert_eq!(
+            clamp_anchor_hole_to_declared_hole(contained_anchor, Some(declared_hole)),
+            contained_anchor
+        );
+    }
+
+    #[test]
+    fn border_fit_anchor_skips_only_absolute_descendant_owners() {
+        let flow_child = computed_node(
+            "root.flow",
+            DecorationNodeKind::Box(BoxNode::default()),
+            DecorationStyle::default(),
+            Vec::new(),
+        );
+        let absolute_leaf = computed_node(
+            "root.absolute.leaf",
+            DecorationNodeKind::Box(BoxNode::default()),
+            DecorationStyle::default(),
+            Vec::new(),
+        );
+        let absolute_child = computed_node(
+            "root.absolute",
+            DecorationNodeKind::Box(BoxNode::default()),
+            DecorationStyle {
+                position: Some(StylePosition::Absolute),
+                ..Default::default()
+            },
+            vec![absolute_leaf],
+        );
+        let root = computed_node(
+            "root",
+            DecorationNodeKind::WindowBorder,
+            DecorationStyle::default(),
+            vec![flow_child, absolute_child],
+        );
+
+        assert!(!owner_is_absolute_border_fit_descendant(
+            &root,
+            Some("root"),
+            "root",
+            false,
+            false,
+        ));
+        assert!(!owner_is_absolute_border_fit_descendant(
+            &root,
+            Some("root"),
+            "root.flow",
+            false,
+            false,
+        ));
+        assert!(owner_is_absolute_border_fit_descendant(
+            &root,
+            Some("root"),
+            "root.absolute",
+            false,
+            false,
+        ));
+        assert!(owner_is_absolute_border_fit_descendant(
+            &root,
+            Some("root"),
+            "root.absolute.leaf",
+            false,
+            false,
+        ));
+    }
 }
