@@ -956,31 +956,30 @@ export class HybridWindowManager {
     }
     window.setCloseAnimationDuration(OPEN_CLOSE_ANIMATION_DURATION);
 
-    let restoredExistingWindow = false;
-    const workspace =
-      this.findWorkspaceRestoringWindow(window) ?? this.getCurrentWorkspace();
-    if (workspace) {
-      restoredExistingWindow = workspace.addWindow(window);
-      if (
-        !restoredExistingWindow &&
-        workspace.isTiled &&
-        workspace.shouldTile(window)
-      ) {
-        this.trackPendingInitialFocus(window);
-      }
-      this.applyWorkspaceStackPolicy(workspace);
-      this.syncWorkspaceVisibility();
-    } else {
-      window.state[WINDOW_STATE_RECT].set(this.naturalRootRect(window));
-    }
+    // Delegate to initializeWindowLayout rather than repeating its body. This
+    // function held a verbatim copy of it, which is what a July patch replayed on
+    // top of the refactor left behind -- and the copy was missing the pieces the
+    // refactor exists for: the findWorkspaceForWindow early return (without which a
+    // window whose workspace changed between initial configure and first commit is
+    // added to a SECOND workspace), the options pass-through, and the
+    // restoredDuringInitialConfigure bookkeeping.
+    const layoutWasDeferred = this.deferredInitialLayoutWindowIds.delete(
+      window.id,
+    );
+    const initialized = this.initializeWindowLayout(window, {
+      restoreScrollIfInitiallyFloating: layoutWasDeferred,
+    });
+    const restoredDuringInitialConfigure =
+      this.restoredDuringInitialConfigure.delete(window.id);
+    const restoredExistingWindow =
+      initialized.restoredExistingWindow || restoredDuringInitialConfigure;
+    const workspace = initialized.workspace;
 
-    if (window.isMaximized()) {
-      window.state[WINDOW_STATE_RESTORE_RECT].set(
-        this.initialRestoreRectForMaximizedWindow(window),
-      );
-      window.state[WINDOW_STATE_RECT].set(this.maximizedRectForWindow(window));
-      window.state[WINDOW_STATE_MAXIMIZED].set(true);
-    } else {
+    // The one thing that is genuinely ours and does NOT belong in the helper: the
+    // helper runs at initial configure too, and a floating window's rect is only
+    // worth clamping once it actually commits. The helper has already handled the
+    // maximized case, so this is the remaining branch.
+    if (!window.isMaximized()) {
       this.clampInitialFloatingRect(window, workspace);
     }
     if (!restoredExistingWindow) {
