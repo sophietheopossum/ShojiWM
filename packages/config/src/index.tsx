@@ -174,8 +174,6 @@ COMPOSITOR.window.decoration.configure((window, context) => {
     appId.endsWith(".firefox") ||
     appId.includes("firefoxdeveloperedition");
 
-COMPOSITOR.window.decoration.configure((_window, context) => {
-  return { mode: context.clientPreference ?? "server" };
   // The KDE manager advertises CSD before per-window metadata is available.
   // Keep that baseline while appId is unknown: sending an early SSD response
   // makes some Firefox/Chromium versions permanently build reduced chrome.
