@@ -975,11 +975,28 @@ export class HybridWindowManager {
       initialized.restoredExistingWindow || restoredDuringInitialConfigure;
     const workspace = initialized.workspace;
 
-    // The one thing that is genuinely ours and does NOT belong in the helper: the
-    // helper runs at initial configure too, and a floating window's rect is only
-    // worth clamping once it actually commits. The helper has already handled the
-    // maximized case, so this is the remaining branch.
-    if (!window.isMaximized()) {
+    // Re-apply the maximised geometry even when the helper returned early.
+    //
+    // initializeWindowLayout early-returns for a window that ALREADY has a workspace, which is
+    // exactly the case on a config hot reload -- and that path never reaches its own isMaximized
+    // block. The inlined version this replaced had no early return, so it always re-applied the
+    // rect. Losing that left a maximised window holding a stale rect across a reload while the
+    // client reconfigured, and every coordinate inside the surface came out offset.
+    //
+    // Idempotent on the other path: the helper has already set these to the same values.
+    if (window.isMaximized()) {
+      // RESTORE_RECT only when unset. Recomputing it on every commit would overwrite the real
+      // pre-maximise size -- which the snapshot restored correctly -- with a synthesised default.
+      if (!window.state[WINDOW_STATE_RESTORE_RECT]()) {
+        window.state[WINDOW_STATE_RESTORE_RECT].set(
+          this.initialRestoreRectForMaximizedWindow(window),
+        );
+      }
+      window.state[WINDOW_STATE_RECT].set(this.maximizedRectForWindow(window));
+      window.state[WINDOW_STATE_MAXIMIZED].set(true);
+    } else {
+      // A floating window's rect is only worth clamping once it actually commits, which is why
+      // this stays here rather than moving into the helper (which also runs at initial configure).
       this.clampInitialFloatingRect(window, workspace);
     }
     if (!restoredExistingWindow) {
