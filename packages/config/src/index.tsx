@@ -1366,11 +1366,15 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         tiled={tiled}
         idle={inactive}
         interactive={inactive((value) => !value)}
-        // Permit low-latency tearing for fullscreen windows. The compositor only actually tears
-        // once the window is on the direct-scanout fast path and is committing faster than the
-        // refresh rate (i.e. games), so this is a no-op for ordinary fullscreen apps. Narrow it
-        // per app if desired, e.g. `allowTearing={isGame(window.appId())}`.
-        allowTearing={true}
+        // Low-latency tearing for fullscreen windows, off by default. This was `true` on the
+        // reasoning that the compositor only tears once the window is on the direct-scanout
+        // fast path AND is committing faster than the refresh rate, so it would be a no-op
+        // outside games. Both halves stopped holding on 1/9/2026: direct scanout began
+        // engaging routinely (it previously never did), and the TV was pinned to 60Hz, which
+        // is far easier to out-commit than the 120Hz it had auto-selected. The result was
+        // visible tearing on HDMI-A-3 during ordinary use. Re-enable per app if wanted, e.g.
+        // `allowTearing={isGame(window.appId())}`.
+        allowTearing={false}
       >
         <ClientWindow />
       </ManagedWindow>
