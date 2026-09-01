@@ -289,6 +289,14 @@ function broadcastWorkspaces() {
   }
   lastWorkspacesJson = json;
   WORKSPACE_IPC.broadcast("workspaces.changed", view);
+  // Same contract as the windows.rects tap above, and for the same reason:
+  // this runs in a microtask after the triggering event's response has been
+  // drained, so without an explicit wake the broadcast sits unflushed until
+  // some unrelated input wakes the compositor. That is why dock titles only
+  // caught up when the mouse moved, and why a title that animates on its own
+  // (a terminal spinner) looked frozen. Guarded by the JSON diff above, so a
+  // title that has not actually changed still costs nothing.
+  wakeRust();
 }
 
 function reconfigureProtocolWorkspaces() {
