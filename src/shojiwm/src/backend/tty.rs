@@ -1794,8 +1794,8 @@ fn fast_cursor_move_inner(
     // final position right before it submits.
     if allow_defer && surface.deferred_submit.is_none() {
         let now = Duration::from(clock.now());
-        if let Some(deadline) = commit_deadline(surface, now) {
-            if now < deadline {
+        if let Some(deadline) = commit_deadline(surface, now)
+            && now < deadline {
                 if surface.cursor_commit_timer_armed {
                     // Already scheduled; the timer reads the freshest pointer
                     // position when it fires.
@@ -1841,7 +1841,6 @@ fn fast_cursor_move_inner(
                 }
                 return true;
             }
-        }
     }
 
     let scale = Scale::from(output.current_scale().fractional_scale());
