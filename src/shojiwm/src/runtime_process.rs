@@ -119,7 +119,18 @@ fn prepare_runtime_process_environment(command: &mut Command) {
         command.env(key, "");
     }
 
-    command.env("XDG_CURRENT_DESKTOP", "ShojiWM");
+    // Colon list, in precedence order (XDG spec). The KDE entry makes
+    // KDE-family integrations engage in apps that sniff the desktop:
+    // Chromium/Electron only select the kwallet6 password store when they
+    // see KDE here (otherwise Signal & co. fall back to a plaintext "basic"
+    // store and never reach the running kwalletd6). Portals are unaffected:
+    // xdg-desktop-portal tries shojiwm-portals.conf first.
+    command.env("XDG_CURRENT_DESKTOP", "ShojiWM:KDE");
+    // Chromium resolves the KDE token further via KDE_SESSION_VERSION:
+    // "6" → kwalletd6, "5" → kwalletd5, unset → the KDE4-era service name
+    // (not running anywhere modern), which silently degrades to the basic
+    // plaintext store again.
+    command.env("KDE_SESSION_VERSION", "6");
     command.env("XDG_SESSION_DESKTOP", "ShojiWM");
     command.env("XDG_SESSION_TYPE", "wayland");
     command.env("DESKTOP_SESSION", "ShojiWM");
