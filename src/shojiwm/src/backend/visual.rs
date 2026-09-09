@@ -965,6 +965,96 @@ pub fn relative_physical_rect_from_root_global_edges_precise(
     )
 }
 
+pub fn transformed_root_rect(rect: LogicalRect, transform: WindowTransform) -> LogicalRect {
+    transformed_rect(rect, rect, transform)
+}
+
+pub fn transformed_rect(
+    rect: LogicalRect,
+    reference_rect: LogicalRect,
+    transform: WindowTransform,
+) -> LogicalRect {
+    let origin_x = reference_rect.x as f64 + reference_rect.width as f64 * transform.origin.x;
+    let origin_y = reference_rect.y as f64 + reference_rect.height as f64 * transform.origin.y;
+
+    let left = origin_x + (rect.x as f64 - origin_x) * transform.scale_x + transform.translate_x;
+    let top = origin_y + (rect.y as f64 - origin_y) * transform.scale_y + transform.translate_y;
+    let rect_right = rect.x.saturating_add(rect.width);
+    let rect_bottom = rect.y.saturating_add(rect.height);
+    let right =
+        origin_x + (rect_right as f64 - origin_x) * transform.scale_x + transform.translate_x;
+    let bottom =
+        origin_y + (rect_bottom as f64 - origin_y) * transform.scale_y + transform.translate_y;
+
+    let x = left.min(right).floor() as i32;
+    let y = top.min(bottom).floor() as i32;
+    let width = (left.max(right) - left.min(right)).ceil() as i32;
+    let height = (top.max(bottom) - top.min(bottom)).ceil() as i32;
+
+    LogicalRect::new(x, y, width.max(0), height.max(0))
+}
+
+pub fn transformed_precise_rect(
+    rect: PreciseLogicalRect,
+    reference_rect: LogicalRect,
+    transform: WindowTransform,
+) -> PreciseLogicalRect {
+    let origin_x = reference_rect.x as f64 + reference_rect.width as f64 * transform.origin.x;
+    let origin_y = reference_rect.y as f64 + reference_rect.height as f64 * transform.origin.y;
+
+    let left = origin_x + (rect.x as f64 - origin_x) * transform.scale_x + transform.translate_x;
+    let top = origin_y + (rect.y as f64 - origin_y) * transform.scale_y + transform.translate_y;
+    let rect_right = rect.x as f64 + rect.width as f64;
+    let rect_bottom = rect.y as f64 + rect.height as f64;
+    let right = origin_x + (rect_right - origin_x) * transform.scale_x + transform.translate_x;
+    let bottom = origin_y + (rect_bottom - origin_y) * transform.scale_y + transform.translate_y;
+
+    PreciseLogicalRect {
+        x: left.min(right) as f32,
+        y: top.min(bottom) as f32,
+        width: (left.max(right) - left.min(right)).max(0.0) as f32,
+        height: (top.max(bottom) - top.min(bottom)).max(0.0) as f32,
+    }
+}
+
+pub fn inverse_transform_point(
+    point: Point<f64, Logical>,
+    rect: LogicalRect,
+    transform: WindowTransform,
+) -> Point<f64, Logical> {
+    let origin_x = rect.x as f64 + rect.width as f64 * transform.origin.x;
+    let origin_y = rect.y as f64 + rect.height as f64 * transform.origin.y;
+    let scale_x = if transform.scale_x.abs() < f64::EPSILON {
+        1.0
+    } else {
+        transform.scale_x
+    };
+    let scale_y = if transform.scale_y.abs() < f64::EPSILON {
+        1.0
+    } else {
+        transform.scale_y
+    };
+
+    Point::from((
+        origin_x + (point.x - transform.translate_x - origin_x) / scale_x,
+        origin_y + (point.y - transform.translate_y - origin_y) / scale_y,
+    ))
+}
+
+pub fn transform_point(
+    point: Point<f64, Logical>,
+    rect: LogicalRect,
+    transform: WindowTransform,
+) -> Point<f64, Logical> {
+    let origin_x = rect.x as f64 + rect.width as f64 * transform.origin.x;
+    let origin_y = rect.y as f64 + rect.height as f64 * transform.origin.y;
+
+    Point::from((
+        origin_x + (point.x - origin_x) * transform.scale_x + transform.translate_x,
+        origin_y + (point.y - origin_y) * transform.scale_y + transform.translate_y,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1198,94 +1288,4 @@ mod tests {
         assert_eq!(clip.width, 10.0);
         assert_eq!(clip.height, 10.0);
     }
-}
-
-pub fn transformed_root_rect(rect: LogicalRect, transform: WindowTransform) -> LogicalRect {
-    transformed_rect(rect, rect, transform)
-}
-
-pub fn transformed_rect(
-    rect: LogicalRect,
-    reference_rect: LogicalRect,
-    transform: WindowTransform,
-) -> LogicalRect {
-    let origin_x = reference_rect.x as f64 + reference_rect.width as f64 * transform.origin.x;
-    let origin_y = reference_rect.y as f64 + reference_rect.height as f64 * transform.origin.y;
-
-    let left = origin_x + (rect.x as f64 - origin_x) * transform.scale_x + transform.translate_x;
-    let top = origin_y + (rect.y as f64 - origin_y) * transform.scale_y + transform.translate_y;
-    let rect_right = rect.x.saturating_add(rect.width);
-    let rect_bottom = rect.y.saturating_add(rect.height);
-    let right =
-        origin_x + (rect_right as f64 - origin_x) * transform.scale_x + transform.translate_x;
-    let bottom =
-        origin_y + (rect_bottom as f64 - origin_y) * transform.scale_y + transform.translate_y;
-
-    let x = left.min(right).floor() as i32;
-    let y = top.min(bottom).floor() as i32;
-    let width = (left.max(right) - left.min(right)).ceil() as i32;
-    let height = (top.max(bottom) - top.min(bottom)).ceil() as i32;
-
-    LogicalRect::new(x, y, width.max(0), height.max(0))
-}
-
-pub fn transformed_precise_rect(
-    rect: PreciseLogicalRect,
-    reference_rect: LogicalRect,
-    transform: WindowTransform,
-) -> PreciseLogicalRect {
-    let origin_x = reference_rect.x as f64 + reference_rect.width as f64 * transform.origin.x;
-    let origin_y = reference_rect.y as f64 + reference_rect.height as f64 * transform.origin.y;
-
-    let left = origin_x + (rect.x as f64 - origin_x) * transform.scale_x + transform.translate_x;
-    let top = origin_y + (rect.y as f64 - origin_y) * transform.scale_y + transform.translate_y;
-    let rect_right = rect.x as f64 + rect.width as f64;
-    let rect_bottom = rect.y as f64 + rect.height as f64;
-    let right = origin_x + (rect_right - origin_x) * transform.scale_x + transform.translate_x;
-    let bottom = origin_y + (rect_bottom - origin_y) * transform.scale_y + transform.translate_y;
-
-    PreciseLogicalRect {
-        x: left.min(right) as f32,
-        y: top.min(bottom) as f32,
-        width: (left.max(right) - left.min(right)).max(0.0) as f32,
-        height: (top.max(bottom) - top.min(bottom)).max(0.0) as f32,
-    }
-}
-
-pub fn inverse_transform_point(
-    point: Point<f64, Logical>,
-    rect: LogicalRect,
-    transform: WindowTransform,
-) -> Point<f64, Logical> {
-    let origin_x = rect.x as f64 + rect.width as f64 * transform.origin.x;
-    let origin_y = rect.y as f64 + rect.height as f64 * transform.origin.y;
-    let scale_x = if transform.scale_x.abs() < f64::EPSILON {
-        1.0
-    } else {
-        transform.scale_x
-    };
-    let scale_y = if transform.scale_y.abs() < f64::EPSILON {
-        1.0
-    } else {
-        transform.scale_y
-    };
-
-    Point::from((
-        origin_x + (point.x - transform.translate_x - origin_x) / scale_x,
-        origin_y + (point.y - transform.translate_y - origin_y) / scale_y,
-    ))
-}
-
-pub fn transform_point(
-    point: Point<f64, Logical>,
-    rect: LogicalRect,
-    transform: WindowTransform,
-) -> Point<f64, Logical> {
-    let origin_x = rect.x as f64 + rect.width as f64 * transform.origin.x;
-    let origin_y = rect.y as f64 + rect.height as f64 * transform.origin.y;
-
-    Point::from((
-        origin_x + (point.x - origin_x) * transform.scale_x + transform.translate_x,
-        origin_y + (point.y - origin_y) * transform.scale_y + transform.translate_y,
-    ))
 }
