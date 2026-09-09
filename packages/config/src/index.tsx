@@ -42,6 +42,12 @@ interface MinkaDisplaySettings {
   enabled?: boolean;
   mirror?: string | null;
   hdr?: boolean;
+  /// Real peak luminance of the panel, cd/m². Only needed when the EDID
+  /// advertises PQ but omits its luminance fields — common, and the reason
+  /// the compositor would otherwise assume 1000. Ignored outside 50..=10000.
+  hdrMaxLuminance?: number;
+  /// Real black level of the panel, cd/m². Ignored outside 0..=10.
+  hdrMinLuminance?: number;
 }
 
 interface MinkaInputSettings {
@@ -905,6 +911,10 @@ COMPOSITOR.output.configure((context) => {
       position: entry?.position ?? "auto",
       scale: entry?.scale ?? 1.0,
       hdr: entry?.hdr === true,
+      // Omitted when unset: the compositor falls back to EDID, then to its
+      // own constants, so an absent key must stay absent rather than become 0.
+      hdrMaxLuminance: entry?.hdrMaxLuminance,
+      hdrMinLuminance: entry?.hdrMinLuminance,
     };
   }
 
