@@ -165,7 +165,11 @@ fn sanitize_inherited_compositor_environment() {
     }
 
     unsafe {
-        std::env::set_var("XDG_CURRENT_DESKTOP", "ShojiWM");
+        // Keep in sync with prepare_runtime_process_environment: the KDE entry 
+        // plus KDE_SESSION_VERSION 
+        // lets Chromium/Electron pick the kwallet6 password store.
+        std::env::set_var("XDG_CURRENT_DESKTOP", "ShojiWM:KDE");
+        std::env::set_var("KDE_SESSION_VERSION", "6");
         std::env::set_var("XDG_SESSION_DESKTOP", "ShojiWM");
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
         std::env::set_var("DESKTOP_SESSION", "ShojiWM");
