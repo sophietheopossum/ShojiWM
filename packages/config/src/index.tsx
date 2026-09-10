@@ -907,8 +907,30 @@ COMPOSITOR.output.configure((context) => {
     }
     display[name] = {
       mode: "extend",
-      resolution: entry?.resolution ?? "best",
-      position: entry?.position ?? "auto",
+      // COPIED, never aliased. `entry` is a live reference into the session's
+      // `activeSettings`, loaded once from minka-settings.json at the top of
+      // this file — and the origin-anchoring block below MUTATES the position
+      // objects it collects (`position.x -= minX`). Handing it the settings'
+      // own object meant an unplug rewrote the saved layout in memory.
+      //
+      // 10/9/2026: the TV dropped out for three seconds. With only the two
+      // built-in panels connected, the anchoring pass renormalised them from
+      // (192,1080)/(0,1944) to (192,0)/(0,864) *inside activeSettings*. When
+      // the TV came back the pass re-derived from those corrupted values, saw
+      // minX/minY already 0, and had nothing left to undo — so the TV returned
+      // to its own untouched (0,0) and sat on top of both panels. The file on
+      // disk was correct the whole time; only the in-memory copy was wrong,
+      // which is why it survived until the next Super+Shift+R.
+      //
+      // The same trap applies to `resolution`: nothing mutates it today, but it
+      // is one edit away, so copy it too.
+      resolution:
+        typeof entry?.resolution === "object"
+          ? { ...entry.resolution }
+          : (entry?.resolution ?? "best"),
+      position: entry?.position
+        ? { x: entry.position.x, y: entry.position.y }
+        : "auto",
       scale: entry?.scale ?? 1.0,
       hdr: entry?.hdr === true,
       // Omitted when unset: the compositor falls back to EDID, then to its
