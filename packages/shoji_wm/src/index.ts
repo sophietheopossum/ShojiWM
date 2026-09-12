@@ -367,6 +367,7 @@ export {
 } from "./window-decoration";
 export { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
 export { ENV_CONTROLLER, drainPendingEnvUpdates } from "./env";
+export { readTextFile } from "./fs";
 export {
   CURSOR_CONTROLLER,
   currentCursorConfig,
