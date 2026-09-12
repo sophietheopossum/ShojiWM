@@ -1029,6 +1029,22 @@ export type OutputTransform =
   | "flipped-180"
   | "flipped-270";
 
+/**
+ * How a panel's subpixels are physically arranged, as advertised to clients in
+ * `wl_output.geometry`. Describes the panel as built: never adjust it for
+ * `transform`.
+ * パネルのサブピクセルの物理的な配列（`wl_output.geometry` でクライアントに
+ * 通知されます）。製造時のパネルそのものを表すため、`transform` に合わせて
+ * 変えないでください。
+ */
+export type OutputSubpixel =
+  | "unknown"
+  | "none"
+  | "horizontal-rgb"
+  | "horizontal-bgr"
+  | "vertical-rgb"
+  | "vertical-bgr";
+
 export interface OutputExtendConfigEntry {
   mode?: "extend";
   /**
@@ -1070,6 +1086,15 @@ export interface OutputExtendConfigEntry {
    * このディスプレイの実際の黒レベル（cd/m²）。0〜10 の範囲外は無視されます。
    */
   hdrMinLuminance?: number;
+  /**
+   * Physical subpixel layout of this panel, which clients such as foot use for
+   * subpixel text antialiasing. Omit it to keep what the kernel reported,
+   * which is `"unknown"` for most panels.
+   * このパネルの物理的なサブピクセル配列。foot などのクライアントがサブピクセル
+   * 単位の文字のアンチエイリアスに使います。省略するとカーネルが報告した値
+   * （多くのパネルでは `"unknown"`）のままになります。
+   */
+  subpixel?: OutputSubpixel;
 }
 
 export interface OutputDisabledConfigEntry {
@@ -1079,6 +1104,8 @@ export interface OutputDisabledConfigEntry {
 export interface OutputMirrorConfigEntry {
   mode: "mirror";
   source: string;
+  /** Same as {@link OutputExtendConfigEntry.subpixel}. / 同上。 */
+  subpixel?: OutputSubpixel;
 }
 
 export type OutputConfigEntry =
@@ -1111,6 +1138,18 @@ export interface OutputStateSnapshot {
   scale: number;
   /** Currently applied transform. / 現在適用されている transform。 */
   transform?: OutputTransform;
+  /**
+   * Subpixel layout currently advertised in `wl_output.geometry`.
+   * 現在 `wl_output.geometry` で通知しているサブピクセル配列。
+   */
+  subpixel?: OutputSubpixel;
+  /**
+   * Subpixel layout the kernel reported for this connector, which `subpixel`
+   * falls back to when the display config names none.
+   * このコネクタについてカーネルが報告したサブピクセル配列。表示設定で指定が
+   * ない場合、`subpixel` はこの値になります。
+   */
+  detectedSubpixel?: OutputSubpixel;
   availableModes: OutputMode[];
   /** EDID advertises HDR (CTA-861 static metadata block). */
   hdrSupported: boolean;
