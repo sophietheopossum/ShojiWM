@@ -514,8 +514,8 @@ WORKSPACE_IPC.handle("windows.minimize", (params) => {
 // running session predates the edit ("reload with Super+Shift+R") instead
 // of silently half-applying. History: 1 = input + display scale;
 // 2 = full display schema (position/mode/enabled/mirror/hdr);
-// 3 = cursor theme + size.
-const MINKA_CONFIG_REVISION = 3;
+// 3 = cursor theme + size; 4 = display subpixel layout.
+const MINKA_CONFIG_REVISION = 4;
 WORKSPACE_IPC.handle("minka.revision", () => ({
   revision: MINKA_CONFIG_REVISION,
 }));
