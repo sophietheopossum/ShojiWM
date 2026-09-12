@@ -78,6 +78,48 @@ impl RuntimeOutputTransform {
     }
 }
 
+/// How a panel's subpixels are physically arranged: the `wl_output.subpixel`
+/// values, kebab-cased like [`RuntimeOutputTransform`]. It describes the panel
+/// as built, so it is never adjusted for the output's transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub enum RuntimeOutputSubpixel {
+    #[serde(rename = "unknown")]
+    Unknown,
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "horizontal-rgb")]
+    HorizontalRgb,
+    #[serde(rename = "horizontal-bgr")]
+    HorizontalBgr,
+    #[serde(rename = "vertical-rgb")]
+    VerticalRgb,
+    #[serde(rename = "vertical-bgr")]
+    VerticalBgr,
+}
+
+impl RuntimeOutputSubpixel {
+    pub fn to_smithay(self) -> smithay::output::Subpixel {
+        use smithay::output::Subpixel;
+        match self {
+            Self::Unknown => Subpixel::Unknown,
+            Self::None => Subpixel::None,
+            Self::HorizontalRgb => Subpixel::HorizontalRgb,
+            Self::HorizontalBgr => Subpixel::HorizontalBgr,
+            Self::VerticalRgb => Subpixel::VerticalRgb,
+            Self::VerticalBgr => Subpixel::VerticalBgr,
+        }
+    }
+}
+
+/// The subpixel layout an output should advertise: the display config's when
+/// it names one, otherwise the one detected for the connector.
+pub fn resolve_output_subpixel(
+    configured: Option<RuntimeOutputSubpixel>,
+    detected: smithay::output::Subpixel,
+) -> smithay::output::Subpixel {
+    configured.map_or(detected, RuntimeOutputSubpixel::to_smithay)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RuntimeOutputMode {
