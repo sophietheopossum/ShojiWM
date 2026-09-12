@@ -255,4 +255,77 @@ mod tests {
             None,
         );
     }
+
+    // MinkaConf writes these names into minka-settings.json; a rename drift
+    // would make the whole display config update fail to parse.
+    #[test]
+    fn runtime_output_config_parses_all_subpixel_names() {
+        let cases = [
+            ("unknown", RuntimeOutputSubpixel::Unknown),
+            ("none", RuntimeOutputSubpixel::None),
+            ("horizontal-rgb", RuntimeOutputSubpixel::HorizontalRgb),
+            ("horizontal-bgr", RuntimeOutputSubpixel::HorizontalBgr),
+            ("vertical-rgb", RuntimeOutputSubpixel::VerticalRgb),
+            ("vertical-bgr", RuntimeOutputSubpixel::VerticalBgr),
+        ];
+        for (name, expected) in cases {
+            let json = format!(r#"{{"mode":"extend","subpixel":"{name}"}}"#);
+            let config: RuntimeOutputConfig = serde_json::from_str(&json)
+                .unwrap_or_else(|error| panic!("failed to parse subpixel {name}: {error}"));
+            assert_eq!(config.subpixel, Some(expected));
+        }
+    }
+
+    /// Absent and `null` both mean "keep the detected layout".
+    #[test]
+    fn runtime_output_config_subpixel_absent_or_null_is_none() {
+        let absent: RuntimeOutputConfig =
+            serde_json::from_str(r#"{"mode":"extend"}"#).unwrap();
+        assert_eq!(absent.subpixel, None);
+        let null: RuntimeOutputConfig =
+            serde_json::from_str(r#"{"mode":"mirror","source":"eDP-1","subpixel":null}"#)
+                .unwrap();
+        assert_eq!(null.subpixel, None);
+    }
+
+    #[test]
+    fn configured_subpixel_wins_and_unset_keeps_the_detected_layout() {
+        use smithay::output::Subpixel;
+        assert_eq!(
+            resolve_output_subpixel(None, Subpixel::VerticalBgr),
+            Subpixel::VerticalBgr,
+        );
+        assert_eq!(
+            resolve_output_subpixel(Some(RuntimeOutputSubpixel::HorizontalRgb), Subpixel::Unknown),
+            Subpixel::HorizontalRgb,
+        );
+        // An explicit "unknown" still overrides a kernel report the user
+        // knows to be wrong.
+        assert_eq!(
+            resolve_output_subpixel(Some(RuntimeOutputSubpixel::Unknown), Subpixel::HorizontalBgr),
+            Subpixel::Unknown,
+        );
+    }
+
+    /// The snapshot reports layouts in the same spelling the config accepts,
+    /// so a value read back from a snapshot can be written straight into the
+    /// config. Pin the two enums to each other through smithay's.
+    #[test]
+    fn subpixel_snapshot_names_parse_back_as_config_values() {
+        use crate::ssd::OutputSubpixelSnapshot;
+        use smithay::output::Subpixel;
+        for subpixel in [
+            Subpixel::Unknown,
+            Subpixel::None,
+            Subpixel::HorizontalRgb,
+            Subpixel::HorizontalBgr,
+            Subpixel::VerticalRgb,
+            Subpixel::VerticalBgr,
+        ] {
+            let json = serde_json::to_string(&OutputSubpixelSnapshot::from(subpixel)).unwrap();
+            let parsed: RuntimeOutputSubpixel = serde_json::from_str(&json)
+                .unwrap_or_else(|error| panic!("snapshot name {json} does not parse: {error}"));
+            assert_eq!(parsed.to_smithay(), subpixel);
+        }
+    }
 }
