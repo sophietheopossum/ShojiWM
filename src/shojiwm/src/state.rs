@@ -533,6 +533,25 @@ fn logical_rect_intersects_output(rect: LogicalRect, output_geo: Rectangle<i32, 
     right > left && bottom > top
 }
 
+
+/// The subpixel layout an output was created with, i.e. what the kernel
+/// reported for its connector.
+///
+/// `Output::set_subpixel` overwrites the only other copy, so the value is
+/// recorded in `create_output_global`, which every backend calls right after
+/// `Output::new`. The first read records it too, as a fallback for an output
+/// that somehow reaches `apply_runtime_output_subpixels` without a global.
+#[derive(Debug, Clone, Copy)]
+struct DetectedSubpixel(smithay::output::Subpixel);
+
+fn detected_subpixel(output: &Output) -> smithay::output::Subpixel {
+    let user_data = output.user_data();
+    user_data.insert_if_missing_threadsafe(|| DetectedSubpixel(output.physical_properties().subpixel));
+    user_data
+        .get::<DetectedSubpixel>()
+        .map_or_else(|| output.physical_properties().subpixel, |detected| detected.0)
+}
+
 impl ShojiWM {
     fn output_auto_sort_key(output_name: &str) -> (i32, String) {
         let rank = if output_name.starts_with("eDP")
@@ -1761,6 +1780,9 @@ impl ShojiWM {
     }
 
     pub fn create_output_global(&mut self, output: &Output) -> GlobalId {
+        // Before any client can bind, and before any display config can call
+        // set_subpixel: the value the output was created with is the kernel's.
+        detected_subpixel(output);
         let output_name = output.name();
         if let Some(global) = self.runtime_output_globals.get(&output_name) {
             return global.clone();
@@ -2621,6 +2643,8 @@ impl ShojiWM {
                                     max_bandwidth_gbps: link.max_bandwidth_gbps(),
                                 }
                             }),
+                        subpixel: physical.subpixel.into(),
+                        detected_subpixel: detected_subpixel(&output).into(),
                     },
                 )
             })
