@@ -28,6 +28,7 @@ import type {
   InputAccelProfile,
   InputScrollMethod,
   ManagedWindowRect,
+  OutputSubpixel,
 } from "shoji_wm/types";
 import { 
     createIpcServer, 
@@ -48,6 +49,32 @@ interface MinkaDisplaySettings {
   hdrMaxLuminance?: number;
   /// Real black level of the panel, cd/m². Ignored outside 0..=10.
   hdrMinLuminance?: number;
+  /// Physical subpixel layout of the panel. `null` (MinkaConf's "detected")
+  /// and absent both keep what the kernel reported.
+  subpixel?: OutputSubpixel | null;
+}
+
+const OUTPUT_SUBPIXELS: ReadonlySet<string> = new Set<OutputSubpixel>([
+  "unknown",
+  "none",
+  "horizontal-rgb",
+  "horizontal-bgr",
+  "vertical-rgb",
+  "vertical-bgr",
+]);
+
+// The compositor parses the layout strictly, and one unrecognised value would
+// fail the whole runtime response rather than just this key. MinkaConf only
+// writes valid names, so this guards hand edits: drop the value and say so.
+function subpixelSetting(name: string, value: unknown): OutputSubpixel | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value === "string" && OUTPUT_SUBPIXELS.has(value)) {
+    return value as OutputSubpixel;
+  }
+  console.warn(`minka-settings: ignoring unknown subpixel layout for ${name}:`, value);
+  return undefined;
 }
 
 interface MinkaInputSettings {
