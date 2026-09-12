@@ -2662,6 +2662,20 @@ impl ShojiWM {
         outputs.into_values().collect()
     }
 
+    /// Advertise each output's subpixel layout: the display config's when it
+    /// names one, the detected one otherwise. Runs on every display config
+    /// apply and hotplug, so deleting the setting restores the detected value.
+    fn apply_runtime_output_subpixels(&self, outputs: &[Output]) {
+        for output in outputs {
+            let detected = detected_subpixel(output);
+            let configured = self
+                .runtime_output_configs
+                .get(&output.name())
+                .and_then(|config| config.subpixel);
+            output.set_subpixel(crate::config::resolve_output_subpixel(configured, detected));
+        }
+    }
+
     fn runtime_output_mode_setting(&self, output_name: &str) -> RuntimeOutputMode {
         self.runtime_output_configs
             .get(output_name)
@@ -2800,6 +2814,8 @@ impl ShojiWM {
         if outputs.is_empty() {
             return;
         }
+
+        self.apply_runtime_output_subpixels(&outputs);
 
         let mut extend_output_names = outputs
             .iter()
