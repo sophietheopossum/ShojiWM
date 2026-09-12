@@ -929,7 +929,11 @@ COMPOSITOR.output.configure((context) => {
       continue;
     }
     if (entry?.mirror) {
-      display[name] = { mode: "mirror", source: entry.mirror };
+      display[name] = {
+        mode: "mirror",
+        source: entry.mirror,
+        subpixel: subpixelSetting(name, entry.subpixel),
+      };
       continue;
     }
     display[name] = {
@@ -964,6 +968,9 @@ COMPOSITOR.output.configure((context) => {
       // own constants, so an absent key must stay absent rather than become 0.
       hdrMaxLuminance: entry?.hdrMaxLuminance,
       hdrMinLuminance: entry?.hdrMinLuminance,
+      // Omitted when unset, like the luminance fields: the compositor then
+      // keeps the layout the kernel reported.
+      subpixel: subpixelSetting(name, entry?.subpixel),
     };
   }
 
