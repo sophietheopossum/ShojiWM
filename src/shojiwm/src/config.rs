@@ -39,6 +39,10 @@ pub struct RuntimeOutputConfig {
     pub hdr_max_luminance: Option<f32>,
     /// Real black level of the display in cd/m². Same caveat.
     pub hdr_min_luminance: Option<f32>,
+    /// Physical subpixel layout of the panel, advertised to clients in
+    /// `wl_output.geometry`. Unset keeps what the kernel reported for the
+    /// connector, which is `unknown` for most panels.
+    pub subpixel: Option<RuntimeOutputSubpixel>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
