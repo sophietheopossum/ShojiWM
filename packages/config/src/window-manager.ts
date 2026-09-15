@@ -2216,6 +2216,41 @@ export class HybridWindowManager {
   }
 
   /**
+   * Dock drag-to-reorder (IPC `windows.reorder`): put `windowId` directly
+   * before `beforeId` in its own workspace's window order, or last when
+   * `beforeId` is null. An anchor in another workspace is refused, so a
+   * reorder never moves a window between workspaces or monitors. Refused while
+   * a pointer tile drag is live on that workspace: the drag owns the tile
+   * order until it ends. Checked on the live grab rather than
+   * `Workspace.draggingWindowId`, which a tiling toggle mid-drag can leave set.
+   */
+  public reorderWindowById(
+    windowId: string,
+    beforeId: string | null,
+  ): "moved" | "unchanged" | "refused" {
+    const window = this.findWindowById(windowId);
+    const workspace = window ? this.findWorkspaceForWindow(window) : undefined;
+    if (!window || !workspace) {
+      return "refused";
+    }
+    if (this.isGrabbing && this.tileDrag?.workspace === workspace) {
+      return "refused";
+    }
+    const before =
+      beforeId === null ? null : workspace.findWindowById(beforeId);
+    if (before === undefined) {
+      return "refused";
+    }
+    return withManagedWindowOnlySSDRebuildSuppressed(() => {
+      const outcome = workspace.moveWindowBefore(window, before);
+      if (outcome === "moved") {
+        this.applyWorkspaceStackPolicy(workspace);
+      }
+      return outcome;
+    });
+  }
+
+  /**
    * Activate a specific workspace on a monitor (external/IPC entry point).
    * Plays the same slide/fade transition as keyboard/gesture switching.
    */
@@ -3668,6 +3703,13 @@ export class Workspace {
     string,
     WorkspaceWindowSnapshot
   >();
+  // Hot-reload restore order: each restored window's snapshot position and
+  // the ids still waiting to re-enter. Restored windows come back through
+  // addWindow in whatever order the runtime re-announces them, so without
+  // this every Super+Shift+R reshuffles the window order (tiles, Alt+Tab,
+  // the dock).
+  private readonly restoreRankById = new Map<string, number>();
+  private readonly restorePendingIds = new Set<string>();
   private activeWindowId: string | null = null;
   private visibilityAnimationToken = 0;
   private draggingWindowId: string | null = null;
@@ -3753,6 +3795,9 @@ export class Workspace {
         ? this.tileInsertionIndexAfterFocusedWindow()
         : null;
     this.windows.push(window);
+    if (restored && this.restorePendingIds.delete(window.id)) {
+      this.placeRestoredWindow(window);
+    }
     if (tileInsertionIndex !== null) {
       this.moveTileWindowToIndex(window, tileInsertionIndex);
     }
@@ -3992,6 +4037,54 @@ export class Workspace {
     this.applyLayout();
     focused.focus();
     return true;
+  }
+
+  /**
+   * Place `window` directly before `before` in this workspace's window order,
+   * or last when `before` is null. That order is the left-to-right tile
+   * sequence on a tiled workspace and the Alt+Tab ring on every workspace;
+   * MinkaShell's dock drag-to-reorder drives it through `windows.reorder`.
+   * Never focuses. Refused when either window is not in this workspace; the
+   * caller refuses while a pointer tile drag owns the tile order.
+   */
+  public moveWindowBefore(
+    window: WaylandWindow,
+    before: WaylandWindow | null,
+  ): "moved" | "unchanged" | "refused" {
+    const from = this.windows.findIndex((current) => current.id === window.id);
+    const beforeId = before === null ? null : before.id;
+    if (
+      from < 0 ||
+      (before !== null && (beforeId === window.id || !this.hasWindow(before)))
+    ) {
+      return "refused";
+    }
+    const tileOrder = this.tileableWindows()
+      .map((current) => current.id)
+      .join(" ");
+    this.windows.splice(from, 1);
+    const to =
+      beforeId === null
+        ? this.windows.length
+        : this.windows.findIndex((current) => current.id === beforeId);
+    this.windows.splice(to, 0, window);
+    if (to === from) {
+      return "unchanged";
+    }
+    const tiles = this.tileableWindows();
+    if (
+      this.isTiled &&
+      tiles.map((current) => current.id).join(" ") !== tileOrder
+    ) {
+      this.stopKineticScroll();
+      this.markTileReordering(window);
+      const active = this.activeWindow(tiles);
+      if (active) {
+        this.scrollToWindow(active);
+      }
+      this.applyLayout();
+    }
+    return "moved";
   }
 
   private markTileReordering(window: WaylandWindow): void {
@@ -5066,6 +5159,12 @@ export class Workspace {
     this.scrollOffset = snapshot.scrollOffset;
     this.tileWidthByWindowId.clear();
     this.restoredWindowStateById.clear();
+    this.restoreRankById.clear();
+    this.restorePendingIds.clear();
+    snapshot.windows.forEach((window, rank) => {
+      this.restoreRankById.set(window.id, rank);
+      this.restorePendingIds.add(window.id);
+    });
     for (const window of snapshot.windows) {
       if (window.tileWidth !== undefined) {
         this.tileWidthByWindowId.set(window.id, window.tileWidth);
@@ -5084,6 +5183,27 @@ export class Workspace {
 
   public getWindows(): WaylandWindow[] {
     return Array.from(this.windows);
+  }
+
+  /**
+   * Put a window re-entering after a hot reload back in its snapshot position:
+   * before the first window already present that ranked after it. Windows
+   * opened during the reload have no rank and keep their place.
+   */
+  private placeRestoredWindow(window: WaylandWindow): void {
+    const rank = this.restoreRankById.get(window.id);
+    const at = this.windows.findIndex((current) => current.id === window.id);
+    if (rank === undefined || at < 0) {
+      return;
+    }
+    this.windows.splice(at, 1);
+    const next = this.windows.findIndex(
+      (current) => (this.restoreRankById.get(current.id) ?? -1) > rank,
+    );
+    this.windows.splice(next < 0 ? this.windows.length : next, 0, window);
+    if (this.restorePendingIds.size === 0) {
+      this.restoreRankById.clear();
+    }
   }
 
   private snapshotWindow(window: WaylandWindow): WorkspaceWindowSnapshot {

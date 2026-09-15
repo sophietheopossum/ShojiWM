@@ -238,6 +238,7 @@ COMPOSITOR.onEnable((event) => {
 //   workspaces.toggleTiling  { monitor?: string }                  (command)
 //   workspaces.changed       -> WorkspacesView                     (broadcast)
 //   windows.activate         { windowId: string }                  (command)
+//   windows.reorder          { windowId, beforeId: string|null }   -> {ok, changed} (request/response)
 //   windows.setRect          { windowId, x, y, width, height }     (request/response)
 //   dock.proximity           { monitor: string, inside: bool }    (broadcast)
 // ---------------------------------------------------------------------------
@@ -418,6 +419,30 @@ WORKSPACE_IPC.handle("windows.close", (params) => {
     HYBRID_WINDOW_MANAGER.closeWindowById(windowId);
     scheduleWorkspaceBroadcast();
   }
+});
+// Dock drag-to-reorder (MinkaShell, 15/9/2026): put `windowId` directly
+// before `beforeId` in its own workspace's window order, or last when
+// `beforeId` is null. That order is the tile sequence on a tiled workspace
+// and the Alt+Tab ring everywhere. Never crosses workspaces, never focuses;
+// refused during a pointer tile drag. ok with changed:false is a no-op.
+WORKSPACE_IPC.handle("windows.reorder", (params) => {
+  const request = params as
+    | { windowId?: string; beforeId?: string | null }
+    | undefined;
+  if (
+    typeof request?.windowId !== "string" ||
+    (request.beforeId !== null && typeof request.beforeId !== "string")
+  ) {
+    return { ok: false, changed: false };
+  }
+  const outcome = HYBRID_WINDOW_MANAGER.reorderWindowById(
+    request.windowId,
+    request.beforeId,
+  );
+  if (outcome === "moved") {
+    scheduleWorkspaceBroadcast();
+  }
+  return { ok: outcome !== "refused", changed: outcome === "moved" };
 });
 // Client-declared semantic window roles ("typed segments", ported from
 // Arcan's SHMIF idea), for example: Minka apps claim what a window *is* — e.g.
