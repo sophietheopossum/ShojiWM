@@ -5010,10 +5010,15 @@ export class Workspace {
    *
    * "Within the screen" is measured against the usable area, not the tile
    * viewport: the viewport is inset by TILE_MARGIN for cosmetic spacing, and
-   * content inside that margin is still on screen. Maximized tiles in
-   * particular are wider than the viewport by design (MAXIMIZED_WINDOW_PADDING
-   * < TILE_MARGIN), so an inset-viewport check would eat one key press on a
-   * 4px invisible pan for every fully-visible maximized tile.
+   * content inside that margin is still on screen. Maximized tiles fill the
+   * usable area edge to edge, so they are exactly TILE_MARGIN wider than the
+   * viewport on each side; an inset-viewport check would eat one key press on
+   * an invisible pan for every fully-visible maximized tile.
+   *
+   * That also means a fully-visible maximized tile computes an overflow of
+   * exactly 0, leaving only TILE_FOCUS_OVERFLOW_EPSILON of slack for rounding
+   * (scrollOffset is quantised to physical pixels, so a fractional scale
+   * carries a fraction of a logical pixel here).
    */
   private panActiveTileIntoView(
     tileable: WaylandWindow[],
