@@ -552,6 +552,19 @@ fn op_shoji_path_exists(#[string] path: &str) -> bool {
     std::path::Path::new(path).exists()
 }
 
+/// Read a UTF-8 file for a config.
+///
+/// The runtime is built against RustyScript's `web` feature only, so configs
+/// have neither `node:fs` nor Deno's own fs extension — reading a settings or
+/// theme file next to the config is otherwise impossible. Keep this a narrow
+/// read rather than enabling the `fs` feature, which would also pull in
+/// `io`/`deno_process` and hand configs the whole filesystem API.
+#[op2]
+#[string]
+fn op_shoji_read_text_file(#[string] path: &str) -> Result<String, std::io::Error> {
+    std::fs::read_to_string(path)
+}
+
 #[op2(fast)]
 fn op_shoji_remove_unix_socket(#[string] path: &str) -> Result<bool, std::io::Error> {
     let metadata = match std::fs::symlink_metadata(path) {
@@ -2187,6 +2200,7 @@ extension!(
         op_shoji_environment,
         op_shoji_current_dir,
         op_shoji_path_exists,
+        op_shoji_read_text_file,
         op_shoji_remove_unix_socket,
         op_shoji_ipc_listen,
         op_shoji_process_id,
