@@ -2213,7 +2213,14 @@ impl ShojiWM {
         let tick = match self.decoration_evaluator.scheduler_tick(now_ms) {
             Ok(tick) => tick,
             Err(error) => {
-                debug!(?error, "failed to tick decoration runtime scheduler");
+                // This latches the full-screen config-error overlay and turns
+                // the scheduler off until the next successful reload, so it is
+                // not a debug-level event: at debug it left no trace at all
+                // while both outputs showed an error box.
+                warn!(
+                    ?error,
+                    "failed to tick decoration runtime scheduler; disabling it until the next reload"
+                );
                 self.config_error_report =
                     Some(crate::config_error::ConfigErrorReport::runtime(error));
                 self.schedule_redraw();

@@ -2237,14 +2237,37 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
         }
       }
     } catch (error) {
+      // A failing request latches the compositor's config-error overlay and
+      // disables the scheduler, so record everything that identifies the
+      // throw. `error.stack` alone loses the type, and a thrown non-Error
+      // loses the shape entirely -- both have reached users as a single
+      // unattributable line.
+      const detail =
+        error instanceof Error
+          ? [
+              `${error.name}: ${error.message}`,
+              error.stack ?? "(no stack)",
+              error.cause === undefined ? "" : `cause: ${String(error.cause)}`,
+            ]
+              .filter((part) => part.length > 0)
+              .join("\n")
+          : `thrown ${typeof error}: ${String(error)}`;
+      const windowId =
+        "windowId" in request
+          ? request.windowId
+          : "snapshot" in request
+            ? request.snapshot?.id
+            : undefined;
+      console.error(
+        `runtime request failed kind=${request.kind} requestId=${request.requestId}` +
+          (windowId === undefined ? "" : ` windowId=${windowId}`),
+        detail,
+      );
       await writeResponse(embeddedBridge, {
         requestId: request.requestId,
         ok: false,
         kind: request.kind,
-        error:
-          error instanceof Error
-            ? (error.stack ?? error.message)
-            : String(error),
+        error: detail,
         displayConfig: pendingDisplayConfigPayload(),
         workspaceConfig: pendingWorkspaceConfigPayload(),
       });
