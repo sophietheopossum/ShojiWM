@@ -278,6 +278,7 @@ pub struct ShojiWM {
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub screencopy_state: crate::protocols::screencopy::ScreencopyManagerState,
     pub tearing_control_state: crate::protocols::tearing_control::TearingControlManagerState,
+    pub color_management_state: crate::protocols::color_management::ColorManagementState,
     pub foreign_toplevel_list_state:
         smithay::wayland::foreign_toplevel_list::ForeignToplevelListState,
     pub wlr_foreign_toplevel_manager_state:
@@ -362,6 +363,10 @@ pub struct ShojiWM {
     pub runtime_scheduler_kick_interval_ms: Option<u64>,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
     pub runtime_output_globals: HashMap<String, GlobalId>,
+    /// Per-output color mode/signal state, keyed by output name (tty only).
+    pub output_color: HashMap<String, crate::color::OutputColorState>,
+    /// Per-output fp16 composite + PQ encode state for HDR10 outputs.
+    pub hdr_pipelines: HashMap<String, crate::backend::hdr_pipeline::HdrPipeline>,
     pub managed_window_animations: HashMap<String, BTreeMap<String, ActiveManagedWindowAnimation>>,
     pub managed_window_animation_sequence: u64,
     pub runtime_output_configs: std::collections::BTreeMap<String, RuntimeOutputConfig>,
@@ -543,6 +548,29 @@ fn logical_rect_intersects_output(rect: LogicalRect, output_geo: Rectangle<i32, 
     right > left && bottom > top
 }
 
+/// The subpixel layout an output was created with, i.e. what the kernel
+/// reported for its connector.
+///
+/// `Output::set_subpixel` overwrites the only other copy, so the value is
+/// recorded in `create_output_global`, which every backend calls right after
+/// `Output::new`. The first read records it too, as a fallback for an output
+/// that somehow reaches `apply_runtime_output_subpixels` without a global.
+#[derive(Debug, Clone, Copy)]
+struct DetectedSubpixel(smithay::output::Subpixel);
+
+fn detected_subpixel(output: &Output) -> smithay::output::Subpixel {
+    let user_data = output.user_data();
+    user_data.insert_if_missing_threadsafe(|| {
+        DetectedSubpixel(output.physical_properties().subpixel)
+    });
+    user_data
+        .get::<DetectedSubpixel>()
+        .map_or_else(
+            || output.physical_properties().subpixel,
+            |detected| detected.0,
+        )
+}
+
 impl ShojiWM {
     fn output_auto_sort_key(output_name: &str) -> (i32, String) {
         let rank = if output_name.starts_with("eDP")
@@ -605,7 +633,9 @@ impl ShojiWM {
             &smithay::input::pointer::MotionEvent {
                 location,
                 serial: SERIAL_COUNTER.next_serial(),
-                time: Duration::from(self.clock.now()).as_millis() as u32,
+                time: smithay::backend::input::InputTime::from_millis(
+                    Duration::from(self.clock.now()).as_millis() as u32,
+                ),
             },
         );
         pointer.frame(self);
@@ -1409,6 +1439,8 @@ impl ShojiWM {
             crate::protocols::screencopy::ScreencopyManagerState::new::<Self, _>(&dh, |_| true);
         let tearing_control_state =
             crate::protocols::tearing_control::TearingControlManagerState::new::<Self>(&dh);
+        let color_management_state =
+            crate::protocols::color_management::ColorManagementState::new::<Self>(&dh);
         let foreign_toplevel_list_state =
             smithay::wayland::foreign_toplevel_list::ForeignToplevelListState::new::<Self>(&dh);
         let wlr_foreign_toplevel_manager_state =
@@ -1597,6 +1629,7 @@ impl ShojiWM {
             fractional_scale_manager_state,
             screencopy_state,
             tearing_control_state,
+            color_management_state,
             foreign_toplevel_list_state,
             wlr_foreign_toplevel_manager_state,
             ext_workspace_manager_state,
@@ -1664,6 +1697,8 @@ impl ShojiWM {
             runtime_scheduler_kick_interval_ms: None,
             runtime_animation_outputs: Default::default(),
             runtime_output_globals: Default::default(),
+            output_color: Default::default(),
+            hdr_pipelines: Default::default(),
             managed_window_animations: Default::default(),
             managed_window_animation_sequence: 0,
             runtime_output_configs: Default::default(),
@@ -1768,6 +1803,9 @@ impl ShojiWM {
     }
 
     pub fn create_output_global(&mut self, output: &Output) -> GlobalId {
+        // Before any client can bind, and before any display config can call
+        // set_subpixel: the value the output was created with is the kernel's.
+        detected_subpixel(output);
         let output_name = output.name();
         if let Some(global) = self.runtime_output_globals.get(&output_name) {
             return global.clone();
@@ -2564,15 +2602,32 @@ impl ShojiWM {
             .map(|output| {
                 let name = output.name();
                 let physical = output.physical_properties();
-                let available_modes = tty_output_available_modes(self, &name)
-                    .unwrap_or_else(|| output.modes())
-                    .into_iter()
-                    .map(|mode| OutputModeSnapshot {
-                        width: mode.size.w,
-                        height: mode.size.h,
-                        refresh_rate: mode.refresh as f64 / 1000.0,
-                    })
-                    .collect::<Vec<_>>();
+                // Prefer the DRM-backed list, which still carries each mode's
+                // pixel clock; fall back to the wl_output modes (no clock) for
+                // backends with no DRM behind them.
+                let available_modes = match crate::backend::tty::
+                    tty_output_available_mode_clocks(self, &name)
+                {
+                    Some(modes) => modes
+                        .into_iter()
+                        .map(|(mode, clock_khz)| OutputModeSnapshot {
+                            width: mode.size.w,
+                            height: mode.size.h,
+                            refresh_rate: mode.refresh as f64 / 1000.0,
+                            clock_khz: Some(clock_khz),
+                        })
+                        .collect::<Vec<_>>(),
+                    None => tty_output_available_modes(self, &name)
+                        .unwrap_or_else(|| output.modes())
+                        .into_iter()
+                        .map(|mode| OutputModeSnapshot {
+                            width: mode.size.w,
+                            height: mode.size.h,
+                            refresh_rate: mode.refresh as f64 / 1000.0,
+                            clock_khz: None,
+                        })
+                        .collect::<Vec<_>>(),
+                };
                 // Report the mode size in the output's transformed orientation
                 // so config-side logical-size math (`resolution / scale`) stays
                 // correct on rotated outputs. `availableModes` stay physical.
@@ -2583,6 +2638,7 @@ impl ShojiWM {
                         width: size.w,
                         height: size.h,
                         refresh_rate: mode.refresh as f64 / 1000.0,
+                        clock_khz: None,
                     }
                 });
                 let location = output.current_location();
@@ -2604,6 +2660,25 @@ impl ShojiWM {
                         scale: output.current_scale().fractional_scale(),
                         transform: transform.into(),
                         available_modes,
+                        hdr_supported: self
+                            .output_color
+                            .get(
+                                &name,
+                            )
+                            .is_some_and(|color| color.edid_hdr.is_some()),
+                        hdmi: self
+                            .output_color
+                            .get(&name)
+                            .and_then(|color| color.hdmi_link)
+                            .map(|link| {
+                                crate::ssd::HdmiLinkSnapshot {
+                                    standard: link.standard(),
+                                    max_tmds_khz: link.max_tmds_khz,
+                                    max_bandwidth_gbps: link.max_bandwidth_gbps(),
+                                }
+                            }),
+                        subpixel: physical.subpixel.into(),
+                        detected_subpixel: detected_subpixel(&output).into(),
                     },
                 )
             })
@@ -2619,6 +2694,20 @@ impl ShojiWM {
             outputs.insert(output.name(), output);
         }
         outputs.into_values().collect()
+    }
+
+    /// Advertise each output's subpixel layout: the display config's when it
+    /// names one, the detected one otherwise. Runs on every display config
+    /// apply and hotplug, so deleting the setting restores the detected value.
+    fn apply_runtime_output_subpixels(&self, outputs: &[Output]) {
+        for output in outputs {
+            let detected = detected_subpixel(output);
+            let configured = self
+                .runtime_output_configs
+                .get(&output.name())
+                .and_then(|config| config.subpixel);
+            output.set_subpixel(crate::config::resolve_output_subpixel(configured, detected));
+        }
     }
 
     fn runtime_output_mode_setting(&self, output_name: &str) -> RuntimeOutputMode {
@@ -2741,6 +2830,15 @@ impl ShojiWM {
                 }
             }
         }
+        // The HDR opt-in lives in this config: widen/narrow the protocol
+        // advertisement and re-resolve connected outputs, which connect
+        // before the TypeScript config evaluates.
+        crate::color::set_session_hdr_configured(
+            self.runtime_output_configs
+                .values()
+                .any(|config| config.hdr == Some(true)),
+        );
+        crate::backend::tty::refresh_tty_output_color_modes(self);
         self.apply_runtime_display_configuration();
         self.notify_runtime_outputs_changed();
     }
@@ -2750,6 +2848,8 @@ impl ShojiWM {
         if outputs.is_empty() {
             return;
         }
+
+        self.apply_runtime_output_subpixels(&outputs);
 
         let mut extend_output_names = outputs
             .iter()
@@ -2872,6 +2972,7 @@ impl ShojiWM {
                 smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown,
             );
             self.output_capture_mirrors.remove(&name);
+            self.hdr_pipelines.remove(&name);
             self.runtime_animation_outputs.remove(&name);
             self.layer_effect_evaluation_cache.remove(&name);
             self.popup_effect_evaluation_cache.remove(&name);
@@ -4819,5 +4920,78 @@ mod wayland_client_identity_tests {
         let (peer_state, pending_error) = identity.socket_disconnect_diagnostic();
         assert_eq!(peer_state, "peer-open-pending-data:1");
         assert_eq!(pending_error, None);
+    }
+}
+
+#[cfg(test)]
+mod subpixel_latch_tests {
+    use super::detected_subpixel;
+    use crate::config::{resolve_output_subpixel, RuntimeOutputSubpixel};
+    use smithay::output::{Output, PhysicalProperties, Subpixel};
+
+    fn output_with_detected(subpixel: Subpixel) -> Output {
+        Output::new(
+            "TEST-1".to_owned(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel,
+                make: "test".to_owned(),
+                model: "test".to_owned(),
+                serial_number: "test".to_owned(),
+            },
+        )
+    }
+
+    /// `set_subpixel` overwrites the only copy of the connector's own layout, so
+    /// the detected value has to be latched before anything overrides it —
+    /// otherwise clearing the setting could not restore it.
+    #[test]
+    fn detected_layout_survives_an_override() {
+        let output = output_with_detected(Subpixel::HorizontalRgb);
+        assert_eq!(detected_subpixel(&output), Subpixel::HorizontalRgb);
+
+        output.set_subpixel(Subpixel::VerticalBgr);
+
+        assert_eq!(output.physical_properties().subpixel, Subpixel::VerticalBgr);
+        assert_eq!(detected_subpixel(&output), Subpixel::HorizontalRgb);
+    }
+
+    /// What `apply_runtime_output_subpixels` does per output: configure a layout,
+    /// then delete the setting and get the connector's own layout back.
+    #[test]
+    fn clearing_the_setting_restores_the_detected_layout() {
+        let output = output_with_detected(Subpixel::HorizontalRgb);
+
+        let configured = Some(RuntimeOutputSubpixel::VerticalRgb);
+        output.set_subpixel(resolve_output_subpixel(
+            configured,
+            detected_subpixel(&output),
+        ));
+        assert_eq!(output.physical_properties().subpixel, Subpixel::VerticalRgb);
+
+        output.set_subpixel(resolve_output_subpixel(None, detected_subpixel(&output)));
+        assert_eq!(
+            output.physical_properties().subpixel,
+            Subpixel::HorizontalRgb
+        );
+    }
+
+    /// The common case: the kernel reports nothing useful, so the setting is the
+    /// only source of a layout, and removing it goes back to `unknown`.
+    #[test]
+    fn an_unknown_connector_takes_the_configured_layout() {
+        let output = output_with_detected(Subpixel::Unknown);
+
+        output.set_subpixel(resolve_output_subpixel(
+            Some(RuntimeOutputSubpixel::HorizontalBgr),
+            detected_subpixel(&output),
+        ));
+        assert_eq!(
+            output.physical_properties().subpixel,
+            Subpixel::HorizontalBgr
+        );
+
+        output.set_subpixel(resolve_output_subpixel(None, detected_subpixel(&output)));
+        assert_eq!(output.physical_properties().subpixel, Subpixel::Unknown);
     }
 }
