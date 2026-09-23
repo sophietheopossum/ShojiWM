@@ -834,9 +834,9 @@ function toggleStartMenu() {
     action: "toggle",
   });
 }
-COMPOSITOR.key.bind("launcher", "Super+A", toggleLauncher);
+COMPOSITOR.key.bind("start-menu", "Super+A", toggleStartMenu);
 // Super tap (fires on release only, when no other key/button was pressed in between).
-COMPOSITOR.key.bind("launcher-tap", "Super", toggleLauncher, {
+COMPOSITOR.key.bind("start-menu-tap", "Super", toggleStartMenu, {
   on: "release",
 });
 // Clipboard UI was dropped with shoji-bar-2 (Sophie's call); the cliphist
@@ -1130,13 +1130,7 @@ const LAYER_BLUR_MASK = compileLayerEffect({
 });
 
 COMPOSITOR.effect.layer = (layer) => {
-  const namespace = layer.namespace();
-  // Both the LiquidIsland experiment and shoji-bar-3 draw only a translucent
-  // silhouette and let the compositor recover the shape from its alpha.
-  if (namespace === "liquid-island-qs" || namespace === "shoji-bar-3") {
-    return { behind: ISLAND_GLASS };
-  }
-  if (namespace === "no_blur") {
+  if (layer.namespace() === "no_blur") {
     return {};
   }
 
