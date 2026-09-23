@@ -633,7 +633,9 @@ impl ShojiWM {
             &smithay::input::pointer::MotionEvent {
                 location,
                 serial: SERIAL_COUNTER.next_serial(),
-                time: Duration::from(self.clock.now()).as_millis() as u32,
+                time: smithay::backend::input::InputTime::from_millis(
+                    Duration::from(self.clock.now()).as_millis() as u32,
+                ),
             },
         );
         pointer.frame(self);
