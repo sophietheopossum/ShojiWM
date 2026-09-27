@@ -23,7 +23,7 @@ use smithay::utils::{Logical, Rectangle};
 use smithay::utils::{Serial, SERIAL_COUNTER};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::{
-    PointerConstraintsHandler, with_pointer_constraint,
+    ConstraintRemove, PointerConstraintsHandler, with_pointer_constraint,
 };
 use smithay::wayland::background_effect::{Capability, ExtBackgroundEffectHandler};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, ImportNotifier};
@@ -176,7 +176,13 @@ impl PointerConstraintsHandler for ShojiWM {
         });
     }
 
-    fn remove_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
+    fn remove_constraint(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &PointerHandle<Self>,
+        _constraint_remove: ConstraintRemove,
+    ) {
+    }
 
     fn cursor_position_hint(
         &mut self,
