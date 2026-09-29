@@ -123,8 +123,8 @@ use crate::ssd::{
     WindowPositionSnapshot,
 };
 use crate::xwayland_satellite::{
-    EmbeddedSatellite, SatelliteEvent, SatelliteInstance, SatelliteMode,
-    reserve_embedded_satellite, satellite_mode, spawn_external_satellite,
+    SatelliteEvent, SatelliteInstance, SatelliteMode, reserve_embedded_satellite, satellite_mode,
+    spawn_external_satellite,
 };
 use crate::{
     backend::{
@@ -2047,8 +2047,22 @@ impl ShojiWM {
         &mut self,
         event_loop: &EventLoop<'static, ShojiWM>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let instance = reserve_embedded_satellite(Self::satellite_event_channel(event_loop)?)?;
+        self.export_satellite_display(&instance);
+        self.xwayland_satellite = Some(instance);
+        self.run_embedded_satellite();
+        Ok(())
+    }
+
+    /// A channel whose events (satellite ready or gone) reach
+    /// `handle_satellite_event` on the event loop.
+    fn satellite_event_channel(
+        event_loop: &EventLoop<'static, ShojiWM>,
+    ) -> Result<
+        smithay::reexports::calloop::channel::Sender<SatelliteEvent>,
+        Box<dyn std::error::Error>,
+    > {
         let (sender, receiver) = smithay::reexports::calloop::channel::channel();
-        let instance = reserve_embedded_satellite(sender)?;
         event_loop
             .handle()
             .insert_source(receiver, |event, _, state| {
@@ -2057,10 +2071,40 @@ impl ShojiWM {
                 }
             })
             .map_err(|error| error.error)?;
+        Ok(sender)
+    }
+
+    /// Start xwayland-satellite as a separate process, respawned by the event
+    /// loop whenever it exits.
+    fn start_external_satellite(
+        &mut self,
+        event_loop: &EventLoop<'static, ShojiWM>,
+        path: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let instance = spawn_external_satellite(path, Self::satellite_event_channel(event_loop)?)?;
         self.export_satellite_display(&instance);
+        info!(
+            display = %instance.display_name,
+            path = %path.display(),
+            "external xwayland-satellite started, DISPLAY exported"
+        );
         self.xwayland_satellite = Some(instance);
-        self.run_embedded_satellite();
         Ok(())
+    }
+
+    /// Respawn the external satellite process.
+    fn run_external_satellite(&mut self) {
+        let Some(external) = self
+            .xwayland_satellite
+            .as_mut()
+            .and_then(|instance| instance.external.as_mut())
+        else {
+            return;
+        };
+        if let Err(error) = external.start() {
+            warn!(?error, path = %external.path().display(), "failed to respawn xwayland-satellite");
+            self.schedule_satellite_restart();
+        }
     }
 
     /// Start (or restart) the embedded satellite's thread and connect it.
@@ -2106,8 +2150,7 @@ impl ShojiWM {
         let current = self
             .xwayland_satellite
             .as_ref()
-            .and_then(|instance| instance.embedded.as_ref())
-            .map(EmbeddedSatellite::generation);
+            .and_then(SatelliteInstance::generation);
         match event {
             SatelliteEvent::Ready {
                 generation,
@@ -2151,6 +2194,13 @@ impl ShojiWM {
                     self.give_up_embedded_satellite();
                 }
             }
+            SatelliteEvent::ProcessExited { generation, status } if Some(generation) == current => {
+                // Xwayland goes with it (its Wayland connection was to satellite), and
+                // X11 apps with Xwayland; a respawn on the same DISPLAY lets new ones
+                // start again without restarting the session.
+                warn!(generation, ?status, "external xwayland-satellite exited");
+                self.schedule_satellite_restart();
+            }
             event => debug!(
                 ?event,
                 "ignoring event from a previous xwayland-satellite run"
@@ -2173,19 +2223,29 @@ impl ShojiWM {
     }
 
     fn schedule_satellite_restart(&mut self) {
-        let Some(embedded) = self
-            .xwayland_satellite
-            .as_mut()
-            .and_then(|instance| instance.embedded.as_mut())
-        else {
+        let Some(instance) = self.xwayland_satellite.as_mut() else {
             return;
         };
-        let delay = embedded.next_restart_delay();
-        info!(?delay, "restarting embedded xwayland-satellite");
+        let (delay, external) = if let Some(embedded) = instance.embedded.as_mut() {
+            (embedded.next_restart_delay(), false)
+        } else if let Some(external) = instance.external.as_mut() {
+            (external.next_restart_delay(), true)
+        } else {
+            return;
+        };
+        info!(
+            ?delay,
+            mode = if external { "external" } else { "embedded" },
+            "restarting xwayland-satellite"
+        );
         if let Err(error) = self.loop_handle.insert_source(
             smithay::reexports::calloop::timer::Timer::from_duration(delay),
-            |_, _, state| {
-                state.run_embedded_satellite();
+            move |_, _, state| {
+                if external {
+                    state.run_external_satellite();
+                } else {
+                    state.run_embedded_satellite();
+                }
                 smithay::reexports::calloop::timer::TimeoutAction::Drop
             },
         ) {
@@ -2206,24 +2266,17 @@ impl ShojiWM {
                     "failed to start embedded xwayland-satellite, falling back to built-in XWayland"
                 ),
             },
-            Some(SatelliteMode::External(path)) => match spawn_external_satellite(&path) {
-                Ok(instance) => {
-                    self.export_satellite_display(&instance);
-                    info!(
-                        display = %instance.display_name,
-                        path = %path.display(),
-                        "external xwayland-satellite started, DISPLAY exported"
-                    );
-                    self.xwayland_satellite = Some(instance);
-                    return;
+            Some(SatelliteMode::External(path)) => {
+                match self.start_external_satellite(event_loop, &path) {
+                    Ok(()) => return,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "failed to start xwayland-satellite, falling back to built-in XWayland"
+                        );
+                    }
                 }
-                Err(error) => {
-                    warn!(
-                        ?error,
-                        "failed to start xwayland-satellite, falling back to built-in XWayland"
-                    );
-                }
-            },
+            }
             None => {}
         }
 
