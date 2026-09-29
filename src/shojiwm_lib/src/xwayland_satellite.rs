@@ -17,7 +17,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -32,8 +32,22 @@ pub struct SatelliteInstance {
     pub display_number: u32,
     /// Present when satellite runs in-process; it keeps what a restart needs.
     pub embedded: Option<EmbeddedSatellite>,
+    /// Present when satellite runs as a separate process; it keeps what a
+    /// respawn needs.
+    pub external: Option<ExternalSatellite>,
     _unix_guard: UnlinkGuard,
     _lock_guard: UnlinkGuard,
+}
+
+impl SatelliteInstance {
+    /// The current run, whichever way satellite runs, so an event from an
+    /// older one can be told apart.
+    pub fn generation(&self) -> Option<u64> {
+        self.embedded
+            .as_ref()
+            .map(EmbeddedSatellite::generation)
+            .or_else(|| self.external.as_ref().map(ExternalSatellite::generation))
+    }
 }
 
 struct UnlinkGuard(PathBuf);
@@ -89,9 +103,11 @@ pub fn satellite_requested() -> bool {
     satellite_mode().is_some()
 }
 
-/// Start xwayland-satellite as a separate process running `path`.
+/// Start xwayland-satellite as a separate process running `path`. Its exit is
+/// reported through `events`, so the compositor can start it again.
 pub fn spawn_external_satellite(
     path: &Path,
+    events: Sender<SatelliteEvent>,
 ) -> Result<SatelliteInstance, Box<dyn std::error::Error>> {
     if !test_listenfd_support(path) {
         return Err(format!(
@@ -106,19 +122,22 @@ pub fn spawn_external_satellite(
         reserve_x11_display(0)?;
     let display_name = format!(":{display_number}");
 
-    let child = spawn_satellite_process(
-        path,
-        &display_name,
-        abstract_listener.as_ref(),
-        &unix_listener,
-    )?;
-
-    spawn_waiter_thread(path.to_path_buf(), child);
+    let mut external = ExternalSatellite {
+        path: path.to_path_buf(),
+        display_name: display_name.clone(),
+        abstract_listener,
+        unix_listener,
+        events,
+        backoff: RestartBackoff::default(),
+        generation: 0,
+    };
+    external.start()?;
 
     Ok(SatelliteInstance {
         display_name,
         display_number,
         embedded: None,
+        external: Some(external),
         _unix_guard: unix_guard,
         _lock_guard: lock_guard,
     })
@@ -152,12 +171,12 @@ pub fn reserve_embedded_satellite(
             listeners,
             flags: glamor_flags(),
             events,
-            started_at: None,
-            restart_delay: INITIAL_RESTART_DELAY,
+            backoff: RestartBackoff::default(),
             generation: 0,
             ready: false,
             failed_starts: 0,
         }),
+        external: None,
         display_name,
         display_number,
         _unix_guard: unix_guard,
@@ -165,10 +184,10 @@ pub fn reserve_embedded_satellite(
     })
 }
 
-/// What the embedded satellite thread reports to the compositor's event loop.
+/// What satellite reports to the compositor's event loop.
 #[derive(Debug)]
 pub enum SatelliteEvent {
-    /// Xwayland is up and satellite manages it.
+    /// Xwayland is up and satellite manages it (embedded satellite only).
     Ready {
         generation: u64,
         display: String,
@@ -176,6 +195,11 @@ pub enum SatelliteEvent {
     },
     /// The satellite thread ended: Xwayland exited, or satellite panicked.
     Exited { generation: u64, panicked: bool },
+    /// The external satellite process exited (`None`: waiting on it failed).
+    ProcessExited {
+        generation: u64,
+        status: Option<ExitStatus>,
+    },
 }
 
 /// Delay before the first restart after a quick failure.
@@ -189,6 +213,40 @@ const HEALTHY_RUN: Duration = Duration::from_secs(60);
 const MAX_FAILED_STARTS: u32 = 3;
 /// The Xwayland executable satellite runs.
 const XWAYLAND_BINARY: &str = "Xwayland";
+
+/// When to start satellite again after a run ended: soon after a long healthy
+/// run, backing off while it keeps failing fast.
+struct RestartBackoff {
+    started_at: Option<Instant>,
+    delay: Duration,
+}
+
+impl Default for RestartBackoff {
+    fn default() -> Self {
+        Self {
+            started_at: None,
+            delay: INITIAL_RESTART_DELAY,
+        }
+    }
+}
+
+impl RestartBackoff {
+    fn started(&mut self) {
+        self.started_at = Some(Instant::now());
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let ran = self
+            .started_at
+            .map_or(Duration::ZERO, |start| start.elapsed());
+        self.delay = if ran >= HEALTHY_RUN {
+            INITIAL_RESTART_DELAY
+        } else {
+            (self.delay * 2).min(MAX_RESTART_DELAY)
+        };
+        self.delay
+    }
+}
 
 /// xwayland-satellite running in-process.
 ///
@@ -204,8 +262,7 @@ pub struct EmbeddedSatellite {
     listeners: Vec<OwnedFd>,
     flags: Vec<String>,
     events: Sender<SatelliteEvent>,
-    started_at: Option<Instant>,
-    restart_delay: Duration,
+    backoff: RestartBackoff,
     /// Identifies the current run, so a late event from an older one is ignored.
     generation: u64,
     /// Whether the current run reported Xwayland ready.
@@ -252,7 +309,7 @@ impl EmbeddedSatellite {
                     panicked,
                 });
             })?;
-        self.started_at = Some(Instant::now());
+        self.backoff.started();
         info!(
             display = %self.display_name,
             generation,
@@ -280,15 +337,61 @@ impl EmbeddedSatellite {
     /// How long to wait before restarting after the current run ended: short
     /// after a long healthy run, growing while satellite keeps failing fast.
     pub fn next_restart_delay(&mut self) -> Duration {
-        let ran = self
-            .started_at
-            .map_or(Duration::ZERO, |start| start.elapsed());
-        self.restart_delay = if ran >= HEALTHY_RUN {
-            INITIAL_RESTART_DELAY
-        } else {
-            (self.restart_delay * 2).min(MAX_RESTART_DELAY)
-        };
-        self.restart_delay
+        self.backoff.next_delay()
+    }
+}
+
+/// xwayland-satellite running as a separate process.
+///
+/// The X11 display (lock file and listening sockets) is reserved once and
+/// kept here, as for the embedded satellite, so a respawned process serves the
+/// same `DISPLAY`. Before, the compositor dropped its copies of the sockets
+/// right after the first spawn and never started satellite again: when it
+/// exited, X11 apps stayed broken until the session was restarted.
+pub struct ExternalSatellite {
+    path: PathBuf,
+    display_name: String,
+    abstract_listener: Option<UnixListener>,
+    unix_listener: UnixListener,
+    events: Sender<SatelliteEvent>,
+    backoff: RestartBackoff,
+    /// Identifies the current run, so a late event from an older one is ignored.
+    generation: u64,
+}
+
+impl ExternalSatellite {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Spawn the process, with a thread that reports its exit.
+    pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let child = spawn_satellite_process(
+            &self.path,
+            &self.display_name,
+            self.abstract_listener.as_ref(),
+            &self.unix_listener,
+        )?;
+        self.generation += 1;
+        self.backoff.started();
+        info!(
+            display = %self.display_name,
+            path = %self.path.display(),
+            generation = self.generation,
+            pid = child.id(),
+            "started external xwayland-satellite"
+        );
+        spawn_waiter_thread(child, self.events.clone(), self.generation);
+        Ok(())
+    }
+
+    /// How long to wait before respawning after the current run ended.
+    pub fn next_restart_delay(&mut self) -> Duration {
+        self.backoff.next_delay()
     }
 }
 
@@ -599,16 +702,20 @@ fn satellite_log_path() -> PathBuf {
         })
 }
 
-fn spawn_waiter_thread(path: PathBuf, mut child: Child) {
+fn spawn_waiter_thread(mut child: Child, events: Sender<SatelliteEvent>, generation: u64) {
     let _ = std::thread::Builder::new()
         .name("xwayland-satellite-wait".to_string())
-        .spawn(move || match child.wait() {
-            Ok(status) => {
-                warn!(path = ?path, ?status, "xwayland-satellite exited");
-            }
-            Err(error) => {
-                warn!(path = ?path, ?error, "failed waiting for xwayland-satellite");
-            }
+        .spawn(move || {
+            let status = match child.wait() {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    warn!(?error, "failed waiting for xwayland-satellite");
+                    None
+                }
+            };
+            // The event loop logs it and schedules the respawn. After the
+            // compositor has shut down the channel is closed; nothing to do.
+            let _ = events.send(SatelliteEvent::ProcessExited { generation, status });
         });
 }
 
@@ -653,6 +760,40 @@ mod mode_tests {
     fn off_disables_satellite_even_with_a_path() {
         assert_eq!(mode(Some("off"), None), None);
         assert_eq!(mode(Some("0"), Some("/opt/xwls/xwayland-satellite")), None);
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::{INITIAL_RESTART_DELAY, MAX_RESTART_DELAY, RestartBackoff};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn restart_delay_doubles_to_a_cap_and_resets_after_a_healthy_run() {
+        let mut backoff = RestartBackoff::default();
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            backoff.started(); // each run fails at once
+            delays.push(backoff.next_delay());
+        }
+        let secs = |s: u64| Duration::from_secs(s);
+        assert_eq!(
+            delays,
+            [
+                secs(1),
+                secs(2),
+                secs(4),
+                secs(8),
+                secs(16),
+                MAX_RESTART_DELAY,
+                MAX_RESTART_DELAY,
+                MAX_RESTART_DELAY
+            ]
+        );
+
+        // A run that lasted past HEALTHY_RUN starts over at the initial delay.
+        backoff.started_at = Instant::now().checked_sub(Duration::from_secs(61));
+        assert_eq!(backoff.next_delay(), INITIAL_RESTART_DELAY);
     }
 }
 
@@ -715,6 +856,92 @@ mod tests {
         assert_eq!(reservation.0, paths.start() + 1);
         drop(reservation);
         drop(occupied);
+    }
+
+    /// Stands in for xwayland-satellite: exits 0 only if every `-listenfd` it was
+    /// handed is an open socket, which is what a respawned satellite needs.
+    const FAKE_SATELLITE: &str = "#!/bin/sh\n\
+        shift\n\
+        while [ $# -gt 0 ]; do\n\
+          if [ \"$1\" = -listenfd ]; then [ -S \"/proc/$$/fd/$2\" ] || exit 3; shift 2; else shift; fi\n\
+        done\n\
+        exit 0\n";
+
+    #[test]
+    fn external_satellite_respawns_on_the_same_listening_sockets() {
+        use super::{ExternalSatellite, RestartBackoff, SatelliteEvent};
+        use smithay::reexports::calloop::{EventLoop, channel};
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{Duration, Instant},
+        };
+
+        ensure_x11_unix_dir().expect("prepare X11 socket directory");
+        let paths = TestDisplayPaths::new();
+        let (unix_listener, _unix_guard) =
+            bind_to_unix_socket(paths.start()).expect("bind the pathname socket");
+        let abstract_listener = bind_to_abstract_socket(paths.start()).ok();
+
+        let dir = std::env::temp_dir().join(format!(
+            "shoji-satellite-respawn-{}-{}",
+            std::process::id(),
+            paths.start()
+        ));
+        fs::create_dir_all(&dir).expect("create the script directory");
+        let script = dir.join("fake-satellite");
+        fs::write(&script, FAKE_SATELLITE).expect("write the fake satellite");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .expect("make the fake satellite executable");
+
+        let mut event_loop: EventLoop<'static, Vec<SatelliteEvent>> =
+            EventLoop::try_new().expect("create an event loop");
+        let (sender, receiver) = channel::channel();
+        event_loop
+            .handle()
+            .insert_source(receiver, |event, _, events| {
+                if let channel::Event::Msg(event) = event {
+                    events.push(event);
+                }
+            })
+            .expect("insert the satellite event channel");
+
+        let mut external = ExternalSatellite {
+            path: script,
+            display_name: format!(":{}", paths.start()),
+            abstract_listener,
+            unix_listener,
+            events: sender,
+            backoff: RestartBackoff::default(),
+            generation: 0,
+        };
+        let mut events = Vec::new();
+        // The second run is the respawn: it only works if the compositor kept
+        // its own copies of the listening sockets after the first spawn.
+        for run in 1..=2u64 {
+            external.start().expect("spawn the fake satellite");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while events.len() < run as usize && Instant::now() < deadline {
+                event_loop
+                    .dispatch(Some(Duration::from_millis(50)), &mut events)
+                    .expect("dispatch the event loop");
+            }
+            match events.last() {
+                Some(SatelliteEvent::ProcessExited {
+                    generation,
+                    status: Some(status),
+                }) => {
+                    assert_eq!(*generation, run, "the exit is reported for run {run}");
+                    assert!(
+                        status.success(),
+                        "run {run}: the satellite was not handed open listening sockets ({status:?})"
+                    );
+                }
+                other => {
+                    panic!("run {run}: expected the process exit to be reported, got {other:?}")
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
