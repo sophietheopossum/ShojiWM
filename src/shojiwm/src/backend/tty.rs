@@ -1356,6 +1356,10 @@ fn reset_surface_after_tty_pause(surface: &mut SurfaceData) {
     surface.frame_callback_timer_armed = false;
     surface.commit_timing_timer_armed = false;
     surface.next_frame_target = None;
+    // The vblank phase does not survive losing DRM access, and the grid would keep placing
+    // frames on the old one for dozens of flips.
+    surface.vblank_observations.clear();
+    surface.last_grid_frame_target = None;
     surface.tearing_active = false;
     surface.redraw_state = TtyRedrawState::Idle;
 }
@@ -14359,6 +14363,9 @@ pub fn apply_tty_output_mode(
                     &DrmOutputRenderElements::default(),
                 )?;
             surface.frame_duration = Duration::from_secs_f64(1_000f64 / mode.refresh as f64);
+            // Observations from the old mode lie on another period and phase.
+            surface.vblank_observations.clear();
+            surface.last_grid_frame_target = None;
             if surface.deferred_submit.take().is_some() {
                 // Staged for a deadline commit but not committed: nothing is in flight. Drop it
                 // (its timer sees the new generation and returns) and render the new mode now,
