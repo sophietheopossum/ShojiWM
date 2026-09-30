@@ -123,8 +123,8 @@ use crate::ssd::{
     WindowPositionSnapshot,
 };
 use crate::xwayland_satellite::{
-    SatelliteEvent, SatelliteInstance, SatelliteMode, reserve_embedded_satellite, satellite_mode,
-    spawn_external_satellite,
+    EmbeddedSatellite, SatelliteEvent, SatelliteInstance, SatelliteMode,
+    reserve_embedded_satellite, satellite_mode, spawn_external_satellite,
 };
 use crate::{
     backend::{
