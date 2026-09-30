@@ -288,6 +288,28 @@ fn ratchet_frame_target(
     }
 }
 
+/// The vblank a flip observed at `observed` completed at, and the next frame's presentation
+/// time after it.
+///
+/// A driver timestamp (`timestamped`) is that vblank, so the next one is exactly a period
+/// later, and the grid could only add error: after a mode change or a resume its history
+/// lies on a phase that no longer exists, and an early target holds commit-timed clients
+/// back a frame. Without one, `observed` is when the event was dispatched, and only the
+/// grid of recent observations can recover the vblank.
+fn next_frame_after_flip(
+    timestamped: bool,
+    history: &std::collections::VecDeque<Duration>,
+    observed: Duration,
+    last_grid_target: Option<Duration>,
+    period: Duration,
+) -> (Duration, Duration) {
+    if timestamped {
+        return (observed, observed + period);
+    }
+    let (vblank, next) = vblank_grid(history, observed, period);
+    (vblank, ratchet_frame_target(last_grid_target, next, period))
+}
+
 fn sanitize_next_frame_target(
     next_frame_target: Option<Duration>,
     fallback_frame_time: Duration,
@@ -1786,7 +1808,8 @@ fn drivers_take_part_in_implicit_sync(drivers: &[Option<String>]) -> bool {
 #[cfg(test)]
 mod vblank_grid_tests {
     use super::{
-        VBLANK_GRID_HISTORY, ratchet_frame_target, sanitize_next_frame_target, vblank_grid,
+        VBLANK_GRID_HISTORY, next_frame_after_flip, ratchet_frame_target,
+        sanitize_next_frame_target, vblank_grid,
     };
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -1877,6 +1900,42 @@ mod vblank_grid_tests {
         assert_eq!(
             sanitize_next_frame_target(Some(fallback + period), fallback, period),
             (fallback + period, false)
+        );
+    }
+
+    /// A driver timestamp is the vblank itself, so the next frame is exactly a period later
+    /// whatever the history says. Here it is from before a mode change (another period and
+    /// phase), and the last target is one the grid would ratchet past.
+    #[test]
+    fn a_timestamped_flip_targets_the_next_vblank_exactly() {
+        let period = us(PERIOD_US);
+        let stale: VecDeque<Duration> = (0..VBLANK_GRID_HISTORY)
+            .map(|index| us(1_000_000.0 + index as f64 * 16_666.0 + 3_000.0))
+            .collect();
+        let observed = us(2_000_000.0);
+        assert_eq!(
+            next_frame_after_flip(true, &stale, observed, Some(observed + period / 4), period),
+            (observed, observed + period)
+        );
+    }
+
+    /// Without a timestamp the grid still decides: a late dispatch is pulled back onto the
+    /// phase of the promptest observations.
+    #[test]
+    fn an_untimestamped_flip_still_uses_the_grid() {
+        let period = us(PERIOD_US);
+        let history: VecDeque<Duration> = [100.0, 4_200.0, 150.0, 6_000.0, 3_000.0]
+            .iter()
+            .enumerate()
+            .map(|(index, delay)| us(1_000_000.0 + index as f64 * PERIOD_US + delay))
+            .collect();
+        let observed = *history.back().unwrap();
+        let (_, next) = next_frame_after_flip(false, &history, observed, None, period);
+        let expected = 1_000_000.0 + 5.0 * PERIOD_US + 100.0;
+        let predicted = next.as_secs_f64() * 1_000_000.0;
+        assert!(
+            (predicted - expected).abs() < 1.0,
+            "predicted {predicted} us"
         );
     }
 }
@@ -2049,28 +2108,32 @@ fn frame_finish(
             DrmEventTime::Realtime(_) => None,
         })
         .unwrap_or_else(|| Duration::from(state.clock.now()));
-    // The next frame's presentation time, on the output's vblank grid. It is what frame
-    // callbacks report and what frame-driven runtime work (kinetic scrolling) is stamped
-    // with, so it has to advance by whole refresh periods: `presentation_clock` itself is
-    // only as good as the driver's timestamp, and NVIDIA's flip events carry none, which
-    // leaves the time this event was dispatched — late by however long the main thread
-    // was busy. Stepping a glide by those gaps (8, 12, 10.7, 10 ms while the display
-    // flipped every 8.33) was the judder in kinetic scrolling.
-    if surface.vblank_observations.len() == VBLANK_GRID_HISTORY {
-        surface.vblank_observations.pop_front();
+    // The next frame's presentation time. It is what frame callbacks report and what
+    // frame-driven runtime work (kinetic scrolling) is stamped with, so it has to advance
+    // by whole refresh periods. With a driver timestamp `presentation_clock` is the vblank
+    // itself. NVIDIA's flip events carry none, which leaves the time this event was
+    // dispatched — late by however long the main thread was busy. Stepping a glide by those
+    // gaps (8, 12, 10.7, 10 ms while the display flipped every 8.33) was the judder in
+    // kinetic scrolling, so there the target comes from the output's vblank grid instead.
+    let timestamped = metadata
+        .as_ref()
+        .is_some_and(|metadata| matches!(metadata.time, DrmEventTime::Monotonic(_)));
+    if !timestamped {
+        if surface.vblank_observations.len() == VBLANK_GRID_HISTORY {
+            surface.vblank_observations.pop_front();
+        }
+        surface.vblank_observations.push_back(presentation_clock);
     }
-    surface.vblank_observations.push_back(presentation_clock);
-    let (grid_vblank, mut next_frame_target) = vblank_grid(
+    let (grid_vblank, next_frame_target) = next_frame_after_flip(
+        timestamped,
         &surface.vblank_observations,
         presentation_clock,
-        surface.frame_duration,
-    );
-    next_frame_target = ratchet_frame_target(
         surface.last_grid_frame_target,
-        next_frame_target,
         surface.frame_duration,
     );
-    surface.last_grid_frame_target = Some(next_frame_target);
+    if !timestamped {
+        surface.last_grid_frame_target = Some(next_frame_target);
+    }
     surface.next_frame_target = Some(next_frame_target);
     if ShojiWM::motion_trace_enabled() {
         info!(
@@ -2078,9 +2141,7 @@ fn frame_finish(
             presented_ms = presentation_clock.as_secs_f64() * 1000.0,
             grid_ms = grid_vblank.as_secs_f64() * 1000.0,
             next_frame_target_ms = next_frame_target.as_secs_f64() * 1000.0,
-            timestamped = metadata
-                .as_ref()
-                .is_some_and(|metadata| matches!(metadata.time, DrmEventTime::Monotonic(_))),
+            timestamped,
             sequence = present_sequence,
             "motion trace: vblank"
         );
