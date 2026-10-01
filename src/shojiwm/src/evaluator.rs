@@ -15,8 +15,9 @@ use crate::embedded_runtime::{
     EmbeddedRuntime, EmbeddedRuntimeResponse, NativeCachedResponse,
     NativeCompositionRequest, NativeCompositionUpdate, NativeEffectRequest, NativeEffectUpdate,
     NativeInteractionRequest, NativeInteractionResponse, NativeSchedulerRequest,
-    NativeSchedulerResponse,
+    NativeSchedulerResponse, RuntimeStartError,
 };
+use crate::runtime_watchdog::RuntimeWatchdog;
 use shojiwm_lib::ssd::window_model::{
     GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, ManagedWindowState,
     PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandPopupSnapshot,
@@ -69,6 +70,9 @@ pub struct EmbeddedDecorationEvaluator {
     runtime_state_generation: Arc<AtomicU64>,
     pointer_move_async: Arc<PointerMoveAsyncDispatcher>,
     host: RuntimeHost,
+    runtime_health: Arc<RuntimeHealth>,
+    // Shared by every clone (reload generations, the pointer worker).
+    watchdog: Arc<RuntimeWatchdog>,
 }
 
 /// An async hook's answer plus the config deltas it carried, published only
@@ -107,8 +111,43 @@ struct EmbeddedDecorationRuntime {
     next_request_id: u64,
     stderr_log: Arc<Mutex<String>>,
     host: RuntimeHost,
+    health: Arc<RuntimeHealth>,
     last_sent_runtime_state_generation: u64,
     last_sent_keyboard_layout: Option<KeyboardLayoutSnapshot>,
+}
+
+/// Whether the watchdog has stopped the config runtime, shared by every
+/// evaluator generation. Readable without the runtime lock, which the pointer
+/// worker may be holding.
+#[derive(Debug, Default)]
+struct RuntimeHealth {
+    /// The stopped isolate and the report, until the next reload. Also set
+    /// when an isolate never finished starting, so nothing respawns it.
+    stopped: Mutex<Option<(u32, String)>>,
+    flag: AtomicBool,
+}
+
+impl RuntimeHealth {
+    fn record_stopped(&self, bridge_id: u32, reason: &str) {
+        if let Ok(mut stopped) = self.stopped.lock() {
+            *stopped = Some((bridge_id, reason.to_owned()));
+        }
+        self.flag.store(true, Ordering::Release);
+    }
+
+    fn clear(&self) {
+        if let Ok(mut stopped) = self.stopped.lock() {
+            *stopped = None;
+        }
+        self.flag.store(false, Ordering::Release);
+    }
+
+    fn stopped(&self) -> Option<(u32, String)> {
+        if !self.flag.load(Ordering::Acquire) {
+            return None;
+        }
+        self.stopped.lock().ok().and_then(|stopped| stopped.clone())
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -888,6 +927,8 @@ impl EmbeddedDecorationEvaluator {
             runtime_state_generation: Arc::new(AtomicU64::new(1)),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
             host: RuntimeHost::detached(),
+            runtime_health: Arc::new(RuntimeHealth::default()),
+            watchdog: Arc::new(RuntimeWatchdog::default()),
         }
     }
 
@@ -903,6 +944,8 @@ impl EmbeddedDecorationEvaluator {
             runtime_state_generation: Arc::new(AtomicU64::new(1)),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
             host: RuntimeHost::detached(),
+            runtime_health: Arc::new(RuntimeHealth::default()),
+            watchdog: Arc::new(RuntimeWatchdog::default()),
         }
     }
 
@@ -916,6 +959,17 @@ impl EmbeddedDecorationEvaluator {
     pub fn with_host(mut self, host: RuntimeHost) -> Self {
         self.host = host;
         self
+    }
+
+    pub fn with_runtime_watchdog(mut self, watchdog: RuntimeWatchdog) -> Self {
+        self.watchdog = Arc::new(watchdog);
+        self
+    }
+
+    /// The watchdog stopped the config runtime and nothing has reloaded it.
+    /// Never takes the runtime lock.
+    pub fn runtime_stopped(&self) -> bool {
+        self.runtime_health.flag.load(Ordering::Acquire)
     }
 
     fn publish_config(&self, delta: RuntimeConfigDelta) {
@@ -979,18 +1033,25 @@ impl EmbeddedDecorationEvaluator {
             *pending = None;
         }
 
-        let mut runtime_guard = match self.runtime.lock() {
-            Ok(guard) => guard,
-            // The cell outlives reloads now, so a poisoned mutex would too.
-            // Reload used to heal it by allocating a new one.
-            Err(poisoned) => {
-                self.runtime.clear_poison();
-                poisoned.into_inner()
-            }
+        let retired = {
+            let mut runtime_guard = match self.runtime.lock() {
+                Ok(guard) => guard,
+                // The cell outlives reloads now, so a poisoned mutex would too.
+                // Reload used to heal it by allocating a new one.
+                Err(poisoned) => {
+                    self.runtime.clear_poison();
+                    poisoned.into_inner()
+                }
+            };
+            // Cleared under the runtime lock, which every stop is recorded
+            // under, so a stop of the retired isolate cannot land afterwards.
+            self.runtime_health.clear();
+            runtime_guard.take()
         };
         // `EmbeddedRuntime::drop` closes the request channel and joins the
-        // runtime thread, so this is the isolate teardown.
-        *runtime_guard = None;
+        // runtime thread (bounded), so this is the isolate teardown. It runs
+        // outside the lock so the pointer worker is not held up by it.
+        drop(retired);
     }
 
     /// Stop the shared pointer-move worker. The worker holds an evaluator clone
@@ -1163,6 +1224,16 @@ impl EmbeddedDecorationEvaluator {
         let mut runtime_guard = self.runtime.lock().map_err(|_| {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
+        // A stopped runtime cannot run onDisable, and spawning one just to
+        // ask would load the config that hung. Reload without saved state.
+        if self.runtime_stopped()
+            || runtime_guard
+                .as_ref()
+                .is_some_and(|runtime| runtime.child.is_killed())
+        {
+            info!("config runtime is stopped; reloading without its saved state");
+            return Ok(serde_json::Value::Object(Default::default()));
+        }
         let runtime = self.ensure_runtime(&mut runtime_guard)?;
         let request_id = runtime.next_request_id;
         runtime.next_request_id += 1;
@@ -1233,7 +1304,17 @@ impl EmbeddedDecorationEvaluator {
         &'a self,
         runtime: &'a mut Option<EmbeddedDecorationRuntime>,
     ) -> Result<&'a mut EmbeddedDecorationRuntime, DecorationEvaluationError> {
+        // A stopped isolate stays in the cell until a reload, so a config that
+        // hangs is not respawned into the same hang on the next frame.
+        if let Some(existing) = runtime.as_ref()
+            && let Some(reason) = existing.child.kill_reason()
+        {
+            return Err(DecorationEvaluationError::RuntimeStopped(reason));
+        }
         if runtime.is_none() {
+            if let Some((_, reason)) = self.runtime_health.stopped() {
+                return Err(DecorationEvaluationError::RuntimeStopped(reason));
+            }
             *runtime = Some(self.spawn_embedded_runtime()?);
         }
 
@@ -1247,17 +1328,36 @@ impl EmbeddedDecorationEvaluator {
     ) -> Result<EmbeddedDecorationRuntime, DecorationEvaluationError> {
         debug!("spawning embedded RustyScript decoration runtime");
         crate::embedded_runtime::set_wake_host(self.host.clone());
+        // The session's first generation loads alongside the whole compositor
+        // start; reloads only load the config.
+        let load_budget = if self.pointer_move_async.epoch.load(Ordering::Acquire) == 0 {
+            self.watchdog.boot_load_hang
+        } else {
+            self.watchdog.load_hang
+        };
         let child = EmbeddedRuntime::start(
             self.script_path.clone(),
             self.config_path.clone(),
             self.working_dir.clone(),
+            *self.watchdog,
+            load_budget,
         )
-        .map_err(DecorationEvaluationError::RuntimeProtocol)?;
+        .map_err(|error: RuntimeStartError| {
+            if error.timed_out {
+                self.runtime_health
+                    .record_stopped(error.bridge_id, &error.message);
+                self.host.send(HostMessage::RuntimeStopped(error.message.clone()));
+                DecorationEvaluationError::RuntimeStopped(error.message)
+            } else {
+                DecorationEvaluationError::RuntimeProtocol(error.message)
+            }
+        })?;
         Ok(EmbeddedDecorationRuntime {
             child,
             next_request_id: 1,
             stderr_log: Arc::new(Mutex::new(String::new())),
             host: self.host.clone(),
+            health: Arc::clone(&self.runtime_health),
             last_sent_runtime_state_generation: 0,
             last_sent_keyboard_layout: None,
         })
@@ -1480,6 +1580,9 @@ impl EmbeddedDecorationEvaluator {
         event: &PointerMoveEventSnapshot,
         now_ms: u64,
     ) -> Result<DecorationPointerMoveAsyncInvocation, DecorationEvaluationError> {
+        if self.runtime_stopped() {
+            return Ok(DecorationPointerMoveAsyncInvocation::default());
+        }
         let mut runtime_guard = self.runtime.lock().map_err(|_| {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
@@ -1511,6 +1614,9 @@ impl EmbeddedDecorationEvaluator {
         event: &GestureSwipeEventSnapshot,
         now_ms: u64,
     ) -> Result<DecorationGestureSwipeAsyncInvocation, DecorationEvaluationError> {
+        if self.runtime_stopped() {
+            return Ok(DecorationGestureSwipeAsyncInvocation::default());
+        }
         let mut runtime_guard = self.runtime.lock().map_err(|_| {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
@@ -1542,10 +1648,12 @@ impl EmbeddedDecorationEvaluator {
         event: &PointerMoveEventSnapshot,
         now_ms: u64,
     ) -> Result<Option<AsyncHookResult>, DecorationEvaluationError> {
-        if !self
-            .pointer_move_async
-            .runtime_dispatchable
-            .load(Ordering::Acquire)
+        // A stopped runtime parks the worker until a reload.
+        if self.runtime_stopped()
+            || !self
+                .pointer_move_async
+                .runtime_dispatchable
+                .load(Ordering::Acquire)
         {
             return Ok(None);
         }
@@ -1557,7 +1665,10 @@ impl EmbeddedDecorationEvaluator {
         // Never `ensure_runtime` here: the worker must not be what brings an
         // isolate into existence, or a sample landing mid-reload spawns one that
         // never received `lifecycleEnable`.
-        let Some(runtime) = runtime_guard.as_mut() else {
+        let Some(runtime) = runtime_guard
+            .as_mut()
+            .filter(|runtime| !runtime.child.is_killed())
+        else {
             return Ok(None);
         };
         let request_id = runtime.next_request_id;
@@ -1642,10 +1753,12 @@ impl EmbeddedDecorationEvaluator {
         event: &GestureSwipeEventSnapshot,
         now_ms: u64,
     ) -> Result<Option<AsyncHookResult>, DecorationEvaluationError> {
-        if !self
-            .pointer_move_async
-            .runtime_dispatchable
-            .load(Ordering::Acquire)
+        // A stopped runtime parks the worker until a reload.
+        if self.runtime_stopped()
+            || !self
+                .pointer_move_async
+                .runtime_dispatchable
+                .load(Ordering::Acquire)
         {
             return Ok(None);
         }
@@ -1653,7 +1766,10 @@ impl EmbeddedDecorationEvaluator {
             return Ok(None);
         };
         // See `dispatch_pointer_move_async`: the worker never spawns an isolate.
-        let Some(runtime) = runtime_guard.as_mut() else {
+        let Some(runtime) = runtime_guard
+            .as_mut()
+            .filter(|runtime| !runtime.child.is_killed())
+        else {
             return Ok(None);
         };
         let request_id = runtime.next_request_id;
@@ -1747,11 +1863,27 @@ impl Clone for EmbeddedDecorationEvaluator {
             runtime_state_generation: Arc::clone(&self.runtime_state_generation),
             pointer_move_async: Arc::clone(&self.pointer_move_async),
             host: self.host.clone(),
+            runtime_health: Arc::clone(&self.runtime_health),
+            watchdog: Arc::clone(&self.watchdog),
         }
     }
 }
 
 impl EmbeddedDecorationRuntime {
+    /// A read failed. If the watchdog stopped the isolate, the first caller
+    /// to see it records the stop and tells the compositor.
+    fn read_error(&self, error: String) -> DecorationEvaluationError {
+        if !self.child.is_killed() {
+            return DecorationEvaluationError::RuntimeProtocol(error);
+        }
+        if self.child.claim_stop_report() {
+            let bridge_id = self.child.bridge_id();
+            self.health.record_stopped(bridge_id, &error);
+            self.host.send(HostMessage::RuntimeStopped(error.clone()));
+        }
+        DecorationEvaluationError::RuntimeStopped(error)
+    }
+
     fn write_request(&mut self, request: &str) -> Result<(), DecorationEvaluationError> {
         timescope::scope!("runtime write request");
         let bytes = request.as_bytes();
@@ -1859,7 +1991,7 @@ impl EmbeddedDecorationRuntime {
             timescope::scope!("runtime read frame");
             self.child
                 .read_response()
-                .map_err(DecorationEvaluationError::RuntimeProtocol)?
+                .map_err(|error| self.read_error(error))?
         };
         let Some(response) = payload else {
             return Ok(None);
@@ -1879,7 +2011,7 @@ impl EmbeddedDecorationRuntime {
         let response = self
             .child
             .read_response()
-            .map_err(DecorationEvaluationError::RuntimeProtocol)?;
+            .map_err(|error| self.read_error(error))?;
         match response {
             None => Ok(None),
             Some(EmbeddedRuntimeResponse::Scheduler(response)) => {
@@ -1899,7 +2031,7 @@ impl EmbeddedDecorationRuntime {
         let response = self
             .child
             .read_response()
-            .map_err(DecorationEvaluationError::RuntimeProtocol)?;
+            .map_err(|error| self.read_error(error))?;
         match response {
             None => Ok(None),
             Some(EmbeddedRuntimeResponse::Cached(response)) => {
@@ -1919,7 +2051,7 @@ impl EmbeddedDecorationRuntime {
         let response = self
             .child
             .read_response()
-            .map_err(DecorationEvaluationError::RuntimeProtocol)?;
+            .map_err(|error| self.read_error(error))?;
         match response {
             None => Ok(None),
             Some(EmbeddedRuntimeResponse::Interaction(response)) => {
@@ -2165,7 +2297,7 @@ fn summarize_runtime_protocol_counters(
     summary
 }
 
-fn extract_json_kind(payload: &str) -> Option<&str> {
+pub(super) fn extract_json_kind(payload: &str) -> Option<&str> {
     let start = payload.find("\"kind\":\"")? + "\"kind\":\"".len();
     let rest = &payload[start..];
     let end = rest.find('"')?;
@@ -2696,7 +2828,10 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
 
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(_) = runtime_guard
+            .as_ref()
+            .filter(|runtime| !runtime.child.is_killed())
+        else {
             return Ok(DecorationSchedulerTick::default());
         };
 
@@ -2822,7 +2957,10 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
 
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(_) = runtime_guard
+            .as_ref()
+            .filter(|runtime| !runtime.child.is_killed())
+        else {
             return Ok(());
         };
 
@@ -2901,7 +3039,10 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
 
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(_) = runtime_guard
+            .as_ref()
+            .filter(|runtime| !runtime.child.is_killed())
+        else {
             return Ok(DecorationHandlerInvocation::default());
         };
 
@@ -3013,7 +3154,10 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
 
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(_) = runtime_guard
+            .as_ref()
+            .filter(|runtime| !runtime.child.is_killed())
+        else {
             return Ok(DecorationKeyBindingInvocation::default());
         };
 
@@ -3113,7 +3257,10 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
 
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(_) = runtime_guard
+            .as_ref()
+            .filter(|runtime| !runtime.child.is_killed())
+        else {
             return Ok(DecorationHandlerInvocation::default());
         };
 
@@ -3226,7 +3373,10 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
 
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(_) = runtime_guard
+            .as_ref()
+            .filter(|runtime| !runtime.child.is_killed())
+        else {
             return Ok(DecorationWindowResizeInvocation::default());
         };
 
@@ -3319,7 +3469,10 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
 
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(_) = runtime_guard
+            .as_ref()
+            .filter(|runtime| !runtime.child.is_killed())
+        else {
             return Ok(DecorationWindowMoveInvocation::default());
         };
 
@@ -3831,7 +3984,10 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
         })?;
 
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(_) = runtime_guard
+            .as_ref()
+            .filter(|runtime| !runtime.child.is_killed())
+        else {
             return Ok(DecorationHandlerInvocation::default());
         };
 
@@ -8217,7 +8373,7 @@ COMPOSITOR.window.composition = () => <Label text="x" />;
     fn embedded_runtime_watchdog_stops_never_resolving_async_listener() {
         // Holds isolates for hundreds of ms; keep clear of fd counting.
         let _fd_count = lock_process_fd_count();
-        use crate::ssd::{
+        use shojiwm_lib::ssd::{
             PointerHitTargetSnapshot, PointerModifierStateSnapshot, PointerMovePointSnapshot,
         };
         let socket_dir = std::env::temp_dir().join(format!(
@@ -8433,7 +8589,7 @@ COMPOSITOR.window.composition = () => <Label text="x" />;
     fn embedded_runtime_watchdog_reports_slow_round_trips_without_stopping() {
         // Holds isolates for hundreds of ms; keep clear of fd counting.
         let _fd_count = lock_process_fd_count();
-        use crate::ssd::runtime_watchdog::SLOW_TRIP_COUNT;
+        use crate::runtime_watchdog::SLOW_TRIP_COUNT;
         let (evaluator, test_dir) = watchdog_evaluator(
             "slow-trip",
             r#"
@@ -8472,7 +8628,7 @@ COMPOSITOR.window.composition = () => <Label text="x" />;
     #[test]
     #[ignore = "shares the real config's IPC socket path; run alone with --ignored"]
     fn real_config_sends_window_rects_only_to_lease_holders() {
-        use crate::ssd::window_model::{
+        use shojiwm_lib::ssd::window_model::{
             PointerModifierStateSnapshot, WindowMovePhaseSnapshot, WindowMoveSourceSnapshot,
             WindowResizePointSnapshot,
         };

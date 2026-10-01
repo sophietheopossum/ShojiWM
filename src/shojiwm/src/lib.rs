@@ -20,6 +20,7 @@ use shojiwm_lib::{
 };
 
 pub use evaluator::EmbeddedDecorationEvaluator;
+pub use runtime_watchdog::RuntimeWatchdog;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TypeScriptLauncher;
@@ -49,7 +50,8 @@ impl RuntimeLauncher for TypeScriptLauncher {
         let evaluator =
             EmbeddedDecorationEvaluator::for_paths(paths.script_path, paths.config_path)
                 .with_working_dir(paths.working_dir)
-                .with_host(context.host);
+                .with_host(context.host)
+                .with_runtime_watchdog(RuntimeWatchdog::from_env());
         Box::new(TypeScriptRuntime { evaluator })
     }
 }
@@ -198,6 +200,10 @@ impl ConfigRuntime for TypeScriptRuntime {
             RuntimeEvent::PointerMove(event) => self.evaluator.pointer_move_async(event, now),
             RuntimeEvent::GestureSwipe(event) => self.evaluator.gesture_swipe_async(event, now),
         }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.evaluator.runtime_stopped()
     }
 
     fn shutdown(&mut self) {
