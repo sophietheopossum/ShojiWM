@@ -102,6 +102,12 @@ pub enum HostMessage {
     /// Start a copy-only data offer from a native control during a pointer drag.
     StartCopyDrag { id: u64, mime_type: String, data: Vec<u8> },
     CancelCopyDrag(u64),
+    /// The runtime stopped serving requests on its own; see
+    /// [`ConfigRuntime::is_stopped`](super::ConfigRuntime::is_stopped). The
+    /// text is shown to the user. Until a reload, requests should fail fast
+    /// with `RuntimeError::RuntimeStopped` rather than answer `Unhandled`.
+    /// Send it once per stop.
+    RuntimeStopped(String),
 }
 
 /// When a runtime that keeps a clock per output (see `SchedulerTickRequest`)

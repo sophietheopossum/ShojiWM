@@ -84,6 +84,15 @@ pub trait ConfigRuntime {
 
     fn post(&mut self, _now_ms: f64, _event: RuntimeEvent) {}
 
+    /// The runtime stopped serving requests on its own (its watchdog shut
+    /// down a config that stopped answering, say) and no reload has replaced
+    /// it. While true, config key bindings pass through, effects stay as last
+    /// configured and windows get the built-in decorations. Checked on every
+    /// key event, so it must not wait on the runtime.
+    fn is_stopped(&self) -> bool {
+        false
+    }
+
     /// The compositor is exiting.
     fn shutdown(&mut self) {}
 }
