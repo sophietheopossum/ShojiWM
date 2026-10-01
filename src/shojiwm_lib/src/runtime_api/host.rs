@@ -86,6 +86,12 @@ pub enum HostMessage {
     /// [`RuntimeLauncher::start_locked`](super::RuntimeLauncher::start_locked).
     /// Honored only while the config first loads, before any client runs.
     StartLocked,
+    /// The runtime stopped serving requests on its own; see
+    /// [`ConfigRuntime::is_stopped`](super::ConfigRuntime::is_stopped). The
+    /// text is shown to the user. Until a reload, requests should fail fast
+    /// with `RuntimeError::RuntimeStopped` rather than answer `Unhandled`.
+    /// Send it once per stop.
+    RuntimeStopped(String),
 }
 
 /// When a runtime that keeps a clock per output (see `SchedulerTickRequest`)
