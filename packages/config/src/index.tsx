@@ -33,9 +33,10 @@ import type {
   ManagedWindowRect,
   OutputSubpixel,
 } from "shoji_wm/types";
-import { 
-    createIpcServer, 
-    wakeRust
+import {
+    createIpcServer,
+    wakeRust,
+    type IpcClient,
 } from "shoji_wm/ipc";
 
 // Full per-display schema MinkaConf's visual page writes.
@@ -245,7 +246,8 @@ COMPOSITOR.onEnable((event) => {
 
 // ---------------------------------------------------------------------------
 // External IPC: expose the workspace layout to clients such as the bar.
-//   workspaces.get           -> WorkspacesView                     (request/response)
+//   workspaces.get           { rectsLease?: string } -> WorkspacesView (request/response;
+//                            the token renews a 2 s windows.rects lease for this client)
 //   workspaces.switch        { direction: -1 | 1 }                 (command)
 //   workspaces.activate      { monitor: string, index: number }    (command)
 //   workspaces.toggleTiling  { monitor?: string }                  (command)
@@ -254,6 +256,7 @@ COMPOSITOR.onEnable((event) => {
 //   windows.reorder          { windowId, beforeId: string|null }   -> {ok, changed} (request/response)
 //   windows.setRect          { windowId, x, y, width, height }     (request/response)
 //   dock.proximity           { monitor: string, inside: bool }    (broadcast)
+//   windows.rects            -> { windows: [...] }                 (event, lease holders only)
 // ---------------------------------------------------------------------------
 const WORKSPACE_IPC = createIpcServer();
 let lastWorkspacesJson = "";
@@ -289,18 +292,65 @@ function attachDragTabs(view: WorkspacesView): WorkspacesView {
 // Live rect stream for MinkaMon's leader lines: pushed on every window
 // move/resize event batch so the lines track drags at event rate instead
 // of the client's fallback poll. Minimal payload (id + rect + drag tab),
-// coalesced per tick; clients that don't know the event ignore it.
+// coalesced per tick.
+//
+// Sent only to clients holding a lease, not broadcast: MinkaShell, MinkaShot
+// and MinkaFX stay connected all session and have no use for it. The SDK
+// hands handlers a fresh IpcClient per request and has no disconnect hook,
+// so a client leases the stream by passing `rectsLease: <token>` on its
+// workspaces.get poll, and the lease lapses RECTS_LEASE_MS after the last one.
+const RECTS_LEASE_MS = 2000;
+const RECTS_MAX_SUBSCRIBERS = 8;
+const RECTS_SUBSCRIBERS = new Map<
+  string,
+  { client: IpcClient; renewedAt: number }
+>();
+
+function rectsLeaseLive(renewedAt: number, now: number): boolean {
+  const age = now - renewedAt;
+  // A backwards clock step expires a lease rather than extending it.
+  return age >= 0 && age <= RECTS_LEASE_MS;
+}
+
+function pruneRectsSubscribers(now: number) {
+  for (const [token, subscriber] of RECTS_SUBSCRIBERS) {
+    if (!rectsLeaseLive(subscriber.renewedAt, now)) {
+      RECTS_SUBSCRIBERS.delete(token);
+    }
+  }
+}
+
+function renewRectsLease(params: unknown, client: IpcClient) {
+  const token = (params as { rectsLease?: unknown } | null | undefined)
+    ?.rectsLease;
+  if (typeof token !== "string" || token.length === 0 || token.length > 64) {
+    return;
+  }
+  const now = Date.now();
+  // Re-insert so Map order is recency order for the eviction below.
+  RECTS_SUBSCRIBERS.delete(token);
+  RECTS_SUBSCRIBERS.set(token, { client, renewedAt: now });
+  pruneRectsSubscribers(now);
+  while (RECTS_SUBSCRIBERS.size > RECTS_MAX_SUBSCRIBERS) {
+    const oldest = RECTS_SUBSCRIBERS.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    RECTS_SUBSCRIBERS.delete(oldest);
+  }
+}
+
 let rectsBroadcastQueued = false;
 function scheduleRectsBroadcast() {
-  if (rectsBroadcastQueued) {
+  // Nobody holds a lease: no microtask, no payload, no wake.
+  if (rectsBroadcastQueued || RECTS_SUBSCRIBERS.size === 0) {
     return;
   }
   rectsBroadcastQueued = true;
   void Promise.resolve().then(() => {
     rectsBroadcastQueued = false;
-    // No listeners, no work: with MinkaMon closed this path costs nothing
-    // and the runtime behaves exactly as if the tap didn't exist.
-    if (WORKSPACE_IPC.clientCount() === 0) {
+    pruneRectsSubscribers(Date.now());
+    if (RECTS_SUBSCRIBERS.size === 0) {
       return;
     }
     const windows = [];
@@ -315,7 +365,10 @@ function scheduleRectsBroadcast() {
         dragTab: DRAG_TAB_RECTS.get(window.id)?.() ?? null,
       });
     }
-    WORKSPACE_IPC.broadcast("windows.rects", { windows });
+    const payload = { windows };
+    for (const subscriber of RECTS_SUBSCRIBERS.values()) {
+      subscriber.client.send("windows.rects", payload);
+    }
     // This microtask runs AFTER the triggering event's request/response
     // cycle has been drained, so anything it touched in runtime state is
     // invisible to the compositor's scheduler until the next poll — which
@@ -393,11 +446,12 @@ COMPOSITOR.workspace.event.onActivate((event) => {
   scheduleWorkspaceBroadcast();
 });
 
-WORKSPACE_IPC.handle("workspaces.get", () =>
-  attachDragTabs(
+WORKSPACE_IPC.handle("workspaces.get", (params, client) => {
+  renewRectsLease(params, client);
+  return attachDragTabs(
       HYBRID_WINDOW_MANAGER.viewForIpc(),
-  ),
-);
+  );
+});
 WORKSPACE_IPC.handle("workspaces.switch", (params) => {
   const direction = (params as { direction?: number } | undefined)?.direction;
   HYBRID_WINDOW_MANAGER.switchWorkspace(direction === -1 ? -1 : 1);
