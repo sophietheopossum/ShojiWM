@@ -2751,6 +2751,50 @@ impl ShojiWM {
         self.schedule_runtime_scheduler_kick(&loop_handle, next_poll_in_ms);
     }
 
+    /// The runtime asked for a tick (an IPC handler or a promise changed its
+    /// state). While frames drive the scheduler, hand the tick to the next frame
+    /// instead of running it now: a wake arrives at wall-clock time, so a tick
+    /// here could step a frame-paced poll (kinetic scrolling) between frames.
+    /// After a missed frame that step lands late enough that the next frame
+    /// finds nothing due and shows the earlier position. Stamping the tick with
+    /// a frame time would not help: the runtime's clock only moves forward, and
+    /// any wall-stamped request in the gap has already moved it.
+    fn handle_runtime_wake(&mut self) {
+        if !self.frame_driven_runtime_scheduler_active() {
+            let _ = self.tick_runtime_scheduler_at(true, None, "wake");
+            return;
+        }
+        self.schedule_redraw();
+        if self.runtime_wake_pending {
+            return;
+        }
+        self.runtime_wake_pending = true;
+        self.runtime_wake_generation = self.runtime_wake_generation.wrapping_add(1);
+        let generation = self.runtime_wake_generation;
+        // Frames normally pick it up within one interval. Only once they have
+        // stopped driving the scheduler does it run here, on the wall clock.
+        let fallback =
+            Duration::from_millis(self.runtime_frame_sync_interval_ms() * 2 + 2);
+        let inserted = self
+            .loop_handle
+            .insert_source(Timer::from_duration(fallback), move |_, _, state| {
+                if !state.runtime_wake_pending || state.runtime_wake_generation != generation {
+                    return TimeoutAction::Drop;
+                }
+                if state.frame_driven_runtime_scheduler_active() {
+                    return TimeoutAction::ToDuration(fallback);
+                }
+                state.runtime_wake_pending = false;
+                let _ = state.tick_runtime_scheduler_at(true, None, "wake");
+                TimeoutAction::Drop
+            });
+        if let Err(error) = inserted {
+            debug!(?error, "failed to arm the runtime wake fallback; ticking now");
+            self.runtime_wake_pending = false;
+            let _ = self.tick_runtime_scheduler_at(true, None, "wake");
+        }
+    }
+
     fn register_runtime_wake_signal(event_loop: &mut EventLoop<'static, Self>) {
         use calloop::signals::{Signal, Signals};
 
