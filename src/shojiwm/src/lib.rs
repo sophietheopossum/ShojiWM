@@ -7,6 +7,7 @@
 mod embedded_runtime;
 pub mod evaluator;
 pub mod paths;
+mod runtime_watchdog;
 
 use tracing::warn;
 
