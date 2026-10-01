@@ -2525,20 +2525,24 @@ impl ShojiWM {
     /// exactly the motion that belongs to it. The step's dirty windows are then picked up
     /// by the decoration refresh that follows in the same render.
     pub(crate) fn tick_runtime_scheduler_for_frame(&mut self, frame_time_ms: f64) -> bool {
-        // Only for a poll the scheduler reported as due by this frame. Evaluations also
+        // Only for a poll the scheduler reported as due by this frame, or for a runtime
+        // wake deferred to this frame (`handle_runtime_wake`). Evaluations also
         // switch `runtime_scheduler_enabled` on (a window with a running animation reports
         // "next poll: now") without registering any poll; ticking for those put a runtime
         // turn in every animated frame, and each turn handed back every window whose
         // position signals the animation had moved — as full re-evaluations. Window
         // animations already re-evaluate what they need in the decoration refresh.
-        let due = self
-            .runtime_scheduler_next_due_ms
-            .is_some_and(|due_ms| due_ms <= frame_time_ms + 0.5);
-        if !self.runtime_scheduler_enabled || !due {
+        let Some(force) = frame_scheduler_tick(
+            self.runtime_scheduler_enabled,
+            self.runtime_scheduler_next_due_ms,
+            self.runtime_wake_pending,
+            frame_time_ms,
+        ) else {
             return false;
-        }
+        };
+        self.runtime_wake_pending = false;
         self.runtime_scheduler_last_frame_tick_at = Some(Instant::now());
-        let _ = self.tick_runtime_scheduler_at(false, Some(frame_time_ms));
+        let _ = self.tick_runtime_scheduler_at(force, Some(frame_time_ms), "frame");
         true
     }
 
@@ -2761,7 +2765,7 @@ impl ShojiWM {
             .handle()
             .insert_source(signals, |_event, _, state| {
                 state.record_event_source_wake("runtime-wake-signal");
-                let _ = state.tick_runtime_scheduler_with(true);
+                state.handle_runtime_wake();
             });
         if let Err(error) = insert {
             warn!(?error, "failed to register runtime wake signal source");
