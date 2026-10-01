@@ -2557,10 +2557,17 @@ impl ShojiWM {
     }
 
     fn tick_runtime_scheduler_with(&mut self, force: bool) -> u64 {
-        self.tick_runtime_scheduler_at(force, None)
+        self.tick_runtime_scheduler_at(force, None, "timer")
     }
 
-    fn tick_runtime_scheduler_at(&mut self, force: bool, frame_time_ms: Option<f64>) -> u64 {
+    /// `stamp_ms` is the scheduler time the tick runs at; `None` means now.
+    /// `source` only labels motion traces.
+    fn tick_runtime_scheduler_at(
+        &mut self,
+        force: bool,
+        stamp_ms: Option<f64>,
+        source: &'static str,
+    ) -> u64 {
         self.sync_keyboard_layout();
         self.refresh_runtime_processes();
         let managed_window_animation_active = !self.managed_window_animations.is_empty();
@@ -2582,7 +2589,7 @@ impl ShojiWM {
             return self.runtime_frame_sync_interval_ms();
         }
 
-        let now_ms = frame_time_ms
+        let now_ms = stamp_ms
             .unwrap_or_else(|| Duration::from(self.clock.now()).as_secs_f64() * 1000.0);
         self.sync_runtime_display_state();
         let tick = match self.decoration_evaluator.scheduler_tick(now_ms) {
@@ -2659,7 +2666,7 @@ impl ShojiWM {
 
         if Self::motion_trace_enabled() {
             info!(
-                source = if frame_time_ms.is_some() { "frame" } else { "timer" },
+                source,
                 tick_ms = now_ms,
                 wall_ms = Duration::from(self.clock.now()).as_secs_f64() * 1000.0,
                 dirty = tick.dirty,
