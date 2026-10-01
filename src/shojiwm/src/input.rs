@@ -515,7 +515,14 @@ impl ShojiWM {
                         crate::runtime_key_binding::RuntimeKeyBindingPhase::Release
                     }
                 };
-                let runtime_key_bindings = self.runtime_key_bindings.clone();
+                // A stopped config runtime cannot run its bindings, so let
+                // those keys through to clients and the built-in shortcuts
+                // (Super+Shift+R above all) instead of swallowing them.
+                let runtime_key_bindings = if self.decoration_evaluator.runtime_stopped() {
+                    Vec::new()
+                } else {
+                    self.runtime_key_bindings.clone()
+                };
 
                 let action = self
                     .seat

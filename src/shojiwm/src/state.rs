@@ -1542,7 +1542,8 @@ impl ShojiWM {
             runtime_paths.script_path,
             runtime_paths.config_path,
         )
-        .with_working_dir(runtime_paths.working_dir);
+        .with_working_dir(runtime_paths.working_dir)
+        .with_runtime_watchdog(crate::ssd::RuntimeWatchdog::from_env());
         let config_error_report = match evaluator.preload() {
             Ok(()) => None,
             Err(error) => {
@@ -1567,6 +1568,9 @@ impl ShojiWM {
                     }
                     DecorationRuntimeAsyncInvocation::CursorConfig(update) => {
                         state.apply_runtime_cursor_config_update(update);
+                    }
+                    DecorationRuntimeAsyncInvocation::RuntimeStopped { bridge_id, reason } => {
+                        state.handle_runtime_stopped(bridge_id, reason);
                     }
                 },
                 ChannelEvent::Closed => {}
@@ -2829,6 +2833,29 @@ impl ShojiWM {
 
         let _ = self.decoration_evaluator.window_closed(&snapshot.id);
         debug!(window_id = snapshot.id, "warmed up decoration runtime");
+    }
+
+    /// The watchdog stopped a config runtime that stopped answering. Show the
+    /// report and stop driving the runtime until Super+Shift+R reloads it.
+    fn handle_runtime_stopped(&mut self, bridge_id: u32, reason: String) {
+        let Some(evaluator) = self.decoration_evaluator.as_embedded() else {
+            return;
+        };
+        // A notice from an isolate a reload has already replaced.
+        if evaluator.stopped_runtime_id() != Some(bridge_id) {
+            debug!(bridge_id, "ignoring a stop notice for a retired config runtime");
+            return;
+        }
+        evaluator.note_runtime_stopped();
+        // The stop is the root cause of whatever else went wrong, so it
+        // replaces any report already showing.
+        self.config_error_report = Some(crate::config_error::ConfigErrorReport::runtime(
+            crate::ssd::DecorationEvaluationError::RuntimeStopped(reason),
+        ));
+        self.runtime_scheduler_enabled = false;
+        // Effect animations the runtime was driving cannot advance now.
+        self.runtime_animation_outputs.clear();
+        self.schedule_redraw();
     }
 
     pub fn reload_decoration_runtime(&mut self) {

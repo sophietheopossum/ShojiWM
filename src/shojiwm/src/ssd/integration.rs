@@ -1123,6 +1123,12 @@ impl DecorationRuntimeEvaluator {
             Self::Static(_) => None,
         }
     }
+
+    /// The watchdog stopped the config runtime and nothing has reloaded it.
+    pub fn runtime_stopped(&self) -> bool {
+        self.as_embedded()
+            .is_some_and(|evaluator| evaluator.runtime_stopped())
+    }
 }
 
 impl ShojiWM {
@@ -2625,10 +2631,13 @@ impl ShojiWM {
             .collect::<std::collections::HashSet<_>>();
         let now_ms = Duration::from(self.clock.now()).as_millis() as u64;
         let signature = layer_effect_evaluation_signature(output_name, &snapshots);
-        let force_evaluate = self
-            .layer_effect_evaluation_cache
-            .get(output_name)
-            .is_none_or(|cache| cache.signature != signature || cache.animating);
+        // A runtime the watchdog stopped cannot answer; keep the effects it
+        // last configured until the config is reloaded.
+        let force_evaluate = !self.decoration_evaluator.runtime_stopped()
+            && self
+                .layer_effect_evaluation_cache
+                .get(output_name)
+                .is_none_or(|cache| cache.signature != signature || cache.animating);
         if !force_evaluate {
             retain_effect_assignments_for_live_ids(
                 &mut self.configured_layer_effects,
@@ -2756,10 +2765,11 @@ impl ShojiWM {
             .collect::<std::collections::HashSet<_>>();
         let now_ms = Duration::from(self.clock.now()).as_millis() as u64;
         let signature = popup_effect_evaluation_signature(output_name, &snapshots);
-        let force_evaluate = self
-            .popup_effect_evaluation_cache
-            .get(output_name)
-            .is_none_or(|cache| cache.signature != signature || cache.animating);
+        let force_evaluate = !self.decoration_evaluator.runtime_stopped()
+            && self
+                .popup_effect_evaluation_cache
+                .get(output_name)
+                .is_none_or(|cache| cache.signature != signature || cache.animating);
         if !force_evaluate {
             retain_effect_assignments_for_live_ids(
                 &mut self.configured_popup_effects,
@@ -3207,6 +3217,10 @@ impl ShojiWM {
                         timescope::scope!("ssd window evaluate");
                         match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
                             Ok(evaluation) => evaluation,
+                            // Stopped by the watchdog: the overlay already says so.
+                            Err(error) if error.is_runtime_stopped() => {
+                                StaticDecorationEvaluator.evaluate_window(&snapshot, now_ms)?
+                            }
                             Err(error) => {
                                 warn!(
                                     window_id = snapshot.id,
@@ -3609,6 +3623,11 @@ impl ShojiWM {
                             if runtime_state_changed && !force_full_cached_reevaluation {
                                 match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
                                     Ok(evaluation) => evaluation.into(),
+                                    Err(error) if error.is_runtime_stopped() => {
+                                        StaticDecorationEvaluator
+                                            .evaluate_window(&snapshot, now_ms)?
+                                            .into()
+                                    }
                                     Err(error) => {
                                         warn!(
                                             window_id = snapshot.id,
@@ -3631,6 +3650,12 @@ impl ShojiWM {
                                     force_full_cached_reevaluation,
                                 ) {
                                     Ok(evaluation) => evaluation,
+                                    // A stopped runtime cannot be re-seeded either.
+                                    Err(error) if error.is_runtime_stopped() => {
+                                        StaticDecorationEvaluator
+                                            .evaluate_window(&snapshot, now_ms)?
+                                            .into()
+                                    }
                                     Err(error) => {
                                         warn!(
                                             window_id = snapshot.id,
@@ -4383,12 +4408,19 @@ impl ShojiWM {
                     let previous_icon_buffers = closing.decoration.icon_buffers.clone();
                     let mut evaluation = {
                         timescope::scope!("ssd closing runtime evaluate");
-                        self.decoration_evaluator.evaluate_cached_window(
+                        match self.decoration_evaluator.evaluate_cached_window(
                             &window_id,
                             None,
                             now_ms,
                             force_full_cached_reevaluation,
-                        )?
+                        ) {
+                            Ok(evaluation) => evaluation,
+                            // Stopped by the watchdog: the close animation cannot
+                            // advance, so leave the snapshot to its close deadline
+                            // rather than failing the whole refresh every frame.
+                            Err(error) if error.is_runtime_stopped() => continue,
+                            Err(error) => return Err(error),
+                        }
                     };
                     pending_display_config_updates.push(evaluation.display_config.clone());
                     pending_process_config_updates.push(evaluation.process_config.clone());
