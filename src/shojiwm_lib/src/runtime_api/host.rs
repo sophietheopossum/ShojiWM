@@ -58,6 +58,12 @@ pub enum HostMessage {
     /// stays. A runtime may also send it unprompted, e.g. from a file
     /// watcher, to start a reload on its own.
     ReloadReady(Result<(), String>),
+    /// The runtime stopped serving requests on its own; see
+    /// [`ConfigRuntime::is_stopped`](super::ConfigRuntime::is_stopped). The
+    /// text is shown to the user. Until a reload, requests should fail fast
+    /// with `RuntimeError::RuntimeStopped` rather than answer `Unhandled`.
+    /// Send it once per stop.
+    RuntimeStopped(String),
 }
 
 /// Config deltas that every runtime reply may carry. A runtime implementation

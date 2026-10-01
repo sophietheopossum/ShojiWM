@@ -2790,6 +2790,12 @@ impl ShojiWM {
                     self.handle_runtime_pointer_move_async_invocation(invocation, &loop_handle);
                 }
                 HostMessage::ReloadReady(result) => reload_ready = Some(result),
+                // Handled at a quiet point too: a caller that drained mid-way
+                // would re-enable the scheduler from its own reply right after.
+                HostMessage::RuntimeStopped(reason) => {
+                    self.loop_handle
+                        .insert_idle(move |state| state.handle_runtime_stopped(reason));
+                }
             }
         }
         // Swap at a quiet point of the loop rather than wherever the queue
@@ -2890,6 +2896,25 @@ impl ShojiWM {
 
         let _ = self.config_runtime.window_closed(&snapshot.id);
         debug!(window_id = snapshot.id, "warmed up decoration runtime");
+    }
+
+    /// The watchdog stopped a config runtime that stopped answering. Show the
+    /// report and stop driving the runtime until Super+Shift+R reloads it.
+    fn handle_runtime_stopped(&mut self, reason: String) {
+        // A notice from a runtime a reload has already replaced.
+        if !self.config_runtime.runtime_stopped() {
+            debug!("ignoring a stop notice for a retired config runtime");
+            return;
+        }
+        // The stop is the root cause of whatever else went wrong, so it
+        // replaces any report already showing.
+        self.config_error_report = Some(crate::config_error::ConfigErrorReport::runtime(
+            crate::ssd::DecorationEvaluationError::RuntimeStopped(reason),
+        ));
+        self.runtime_scheduler_enabled = false;
+        // Effect animations the runtime was driving cannot advance now.
+        self.runtime_animation_outputs.clear();
+        self.schedule_redraw();
     }
 
     /// `Super+Shift+R`: ask the runtime to prepare a hot reload. A runtime that

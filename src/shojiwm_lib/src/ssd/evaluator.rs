@@ -596,4 +596,15 @@ pub enum DecorationEvaluationError {
     RuntimeProtocol(String),
     #[error("{0} is not supported by this config runtime")]
     Unsupported(&'static str),
+    #[error("config runtime stopped: {0}")]
+    RuntimeStopped(String),
+}
+
+impl DecorationEvaluationError {
+    /// The config runtime stopped serving requests (see
+    /// `runtime_api::ConfigRuntime::is_stopped`). It repeats until a reload,
+    /// so callers fall back quietly instead of warning every time.
+    pub fn is_runtime_stopped(&self) -> bool {
+        matches!(self, Self::RuntimeStopped(_))
+    }
 }

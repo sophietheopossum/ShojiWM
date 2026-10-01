@@ -79,6 +79,12 @@ impl RuntimeHandle {
         &self.host
     }
 
+    /// The runtime stopped serving requests and nothing has reloaded it.
+    /// Cheap enough for per-key and per-frame checks.
+    pub fn runtime_stopped(&self) -> bool {
+        self.runtime.is_stopped()
+    }
+
     pub fn preload(&mut self) -> Result<(), RuntimeError> {
         self.runtime.preload()
     }
