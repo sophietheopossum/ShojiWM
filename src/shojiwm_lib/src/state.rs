@@ -438,6 +438,12 @@ pub struct ShojiWM {
     pub redraw_all_outputs: bool,
     /// Per-output frame pacing from the config (`COMPOSITOR.rendering.framePacing`).
     pub frame_pacing: crate::frame_pacing::FramePacingConfig,
+    /// A runtime wake arrived while frames drive the scheduler; the next frame tick runs
+    /// for it (see `register_runtime_wake_signal`).
+    pub runtime_wake_pending: bool,
+    /// Bumped whenever a wake is deferred, so a fallback timer armed for an earlier,
+    /// already-serviced wake does nothing.
+    pub runtime_wake_generation: u64,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
     pub runtime_output_globals: HashMap<String, GlobalId>,
     /// Per-output color mode/signal state, keyed by output name (tty only).
@@ -1833,6 +1839,8 @@ impl ShojiWM {
             pending_output_redraws: Default::default(),
             redraw_all_outputs: false,
             frame_pacing: Default::default(),
+            runtime_wake_pending: false,
+            runtime_wake_generation: 0,
             runtime_scheduler_kick_generation: 0,
             runtime_scheduler_kick_active: false,
             runtime_scheduler_kick_interval_ms: None,
