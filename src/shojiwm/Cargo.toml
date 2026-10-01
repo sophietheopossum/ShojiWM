@@ -15,6 +15,8 @@ shojiwm_lib = { path = "../shojiwm_lib" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 tracing = "0.1.41"
+# `gettid`: the runtime watchdog reads the config thread's CPU time from /proc.
+libc = "0.2"
 timescope = "0.1.3"
 # web_stub, not web: `web` is one of rustyscript's network_extensions and pulls
 # deno_net/deno_fetch/deno_tls, so rustls, ring, reqwest and quinn end up in a
