@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     ffi::CStr,
     os::unix::fs::FileTypeExt,
@@ -10,9 +10,11 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tracing::{error, info, warn};
 
 thread_local! {
     static RUNTIME_CURRENT_DIR: RefCell<PathBuf> = RefCell::new(
@@ -70,6 +72,11 @@ use shojiwm_lib::ssd::{
     },
 };
 use shojiwm_lib::runtime_input::RuntimeInputDeviceSnapshot;
+use crate::runtime_watchdog::{
+    ExitGuard, InFlight, RequestClass, RequestKind, RuntimeControl, RuntimeWatchdog, StopLever,
+    TEARDOWN_AFTER_KILL, WaitOutcome, flush_slow_trips_if_due, hang_report, monotonic_ns,
+    record_slow_trip, request_label, thread_cpu_ns, wait_credited,
+};
 
 /// Composition requests cross the CppGC bridge as V8 values instead of JSON
 /// frames. Ownership moves into the request envelope, so large snapshots are
@@ -676,6 +683,7 @@ struct BridgeRegistration {
     overlay_owner: Arc<AtomicBool>,
     requests: tokio::sync::mpsc::UnboundedReceiver<BridgeRequest>,
     responses: Sender<EmbeddedRuntimeResponse>,
+    control: Arc<RuntimeControl>,
     composition_updates: Arc<Mutex<HashMap<u64, NativeCompositionUpdate>>>,
     effect_updates: Arc<Mutex<HashMap<u64, NativeEffectUpdate>>>,
     effect_uniform_patch_count: Arc<AtomicU32>,
@@ -740,6 +748,7 @@ struct ShojiRuntimeBridge {
     overlay_owner: Arc<AtomicBool>,
     requests: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<BridgeRequest>>,
     responses: Sender<EmbeddedRuntimeResponse>,
+    control: Arc<RuntimeControl>,
     composition_updates: Arc<Mutex<HashMap<u64, NativeCompositionUpdate>>>,
     effect_updates: Arc<Mutex<HashMap<u64, NativeEffectUpdate>>>,
     composition_uniform_slots: Mutex<HashMap<u32, NativeShaderUniformSlot>>,
@@ -1067,6 +1076,7 @@ impl ShojiRuntimeBridge {
             overlay_owner: registration.overlay_owner,
             requests: tokio::sync::Mutex::new(registration.requests),
             responses: registration.responses,
+            control: registration.control,
             composition_updates: registration.composition_updates,
             effect_updates: registration.effect_updates,
             composition_uniform_slots: Mutex::new(HashMap::new()),
@@ -1112,14 +1122,14 @@ impl ShojiRuntimeBridge {
     #[async_method]
     #[cppgc]
     async fn read_request(&self) -> Option<RuntimeRequestEnvelope> {
-        self.requests
-            .lock()
-            .await
-            .recv()
-            .await
-            .map(|request| RuntimeRequestEnvelope {
-                request: Mutex::new(Some(request)),
-            })
+        if self.control.is_killed() {
+            return None;
+        }
+        let request = self.requests.lock().await.recv().await?;
+        self.control.note_dequeued();
+        Some(RuntimeRequestEnvelope {
+            request: Mutex::new(Some(request)),
+        })
     }
 
     #[fast]
@@ -2437,6 +2447,29 @@ pub struct EmbeddedRuntime {
     effect_uniform_patch_count: Arc<AtomicU32>,
     worker: Option<JoinHandle<()>>,
     worker_error: Arc<Mutex<Option<String>>>,
+    bridge_id: u32,
+    control: Arc<RuntimeControl>,
+    watchdog: RuntimeWatchdog,
+    /// Budget for requests while the config is still loading.
+    load_budget: Duration,
+    in_flight: Cell<Option<InFlight>>,
+    sent: Cell<u64>,
+    /// Set by the first answer to anything but drainPreload: every other
+    /// request awaits the config import, so until then requests are loading.
+    loaded: Cell<bool>,
+    /// Kinds answered at least once; a kind's first trip runs cold JIT code
+    /// and is not reported as slow.
+    seen_kinds: Cell<u64>,
+    last_done: Cell<Option<(RequestKind, Instant)>>,
+}
+
+/// `EmbeddedRuntime::start` failed. `timed_out` means the watchdog stopped an
+/// isolate that never finished starting.
+#[derive(Debug)]
+pub struct RuntimeStartError {
+    pub message: String,
+    pub timed_out: bool,
+    pub bridge_id: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -2706,8 +2739,16 @@ impl EmbeddedRuntime {
         script_path: PathBuf,
         config_path: PathBuf,
         working_dir: Option<PathBuf>,
-    ) -> Result<Self, String> {
+        watchdog: RuntimeWatchdog,
+        load_budget: Duration,
+    ) -> Result<Self, RuntimeStartError> {
         let bridge_id = NEXT_BRIDGE_ID.fetch_add(1, Ordering::Relaxed);
+        let start_error = |message: String| RuntimeStartError {
+            message,
+            timed_out: false,
+            bridge_id,
+        };
+        let started_at = Instant::now();
         let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
         let (response_tx, response_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -2718,16 +2759,19 @@ impl EmbeddedRuntime {
         let effect_uniform_patch_count = Arc::new(AtomicU32::new(0));
         let overlay_owner = Arc::new(AtomicBool::new(true));
         let overlay_owner_for_thread = overlay_owner.clone();
+        let control = Arc::new(RuntimeControl::default());
+        let control_for_thread = Arc::clone(&control);
 
         bridge_registrations()
             .lock()
-            .map_err(|_| "runtime bridge registry is poisoned".to_owned())?
+            .map_err(|_| start_error("runtime bridge registry is poisoned".to_owned()))?
             .insert(
                 bridge_id,
                 BridgeRegistration {
                     overlay_owner: overlay_owner.clone(),
                     requests: request_rx,
                     responses: response_tx,
+                    control: Arc::clone(&control),
                     composition_updates: Arc::clone(&composition_updates),
                     effect_updates: Arc::clone(&effect_updates),
                     effect_uniform_patch_count: Arc::clone(&effect_uniform_patch_count),
@@ -2737,12 +2781,15 @@ impl EmbeddedRuntime {
         let worker = match thread::Builder::new()
             .name("shoji-deno-runtime".to_owned())
             .spawn(move || {
+                // Bound first so it drops last, once the isolate is gone.
+                let _exit = ExitGuard(Arc::clone(&control_for_thread));
                 let result = run_runtime(
                     bridge_id,
                     &script_path,
                     &config_path,
                     working_dir.as_deref(),
                     &ready_tx,
+                    &control_for_thread,
                 );
                 shojiwm_lib::backend::overlay::close_owner(&overlay_owner_for_thread);
                 if let Err(error) = result {
@@ -2752,7 +2799,10 @@ impl EmbeddedRuntime {
                     if let Ok(mut slot) = worker_error_for_thread.lock() {
                         *slot = Some(error.clone());
                     }
-                    let _ = ready_tx.send(Err(error));
+                    // Never block here: if the watchdog stopped a start that
+                    // had just sent Ok, that Ok still fills the one slot, and a
+                    // blocking send would hold the thread past its exit.
+                    let _ = ready_tx.try_send(Err(error));
                 }
             }) {
             Ok(worker) => worker,
@@ -2760,77 +2810,162 @@ impl EmbeddedRuntime {
                 if let Ok(mut registrations) = bridge_registrations().lock() {
                     registrations.remove(&bridge_id);
                 }
-                return Err(format!("failed to spawn embedded runtime thread: {error}"));
+                return Err(start_error(format!(
+                    "failed to spawn embedded runtime thread: {error}"
+                )));
             }
         };
 
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                overlay_owner,
-                requests: Some(request_tx),
-                responses: response_rx,
-                composition_updates,
-                effect_updates,
-                effect_state_cache: Mutex::new(NativeEffectStateCache::default()),
-                effect_uniform_patch_count,
-                worker: Some(worker),
-                worker_error,
-            }),
-            Ok(Err(error)) => {
-                let _ = worker.join();
-                Err(error)
+        let ready_budget = if watchdog.enabled {
+            load_budget
+        } else {
+            Duration::MAX
+        };
+        match wait_credited(&ready_rx, ready_budget, |_| {}) {
+            WaitOutcome::Received(Ok(())) => {
+                info!(
+                    bridge_id,
+                    elapsed = ?started_at.elapsed(),
+                    "config runtime isolate started"
+                );
+                Ok(Self {
+                    overlay_owner,
+                    requests: Some(request_tx),
+                    responses: response_rx,
+                    composition_updates,
+                    effect_updates,
+                    effect_state_cache: Mutex::new(NativeEffectStateCache::default()),
+                    effect_uniform_patch_count,
+                    worker: Some(worker),
+                    worker_error,
+                    bridge_id,
+                    control,
+                    watchdog,
+                    load_budget,
+                    in_flight: Cell::new(None),
+                    sent: Cell::new(0),
+                    loaded: Cell::new(false),
+                    seen_kinds: Cell::new(0),
+                    last_done: Cell::new(None),
+                })
             }
-            Err(_) => {
+            WaitOutcome::Received(Err(error)) => {
                 let _ = worker.join();
-                Err("embedded runtime exited before initialization".to_owned())
+                Err(start_error(error))
+            }
+            WaitOutcome::Disconnected => {
+                let _ = worker.join();
+                Err(start_error(
+                    "embedded runtime exited before initialization".to_owned(),
+                ))
+            }
+            WaitOutcome::TimedOut => {
+                let message = format!(
+                    "The config runtime did not finish starting within {load_budget:?}, so \
+                     ShojiWM stopped it. Windows and input keep working with basic decorations \
+                     until you fix the config and press Super+Shift+R."
+                );
+                control.kill(message.clone());
+                error!(bridge_id, ?load_budget, "config runtime hung while starting; stopped it");
+                if control.wait_exited(TEARDOWN_AFTER_KILL) {
+                    let _ = worker.join();
+                } else {
+                    control.abandon();
+                    warn!(bridge_id, "detached a config runtime thread that would not exit");
+                }
+                if let Ok(mut registrations) = bridge_registrations().lock() {
+                    registrations.remove(&bridge_id);
+                }
+                Err(RuntimeStartError {
+                    message,
+                    timed_out: true,
+                    bridge_id,
+                })
             }
         }
     }
 
-    pub fn write_request(&self, request: &str) -> Result<(), String> {
-        self.requests
+    /// Queue a request and remember it as the one in flight.
+    fn send(
+        &self,
+        request: BridgeRequest,
+        kind: RequestKind,
+        label: Option<String>,
+    ) -> Result<(), String> {
+        if let Some(reason) = self.control.kill_reason() {
+            return Err(reason);
+        }
+        let requests = self
+            .requests
             .as_ref()
-            .ok_or_else(|| "embedded runtime is closed".to_owned())?
-            .send(BridgeRequest::Json(request.to_owned()))
-            .map_err(|_| self.failure_message("embedded runtime request channel closed"))
+            .ok_or_else(|| "embedded runtime is closed".to_owned())?;
+        let seq = self.sent.get() + 1;
+        self.in_flight.set(Some(InFlight {
+            kind,
+            label,
+            written_at: Instant::now(),
+            written_at_ns: monotonic_ns(),
+            seq,
+        }));
+        requests
+            .send(request)
+            .map_err(|_| self.failure_message("embedded runtime request channel closed"))?;
+        self.sent.set(seq);
+        Ok(())
+    }
+
+    pub fn write_request(&self, request: &str) -> Result<(), String> {
+        let kind = super::evaluator::extract_json_kind(request)
+            .map_or(RequestKind::UNKNOWN, RequestKind::named);
+        self.send(
+            BridgeRequest::Json(request.to_owned()),
+            kind,
+            request_label(request),
+        )
     }
 
     pub fn write_composition_request(
         &self,
         request: NativeCompositionRequest,
     ) -> Result<(), String> {
-        self.requests
-            .as_ref()
-            .ok_or_else(|| "embedded runtime is closed".to_owned())?
-            .send(BridgeRequest::Composition(request))
-            .map_err(|_| self.failure_message("embedded runtime request channel closed"))
+        let kind = RequestKind::named(match &request {
+            NativeCompositionRequest::Evaluate { .. } => "evaluate",
+            NativeCompositionRequest::EvaluatePreview { .. } => "evaluatePreview",
+            NativeCompositionRequest::EvaluateCached { .. } => "evaluateCached",
+        });
+        self.send(BridgeRequest::Composition(request), kind, None)
     }
 
     pub fn write_effect_request(&self, request: NativeEffectRequest) -> Result<(), String> {
-        self.requests
-            .as_ref()
-            .ok_or_else(|| "embedded runtime is closed".to_owned())?
-            .send(BridgeRequest::Effect(request))
-            .map_err(|_| self.failure_message("embedded runtime request channel closed"))
+        let kind = RequestKind::named(match &request {
+            NativeEffectRequest::GetEffectConfig { .. } => "getEffectConfig",
+            NativeEffectRequest::EvaluateLayerEffects { .. } => "evaluateLayerEffects",
+            NativeEffectRequest::EvaluatePopupEffects { .. } => "evaluatePopupEffects",
+        });
+        self.send(BridgeRequest::Effect(request), kind, None)
     }
 
     pub fn write_interaction_request(
         &self,
         request: NativeInteractionRequest,
     ) -> Result<(), String> {
-        self.requests
-            .as_ref()
-            .ok_or_else(|| "embedded runtime is closed".to_owned())?
-            .send(BridgeRequest::Interaction(request))
-            .map_err(|_| self.failure_message("embedded runtime request channel closed"))
+        let kind = RequestKind::named(match &request {
+            NativeInteractionRequest::PointerMove { .. } => "pointerMove",
+            NativeInteractionRequest::PointerMoveAsync { .. } => "pointerMoveAsync",
+            NativeInteractionRequest::GestureSwipe { .. } => "gestureSwipe",
+            NativeInteractionRequest::GestureSwipeAsync { .. } => "gestureSwipeAsync",
+            NativeInteractionRequest::WindowMove { .. } => "windowMove",
+            NativeInteractionRequest::WindowResize { .. } => "windowResize",
+        });
+        self.send(BridgeRequest::Interaction(request), kind, None)
     }
 
     pub fn write_scheduler_request(&self, request: NativeSchedulerRequest) -> Result<(), String> {
-        self.requests
-            .as_ref()
-            .ok_or_else(|| "embedded runtime is closed".to_owned())?
-            .send(BridgeRequest::Scheduler(request))
-            .map_err(|_| self.failure_message("embedded runtime request channel closed"))
+        self.send(
+            BridgeRequest::Scheduler(request),
+            RequestKind::named("schedulerTick"),
+            None,
+        )
     }
 
     pub fn write_cached_fast_request(
@@ -2840,24 +2975,24 @@ impl EmbeddedRuntime {
         force_full_reevaluation: bool,
         now_ms: u64,
     ) -> Result<(), String> {
-        self.requests
-            .as_ref()
-            .ok_or_else(|| "embedded runtime is closed".to_owned())?
-            .send(BridgeRequest::CachedFast {
+        self.send(
+            BridgeRequest::CachedFast {
                 request_id,
                 window_id,
                 force_full_reevaluation,
                 now_ms,
-            })
-            .map_err(|_| self.failure_message("embedded runtime request channel closed"))
+            },
+            RequestKind::named("evaluateCached"),
+            None,
+        )
     }
 
     pub fn write_scheduler_fast_request(&self, request_id: u64, now_ms: f64) -> Result<(), String> {
-        self.requests
-            .as_ref()
-            .ok_or_else(|| "embedded runtime is closed".to_owned())?
-            .send(BridgeRequest::SchedulerFast { request_id, now_ms })
-            .map_err(|_| self.failure_message("embedded runtime request channel closed"))
+        self.send(
+            BridgeRequest::SchedulerFast { request_id, now_ms },
+            RequestKind::named("schedulerTick"),
+            None,
+        )
     }
 
     pub fn take_composition_update(
@@ -2894,28 +3029,197 @@ impl EmbeddedRuntime {
         self.effect_uniform_patch_count.load(Ordering::Relaxed)
     }
 
+    /// Wait for the answer to the request in flight. A request that outlives
+    /// its budget gets the isolate stopped and returns the hang report; the
+    /// isolate is never read from again, so a late answer cannot be mistaken
+    /// for the answer to a later request.
     pub fn read_response(&self) -> Result<Option<EmbeddedRuntimeResponse>, String> {
-        match self.responses.recv() {
-            Ok(response) => Ok(Some(response)),
-            Err(_) => {
-                // The V8 runtime drops its response sender immediately before
-                // the worker records the terminal error. Give that hand-off a
-                // short bounded window so callers receive the real JS/op error
-                // instead of a misleading clean EOF.
-                for _ in 0..20 {
-                    if let Some(error) = self
-                        .worker_error
-                        .lock()
-                        .ok()
-                        .and_then(|error| error.clone())
-                    {
-                        return Err(error);
-                    }
-                    thread::sleep(std::time::Duration::from_millis(1));
+        if let Some(reason) = self.control.kill_reason() {
+            return Err(reason);
+        }
+        let in_flight = self.in_flight.take();
+        let kind = in_flight
+            .as_ref()
+            .map_or(RequestKind::UNKNOWN, |request| request.kind);
+        let loading = !self.loaded.get() || kind == RequestKind::named("lifecycleEnable");
+        let (budget, stuck) = if loading {
+            (self.load_budget, self.watchdog.load_stuck_warn)
+        } else {
+            (self.watchdog.hang, self.watchdog.stuck_warn)
+        };
+        let tid = self.control.tid();
+        // The runtime thread's CPU time from the first slow slice on, read
+        // only once a request has stalled, so answered requests never pay for
+        // a /proc read.
+        let mut cpu_since: Option<(u64, Duration)> = None;
+        let mut warned = false;
+        let mut waited = Duration::ZERO;
+        loop {
+            let outcome = wait_credited(&self.responses, budget, |credited| {
+                if cpu_since.is_none() {
+                    cpu_since = thread_cpu_ns(tid).map(|cpu| (cpu, credited));
                 }
-                Ok(None)
+                if !warned && credited >= stuck {
+                    warned = true;
+                    warn!(
+                        target: "shoji_wm::runtime_watchdog",
+                        bridge_id = self.bridge_id,
+                        kind = kind.name(),
+                        label = in_flight.as_ref().and_then(|request| request.label.as_deref()),
+                        waited = ?credited,
+                        picked_up = self.picked_up(in_flight.as_ref()),
+                        "config runtime request still waiting"
+                    );
+                }
+            });
+            match outcome {
+                WaitOutcome::Received(response) => {
+                    self.finish_trip(in_flight.as_ref(), loading);
+                    return Ok(Some(response));
+                }
+                WaitOutcome::Disconnected => return self.disconnected(),
+                WaitOutcome::TimedOut => {
+                    waited += budget;
+                    let picked_up = self.picked_up(in_flight.as_ref());
+                    let cpu_ratio = cpu_since.zip(thread_cpu_ns(tid)).map(
+                        |((before, credited_at), after)| {
+                            let span = waited.saturating_sub(credited_at).as_nanos().max(1);
+                            after.saturating_sub(before) as f64 / span as f64
+                        },
+                    );
+                    let report = hang_report(
+                        in_flight.as_ref(),
+                        budget,
+                        picked_up,
+                        cpu_ratio,
+                        self.last_done.get(),
+                    );
+                    if !self.watchdog.enabled {
+                        error!(
+                            target: "shoji_wm::runtime_watchdog",
+                            bridge_id = self.bridge_id,
+                            kind = kind.name(),
+                            ?waited,
+                            %report,
+                            "config runtime hung; SHOJI_RUNTIME_WATCHDOG=off, so still waiting"
+                        );
+                        continue;
+                    }
+                    self.control.kill(report.clone());
+                    error!(
+                        target: "shoji_wm::runtime_watchdog",
+                        bridge_id = self.bridge_id,
+                        kind = kind.name(),
+                        ?budget,
+                        picked_up,
+                        ?cpu_ratio,
+                        %report,
+                        "config runtime hung; stopped it"
+                    );
+                    return Err(report);
+                }
             }
         }
+    }
+
+    fn picked_up(&self, in_flight: Option<&InFlight>) -> bool {
+        in_flight.is_some_and(|request| self.control.dequeued() >= request.seq)
+    }
+
+    fn finish_trip(&self, in_flight: Option<&InFlight>, loading: bool) {
+        let Some(request) = in_flight else {
+            return;
+        };
+        let total = request.written_at.elapsed();
+        let class = request.kind.class();
+        if class == RequestClass::Lifecycle {
+            info!(
+                bridge_id = self.bridge_id,
+                kind = request.kind.name(),
+                elapsed = ?total,
+                "config runtime lifecycle request answered"
+            );
+        }
+        let first_of_kind = self.seen_kinds.get() & request.kind.bit() == 0;
+        self.seen_kinds.set(self.seen_kinds.get() | request.kind.bit());
+        let threshold = match class {
+            RequestClass::Frame => Some(self.watchdog.slow_frame),
+            RequestClass::Discrete => Some(self.watchdog.slow_discrete),
+            RequestClass::Lifecycle => None,
+        };
+        if let Some(threshold) = threshold
+            && !loading
+            && !first_of_kind
+            && total >= threshold
+        {
+            let queued = if self.picked_up(Some(request)) {
+                Duration::from_nanos(
+                    self.control
+                        .dequeued_at_ns()
+                        .saturating_sub(request.written_at_ns),
+                )
+                .min(total)
+            } else {
+                total
+            };
+            record_slow_trip(
+                request.kind,
+                request.label.as_deref(),
+                total,
+                queued,
+                self.last_done.get().map(|(kind, _)| kind),
+            );
+        }
+        if request.kind != RequestKind::named("drainPreload") {
+            self.loaded.set(true);
+        }
+        self.last_done.set(Some((request.kind, Instant::now())));
+        flush_slow_trips_if_due();
+    }
+
+    fn disconnected(&self) -> Result<Option<EmbeddedRuntimeResponse>, String> {
+        if let Some(reason) = self.control.kill_reason() {
+            return Err(reason);
+        }
+        // The V8 runtime drops its response sender immediately before
+        // the worker records the terminal error. Give that hand-off a
+        // short bounded window so callers receive the real JS/op error
+        // instead of a misleading clean EOF.
+        for _ in 0..20 {
+            if let Some(error) = self
+                .worker_error
+                .lock()
+                .ok()
+                .and_then(|error| error.clone())
+            {
+                return Err(error);
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(None)
+    }
+
+    pub fn bridge_id(&self) -> u32 {
+        self.bridge_id
+    }
+
+    /// The watchdog stopped this isolate; it will not answer again.
+    pub fn is_killed(&self) -> bool {
+        self.control.is_killed()
+    }
+
+    pub fn kill_reason(&self) -> Option<String> {
+        self.control.kill_reason()
+    }
+
+    /// True for exactly one caller after the watchdog stopped this isolate.
+    pub fn claim_stop_report(&self) -> bool {
+        self.control.claim_stop_report()
+    }
+
+    #[cfg(test)]
+    pub fn wait_exited(&self, timeout: Duration) -> bool {
+        self.control.wait_exited(timeout)
     }
 
     pub fn try_wait(&mut self) -> std::io::Result<Option<EmbeddedRuntimeExitStatus>> {
@@ -2938,20 +3242,47 @@ impl EmbeddedRuntime {
 
     pub fn wait(&mut self) -> std::io::Result<EmbeddedRuntimeExitStatus> {
         shojiwm_lib::backend::overlay::close_owner(&self.overlay_owner);
-        self.requests.take();
-        let code = self
-            .worker
-            .take()
-            .map(|worker| if worker.join().is_ok() { 0 } else { -1 })
-            .unwrap_or_default();
+        let code = self.bounded_teardown();
         Ok(EmbeddedRuntimeExitStatus { code })
     }
 
+    /// Close the request channel and join the runtime thread, without ever
+    /// blocking on a thread that will not exit: a healthy runtime gets
+    /// `teardown_grace` to finish (its final GCs included), a stopped or stuck
+    /// one is detached instead of joined.
+    fn bounded_teardown(&mut self) -> i32 {
+        self.requests.take();
+        let Some(worker) = self.worker.take() else {
+            return 0;
+        };
+        let join = |worker: JoinHandle<()>| if worker.join().is_ok() { 0 } else { -1 };
+        if !self.control.is_killed() {
+            if self.control.wait_exited(self.watchdog.teardown_grace) {
+                return join(worker);
+            }
+            warn!(
+                bridge_id = self.bridge_id,
+                grace = ?self.watchdog.teardown_grace,
+                "config runtime did not exit after it was closed; stopping it"
+            );
+            self.control
+                .kill("the config runtime did not exit after it was closed".to_owned());
+        }
+        if self.control.wait_exited(TEARDOWN_AFTER_KILL) {
+            return join(worker);
+        }
+        self.control.abandon();
+        warn!(
+            bridge_id = self.bridge_id,
+            "detached a config runtime thread that would not exit"
+        );
+        -1
+    }
+
     fn failure_message(&self, fallback: &str) -> String {
-        self.worker_error
-            .lock()
-            .ok()
-            .and_then(|error| error.clone())
+        self.control
+            .kill_reason()
+            .or_else(|| self.worker_error.lock().ok().and_then(|error| error.clone()))
             .unwrap_or_else(|| fallback.to_owned())
     }
 }
@@ -2959,10 +3290,7 @@ impl EmbeddedRuntime {
 impl Drop for EmbeddedRuntime {
     fn drop(&mut self) {
         shojiwm_lib::backend::overlay::close_owner(&self.overlay_owner);
-        self.requests.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.bounded_teardown();
     }
 }
 
@@ -2972,7 +3300,9 @@ fn run_runtime(
     config_path: &std::path::Path,
     working_dir: Option<&std::path::Path>,
     ready: &mpsc::SyncSender<Result<(), String>>,
+    control: &Arc<RuntimeControl>,
 ) -> Result<(), String> {
+    control.set_current_thread();
     #[cfg(test)]
     let _test_dir = TestRuntimeDir::new(bridge_id)
         .map_err(|error| format!("failed to isolate test runtime: {error}"))?;
@@ -3011,6 +3341,19 @@ fn run_runtime(
     })
     .map_err(|error| format!("failed to create RustyScript runtime: {error}"))?;
 
+    // Arm the watchdog before any config code can run. Termination stops
+    // running JS; cancelling the runtime's token ends a `block_on` parked on
+    // an await that never resolves, which termination alone cannot reach.
+    // RustyScript uses the same token to unwind on heap exhaustion.
+    let isolate = runtime.deno_runtime().v8_isolate().thread_safe_handle();
+    let cancel = runtime.heap_exhausted_token();
+    control.arm(StopLever::new(
+        move || {
+            isolate.terminate_execution();
+        },
+        move || cancel.cancel(),
+    ));
+
     runtime
         .set_current_dir(&runtime_working_dir)
         .map_err(|error| format!("failed to set runtime working directory: {error}"))?;
@@ -3037,7 +3380,11 @@ fn run_runtime(
     // in V8's own arena instead of returning them to the OS. Hint V8 to
     // shrink its heap before `runtime` drops here, so this isolate's peak
     // doesn't linger past its own teardown.
-    runtime.deno_runtime().v8_isolate().low_memory_notification();
+    // A stopped isolate skips this: its owner is waiting for the thread to
+    // exit, and a runaway heap would make the GCs slow.
+    if !control.is_killed() {
+        runtime.deno_runtime().v8_isolate().low_memory_notification();
+    }
 
     result
 }
