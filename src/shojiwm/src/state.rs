@@ -5468,3 +5468,40 @@ mod subpixel_latch_tests {
         assert_eq!(output.physical_properties().subpixel, Subpixel::Unknown);
     }
 }
+
+/// Whether a frame about to be shown at `frame_time_ms` ticks the runtime
+/// scheduler, and if so whether the tick is forced past its idle fast path.
+/// A deferred wake always ticks, forced; otherwise only a poll due by the frame
+/// does (half a millisecond of slack absorbs rounding between the clocks).
+fn frame_scheduler_tick(
+    scheduler_enabled: bool,
+    next_due_ms: Option<f64>,
+    wake_pending: bool,
+    frame_time_ms: f64,
+) -> Option<bool> {
+    if wake_pending {
+        return Some(true);
+    }
+    let due = next_due_ms.is_some_and(|due_ms| due_ms <= frame_time_ms + 0.5);
+    (scheduler_enabled && due).then_some(false)
+}
+
+#[cfg(test)]
+mod frame_scheduler_tick_tests {
+    use super::frame_scheduler_tick;
+
+    #[test]
+    fn frame_ticks_only_for_a_due_poll() {
+        assert_eq!(frame_scheduler_tick(true, Some(100.0), false, 100.0), Some(false));
+        assert_eq!(frame_scheduler_tick(true, Some(100.4), false, 100.0), Some(false));
+        assert_eq!(frame_scheduler_tick(true, Some(101.0), false, 100.0), None);
+        assert_eq!(frame_scheduler_tick(true, None, false, 100.0), None);
+        assert_eq!(frame_scheduler_tick(false, Some(90.0), false, 100.0), None);
+    }
+
+    #[test]
+    fn deferred_wake_forces_the_frame_tick() {
+        assert_eq!(frame_scheduler_tick(true, Some(200.0), true, 100.0), Some(true));
+        assert_eq!(frame_scheduler_tick(false, None, true, 100.0), Some(true));
+    }
+}
