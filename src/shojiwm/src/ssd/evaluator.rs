@@ -8914,4 +8914,172 @@ COMPOSITOR.window.composition = () => <Label text="x" />;
             .expect("real config should disable");
         drop(evaluator);
     }
+
+    /// Where a frame-paced poll steps when wake ticks land between frames.
+    /// Frame ticks are stamped with the next frame's presentation time and
+    /// run ahead of the wall clock; a wake tick carries whatever time Rust
+    /// stamps it with. Returns the poll's step times.
+    enum Turn {
+        /// A scheduler tick stamped with this time.
+        Tick(f64),
+        /// Any other request, stamped with the wall clock (here a key press).
+        Request(u64),
+    }
+
+    fn poll_steps_with_wake_ticks(name: &str, turns: &[Turn]) -> Vec<f64> {
+        let socket_dir = std::env::temp_dir().join(format!(
+            "shojiwm-wake-judder-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory should be created");
+        let socket_path = socket_dir.join("ipc.sock");
+        let socket_literal =
+            serde_json::to_string(&socket_path.to_string_lossy()).expect("path should serialize");
+        // 1000 / 120 Hz, as the kinetic scroll registers it.
+        let (evaluator, test_dir) = watchdog_evaluator(
+            &format!("wake-judder-{name}"),
+            &format!(
+                r#"
+import {{ Box, COMPOSITOR, createPoll }} from "shoji_wm";
+import {{ createIpcServer }} from "shoji_wm/ipc";
+const ipc = createIpcServer({socket_literal});
+const steps: number[] = [];
+COMPOSITOR.key.bind("start", "Super+K", () => {{
+  createPoll(1000 / 120, (handle) => {{ steps.push(handle.nowMs); }});
+}});
+COMPOSITOR.key.bind("noop", "Super+N", () => {{}});
+ipc.handle("steps", () => steps);
+COMPOSITOR.onDisable(() => ipc.close());
+COMPOSITOR.window.composition = () => <Box />;
+"#
+            ),
+        );
+        evaluator
+            .lifecycle_enable("initial", None)
+            .expect("initial lifecycle enable should succeed");
+        evaluator
+            .invoke_key_binding("start", 1000)
+            .expect("start binding should run");
+        for turn in turns {
+            match *turn {
+                Turn::Tick(now_ms) => {
+                    evaluator.scheduler_tick(now_ms).expect("tick should succeed");
+                }
+                Turn::Request(now_ms) => {
+                    evaluator
+                        .invoke_key_binding("noop", now_ms)
+                        .expect("noop binding should run");
+                }
+            }
+        }
+        let mut socket = UnixStream::connect(&socket_path).expect("IPC should accept");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout should be configured");
+        socket
+            .write_all(b"{\"id\":1,\"method\":\"steps\"}\n")
+            .expect("request should be written");
+        let mut line = String::new();
+        BufReader::new(socket)
+            .read_line(&mut line)
+            .expect("response should be read");
+        let response: serde_json::Value =
+            serde_json::from_str(&line).expect("response should be JSON");
+        let steps = response["result"]
+            .as_array()
+            .expect("steps should be an array")
+            .iter()
+            .map(|step| step.as_f64().expect("step should be a number"))
+            .collect();
+        evaluator
+            .lifecycle_disable("test")
+            .expect("lifecycle disable should succeed");
+        drop(evaluator);
+        let _ = std::fs::remove_dir_all(&test_dir);
+        let _ = std::fs::remove_dir_all(&socket_dir);
+        steps
+    }
+
+    const FRAME_MS: f64 = 1000.0 / 120.0;
+
+    #[test]
+    fn wake_ticks_between_on_time_frames_never_step_a_frame_paced_poll() {
+        let _fd_count = lock_process_fd_count();
+        // Frames tick ahead of the clock; each wake lands at wall time,
+        // behind the frame already stepped.
+        let frame = |k: f64| 1000.0 + k * FRAME_MS;
+        let turns = [
+            Turn::Tick(frame(1.0)),
+            Turn::Tick(frame(1.0) - 3.0),
+            Turn::Tick(frame(2.0)),
+            Turn::Tick(frame(2.0) - 5.0),
+            Turn::Tick(frame(3.0)),
+            Turn::Tick(frame(3.0) - 1.0),
+            Turn::Tick(frame(4.0)),
+        ];
+        let steps = poll_steps_with_wake_ticks("on-time", &turns);
+        assert_eq!(
+            steps,
+            vec![frame(1.0), frame(2.0), frame(3.0), frame(4.0)],
+            "only frame ticks should step the poll"
+        );
+    }
+
+    #[test]
+    fn wake_tick_after_a_missed_frame_steps_off_frame_and_stales_the_next_one() {
+        let _fd_count = lock_process_fd_count();
+        let frame = |k: f64| 1000.0 + k * FRAME_MS;
+        // Frame 3 was missed: no tick for it. A wake lands at wall time
+        // 9 ms after the last stepped frame, then frame 4 ticks.
+        let wall_wake = frame(2.0) + 9.0;
+        let steps = poll_steps_with_wake_ticks(
+            "missed-frame-wall",
+            &[
+                Turn::Tick(frame(1.0)),
+                Turn::Tick(frame(2.0)),
+                Turn::Tick(wall_wake),
+                Turn::Tick(frame(4.0)),
+            ],
+        );
+        assert_eq!(
+            steps,
+            vec![frame(1.0), frame(2.0), wall_wake],
+            "a wall-clock wake steps between frames, so frame 4 finds the poll \
+             not due and shows the wake's earlier position"
+        );
+
+        // Stamping the wake with the last frame's time is not enough: any
+        // wall-stamped request in the same gap has already moved the
+        // runtime's (monotonic) clock, and the wake steps at that time.
+        // Late enough in the gap that frame 4 is no longer due afterwards
+        // (anything later than 8 ms before frame 4 behaves the same).
+        let wall_request = (frame(2.0) + 9.5) as u64;
+        let steps = poll_steps_with_wake_ticks(
+            "missed-frame-stamped",
+            &[
+                Turn::Tick(frame(1.0)),
+                Turn::Tick(frame(2.0)),
+                Turn::Request(wall_request),
+                Turn::Tick(frame(2.0)),
+                Turn::Tick(frame(4.0)),
+            ],
+        );
+        assert_eq!(
+            steps,
+            vec![frame(1.0), frame(2.0), wall_request as f64],
+            "a frame-stamped wake still steps off-frame behind a wall-clock request"
+        );
+
+        // Deferring the wake into the next frame's tick steps on the frame.
+        let steps = poll_steps_with_wake_ticks(
+            "missed-frame-deferred",
+            &[
+                Turn::Tick(frame(1.0)),
+                Turn::Tick(frame(2.0)),
+                Turn::Request(wall_request),
+                Turn::Tick(frame(4.0)),
+            ],
+        );
+        assert_eq!(steps, vec![frame(1.0), frame(2.0), frame(4.0)]);
+    }
 }
