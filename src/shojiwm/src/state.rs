@@ -396,6 +396,12 @@ pub struct ShojiWM {
     /// When a rendered frame last ticked the runtime scheduler. While frames keep doing
     /// that, the scheduler timers stand down (see `frame_driven_runtime_scheduler_active`).
     pub runtime_scheduler_last_frame_tick_at: Option<Instant>,
+    /// A runtime wake arrived while frames drive the scheduler; the next frame tick runs
+    /// for it (see `register_runtime_wake_signal`).
+    pub runtime_wake_pending: bool,
+    /// Bumped whenever a wake is deferred, so a fallback timer armed for an earlier,
+    /// already-serviced wake does nothing.
+    pub runtime_wake_generation: u64,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
     pub runtime_output_globals: HashMap<String, GlobalId>,
     /// Per-output color mode/signal state, keyed by output name (tty only).
@@ -1741,6 +1747,8 @@ impl ShojiWM {
             animation_frame_time_ms: None,
             runtime_scheduler_pretick_ms: None,
             runtime_scheduler_last_frame_tick_at: None,
+            runtime_wake_pending: false,
+            runtime_wake_generation: 0,
             runtime_scheduler_kick_generation: 0,
             runtime_scheduler_kick_active: false,
             runtime_scheduler_kick_interval_ms: None,
