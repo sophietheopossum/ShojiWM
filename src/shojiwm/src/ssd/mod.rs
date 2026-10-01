@@ -14,6 +14,7 @@ mod embedded_runtime;
 mod evaluator;
 mod integration;
 mod interaction;
+mod runtime_watchdog;
 mod window_model;
 
 use smithay::utils::Logical;
@@ -39,6 +40,7 @@ pub use integration::{
     WindowDecorationState,
 };
 pub use interaction::DecorationInteractionSnapshot;
+pub use runtime_watchdog::RuntimeWatchdog;
 pub use window_model::{
     GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, LayerKindSnapshot, LayerPositionSnapshot,
     ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode,
