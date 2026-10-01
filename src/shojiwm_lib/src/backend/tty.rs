@@ -3749,7 +3749,11 @@ fn render_surface(
             .runtime_scheduler_pretick_ms
             .take()
             .is_some_and(|pretick_ms| (pretick_ms - frame_time_ms).abs() < 1.0);
-        let ticked = preticked || state.tick_runtime_scheduler_for_frame(frame_time_ms);
+        // A wake deferred after the pretick still ticks here, at the same frame time: the
+        // polls stepped for this frame are not due again, so it only collects the wake's
+        // changes in time for this frame's refresh.
+        let ticked = (preticked && !state.runtime_wake_pending)
+            || state.tick_runtime_scheduler_for_frame(frame_time_ms);
         motion_trace_frame_tick = Some((frame_time_ms, ticked));
         // Rust-side window animations (rect / offset / opacity) sample at the same time.
         state.animation_frame_time_ms = Some(frame_time_ms);
