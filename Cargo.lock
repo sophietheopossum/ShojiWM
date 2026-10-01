@@ -5126,6 +5126,7 @@ dependencies = [
  "icu_normalizer",
  "icu_properties",
  "idna_adapter",
+ "libc",
  "rustyscript",
  "serde",
  "serde_json",
