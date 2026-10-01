@@ -82,6 +82,12 @@ pub enum HostMessage {
     CursorOverride(Option<crate::cursor::CursorOverride>),
     /// Show, move, restyle or dispose of a drag view (`drag.show()`).
     DragView(crate::dnd::DragViewCommand),
+    /// The runtime stopped serving requests on its own; see
+    /// [`ConfigRuntime::is_stopped`](super::ConfigRuntime::is_stopped). The
+    /// text is shown to the user. Until a reload, requests should fail fast
+    /// with `RuntimeError::RuntimeStopped` rather than answer `Unhandled`.
+    /// Send it once per stop.
+    RuntimeStopped(String),
 }
 
 /// When a runtime that keeps a clock per output (see `SchedulerTickRequest`)
