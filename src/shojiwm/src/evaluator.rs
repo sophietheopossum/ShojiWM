@@ -1369,6 +1369,7 @@ impl EmbeddedDecorationEvaluator {
             self.script_path.clone(),
             self.config_path.clone(),
             self.working_dir.clone(),
+            Some(self.host.clone()),
             *self.watchdog,
             load_budget,
         )
