@@ -2645,13 +2645,19 @@ impl ShojiWM {
         output_name: &str,
         frame_time_ms: f64,
     ) -> bool {
-        let due = match &self.runtime_schedule {
+        // A runtime wake deferred to this frame (`handle_runtime_wake`) always ticks,
+        // forced. Otherwise only for work due by this frame, per clock below.
+        let force = match &self.runtime_schedule {
             // A runtime with a clock per output: tick when work bound to this output
-            // comes due by this frame. Frames of other outputs leave its clock alone.
-            Some(schedule) => schedule
-                .output_due_ms
-                .get(output_name)
-                .is_some_and(|due_ms| *due_ms <= frame_time_ms + FRAME_DUE_TOLERANCE_MS),
+            // comes due by this frame. Frames of other outputs leave its clock alone,
+            // except that a deferred wake is runtime-global and the first frame on
+            // any output collects it.
+            Some(schedule) => (self.runtime_wake_pending
+                || schedule
+                    .output_due_ms
+                    .get(output_name)
+                    .is_some_and(|due_ms| *due_ms <= frame_time_ms + FRAME_DUE_TOLERANCE_MS))
+            .then_some(true),
             // Only for a poll the scheduler reported as due by this frame. Evaluations also
             // switch `runtime_scheduler_enabled` on (a window with a running animation
             // reports "next poll: now") without registering any poll; ticking for those put
@@ -2659,24 +2665,25 @@ impl ShojiWM {
             // whose position signals the animation had moved — as full re-evaluations.
             // Window animations already re-evaluate what they need in the decoration
             // refresh.
-            None => {
-                self.runtime_scheduler_enabled
-                    && self
-                        .runtime_scheduler_next_due_ms
-                        .is_some_and(|due_ms| due_ms <= frame_time_ms + FRAME_DUE_TOLERANCE_MS)
-            }
+            None => frame_scheduler_tick(
+                self.runtime_scheduler_enabled,
+                self.runtime_scheduler_next_due_ms,
+                self.runtime_wake_pending,
+                frame_time_ms,
+            ),
         };
         // This frame answers any redraw the schedule timer asked of the output. Ask for
         // the next one once this frame's tick is done: work that stays due (an animation)
         // or comes due later still needs frames even when nothing it touched is visible.
         self.runtime_schedule_redraws_requested.remove(output_name);
-        if due {
+        let due = if let Some(force) = force {
+            self.runtime_wake_pending = false;
             self.runtime_scheduler_last_frame_tick_at = Some(Instant::now());
-            let _ = self.tick_runtime_scheduler_at(
-                self.runtime_schedule.is_some(),
-                Some((output_name, frame_time_ms)),
-            );
-        }
+            let _ = self.tick_runtime_scheduler_at(force, Some((output_name, frame_time_ms)));
+            true
+        } else {
+            false
+        };
         if self.runtime_schedule.is_some() {
             self.arm_runtime_schedule_timer();
         }
@@ -3029,7 +3036,7 @@ impl ShojiWM {
                 state.tick_output_overlays();
                 state.schedule_output_overlay_tick();
                 if state.config_runtime.host().take_wake_request() {
-                    let _ = state.tick_runtime_scheduler_with(true);
+                    state.handle_runtime_wake();
                 }
             })
             .expect("Failed to init runtime host source.");
