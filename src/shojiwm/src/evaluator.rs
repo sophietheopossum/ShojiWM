@@ -7216,8 +7216,19 @@ COMPOSITOR.window.composition = () => <Box />;
     // could outlive the runtime that opened it. Super+Shift+R cannot be driven
     // from a test (input.rs intercepts it in the compositor), so cycle the
     // runtime directly and watch the process fd table.
+    /// Held by tests that count the whole process's fds, and by tests that
+    /// keep isolates and sockets open long enough to disturb such a count.
+    static PROCESS_FD_COUNT_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_process_fd_count() -> std::sync::MutexGuard<'static, ()> {
+        PROCESS_FD_COUNT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn embedded_runtime_ipc_does_not_leak_fds_across_reloads() {
+        let _fd_count = lock_process_fd_count();
         fn open_fds() -> usize {
             std::fs::read_dir("/proc/self/fd")
                 .map(|entries| entries.count())
@@ -8046,5 +8057,522 @@ COMPOSITOR.output.configure(() => ({{
             .expect("embedded runtime should disable");
         drop(evaluator);
         let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    // --- config runtime watchdog -------------------------------------------
+
+    fn watchdog_for_tests() -> RuntimeWatchdog {
+        RuntimeWatchdog {
+            hang: Duration::from_millis(400),
+            boot_load_hang: Duration::from_secs(20),
+            load_hang: Duration::from_secs(20),
+            stuck_warn: Duration::from_millis(200),
+            load_stuck_warn: Duration::from_secs(5),
+            teardown_grace: Duration::from_secs(5),
+            ..RuntimeWatchdog::default()
+        }
+    }
+
+    fn watchdog_evaluator(name: &str, config: &str) -> (EmbeddedDecorationEvaluator, PathBuf) {
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repository root should exist");
+        let test_dir = std::env::temp_dir().join(format!(
+            "shojiwm-watchdog-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be created");
+        let config_path = test_dir.join("config.tsx");
+        std::fs::write(&config_path, config).expect("test config should be written");
+        let evaluator = EmbeddedDecorationEvaluator::for_paths(
+            repository_root.join("tools/decoration-runtime.ts"),
+            &config_path,
+        )
+        .with_working_dir(&repository_root)
+        .with_runtime_watchdog(watchdog_for_tests());
+        (evaluator, test_dir)
+    }
+
+    /// Run `f` on its own thread and fail the test, instead of hanging it,
+    /// if it does not finish within `limit`.
+    fn bounded<T: Send + 'static>(
+        limit: Duration,
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit)
+            .unwrap_or_else(|_| panic!("{what} did not finish within {limit:?}"))
+    }
+
+    // Checks look at this test's own isolate, not at process-wide thread
+    // counts, so tests running in parallel cannot disturb them.
+    fn current_bridge_id(evaluator: &EmbeddedDecorationEvaluator) -> Option<u32> {
+        evaluator
+            .runtime
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|runtime| runtime.child.bridge_id())
+    }
+
+    fn current_runtime_exits(evaluator: &EmbeddedDecorationEvaluator, timeout: Duration) -> bool {
+        evaluator.runtime.lock().is_ok_and(|guard| {
+            guard
+                .as_ref()
+                .is_some_and(|runtime| runtime.child.wait_exited(timeout))
+        })
+    }
+
+    fn reload_bounded(evaluator: &EmbeddedDecorationEvaluator) -> EmbeddedDecorationEvaluator {
+        let current = evaluator.clone();
+        bounded(Duration::from_secs(30), "reload", move || {
+            let persisted = current
+                .lifecycle_disable("reload")
+                .expect("lifecycle disable should not fail on a stopped runtime");
+            let next = current.fresh_like();
+            next.lifecycle_enable("reload", Some(&persisted))
+                .expect("reload should start a fresh runtime");
+            next
+        })
+    }
+
+    #[test]
+    fn embedded_runtime_watchdog_stops_spinning_key_binding_and_reload_recovers() {
+        // Holds isolates for hundreds of ms; keep clear of fd counting.
+        let _fd_count = lock_process_fd_count();
+        let (evaluator, test_dir) = watchdog_evaluator(
+            "spin-binding",
+            r#"
+import { COMPOSITOR, Label } from "shoji_wm";
+COMPOSITOR.key.bind("ok", "Super+O", () => {});
+COMPOSITOR.key.bind("spin", "Super+S", () => { while (true) {} });
+COMPOSITOR.window.composition = () => <Label text="x" />;
+"#,
+        );
+        evaluator
+            .lifecycle_enable("initial", None)
+            .expect("initial lifecycle enable should succeed");
+        assert!(
+            evaluator
+                .invoke_key_binding("ok", 1)
+                .expect("ok binding should run")
+                .invoked
+        );
+
+        let spinning = evaluator.clone();
+        let error = bounded(Duration::from_secs(10), "spinning binding", move || {
+            spinning.invoke_key_binding("spin", 2)
+        })
+        .expect_err("a binding that never returns should be stopped");
+        assert!(error.is_runtime_stopped(), "{error}");
+        let report = error.to_string();
+        assert!(report.contains("`invokeKeyBinding` handler (spin)"), "{report}");
+        assert!(report.contains("Super+Shift+R"), "{report}");
+        assert!(evaluator.runtime_stopped());
+        assert!(
+            current_runtime_exits(&evaluator, Duration::from_secs(2)),
+            "the stopped runtime thread should exit"
+        );
+        let stopped_id = current_bridge_id(&evaluator);
+        assert!(stopped_id.is_some(), "the stopped runtime should stay in the cell");
+
+        // Stopped: requests return quietly without respawning the config.
+        let started = Instant::now();
+        let quiet = evaluator
+            .invoke_key_binding("ok", 3)
+            .expect("a stopped runtime should not error on key bindings");
+        assert!(!quiet.invoked);
+        let tick = evaluator
+            .scheduler_tick(4.0)
+            .expect("a stopped runtime should not error on ticks");
+        assert!(!tick.dirty);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(matches!(
+            evaluator.evaluate_window(&make_window(true), 5),
+            Err(DecorationEvaluationError::RuntimeStopped(_))
+        ));
+        assert_eq!(current_bridge_id(&evaluator), stopped_id, "nothing should respawn");
+
+        let reloaded = reload_bounded(&evaluator);
+        assert!(!reloaded.runtime_stopped());
+        assert!(
+            reloaded
+                .invoke_key_binding("ok", 6)
+                .expect("reloaded binding should run")
+                .invoked
+        );
+        bounded(Duration::from_secs(10), "teardown", move || {
+            drop(reloaded);
+            drop(evaluator);
+        });
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn embedded_runtime_watchdog_stops_never_resolving_async_listener() {
+        // Holds isolates for hundreds of ms; keep clear of fd counting.
+        let _fd_count = lock_process_fd_count();
+        use crate::ssd::{
+            PointerHitTargetSnapshot, PointerModifierStateSnapshot, PointerMovePointSnapshot,
+        };
+        let socket_dir = std::env::temp_dir().join(format!(
+            "shojiwm-watchdog-await-sock-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory should be created");
+        let socket_literal = serde_json::to_string(&socket_dir.join("ipc.sock").to_string_lossy())
+            .expect("path should serialize");
+        // The IPC server leaves an accept op pending, as the live config does,
+        // so the runtime is parked in its event loop rather than running JS.
+        let (evaluator, test_dir) = watchdog_evaluator(
+            "await-forever",
+            &format!(
+                r#"
+import {{ Box, COMPOSITOR }} from "shoji_wm";
+import {{ createIpcServer }} from "shoji_wm/ipc";
+const ipc = createIpcServer({socket_literal});
+COMPOSITOR.onDisable(() => ipc.close());
+COMPOSITOR.window.composition = () => <Box />;
+COMPOSITOR.event.onPointerMoveAsync(async () => {{
+  await new Promise(() => {{}});
+}});
+"#
+            ),
+        );
+        evaluator
+            .lifecycle_enable("initial", None)
+            .expect("initial lifecycle enable should succeed");
+
+        let pointer = PointerMoveEventSnapshot {
+            position: PointerMovePointSnapshot { x: 10.0, y: 20.0 },
+            delta: PointerMovePointSnapshot { x: 1.0, y: -1.0 },
+            target: PointerHitTargetSnapshot::None,
+            output_name: Some("output-1".into()),
+            modifiers: PointerModifierStateSnapshot {
+                logo: false,
+                alt: false,
+                ctrl: false,
+                shift: false,
+            },
+            timestamp: 1,
+        };
+        let waiting = evaluator.clone();
+        // emitPointerMoveAsync awaits each listener, so this request parks the
+        // runtime on a promise nothing will resolve.
+        let error = bounded(Duration::from_secs(10), "async listener", move || {
+            waiting.dispatch_pointer_move_async(&pointer, 1)
+        })
+        .expect_err("a listener that never resolves should be stopped");
+        assert!(error.is_runtime_stopped(), "{error}");
+        let report = error.to_string();
+        assert!(report.contains("`pointerMoveAsync`"), "{report}");
+        assert!(evaluator.runtime_stopped());
+        assert!(
+            current_runtime_exits(&evaluator, Duration::from_secs(2)),
+            "cancelling the parked runtime should let its thread exit"
+        );
+
+        let reloaded = reload_bounded(&evaluator);
+        assert!(!reloaded.runtime_stopped());
+        bounded(Duration::from_secs(10), "teardown", move || {
+            drop(reloaded);
+            drop(evaluator);
+        });
+        let _ = std::fs::remove_dir_all(&test_dir);
+        let _ = std::fs::remove_dir_all(&socket_dir);
+    }
+
+    #[test]
+    fn embedded_runtime_watchdog_attributes_a_wedge_from_an_ipc_handler() {
+        // Holds isolates for hundreds of ms; keep clear of fd counting.
+        let _fd_count = lock_process_fd_count();
+        let socket_dir = std::env::temp_dir().join(format!(
+            "shojiwm-watchdog-ipc-sock-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory should be created");
+        let socket_path = socket_dir.join("ipc.sock");
+        let socket_literal =
+            serde_json::to_string(&socket_path.to_string_lossy()).expect("path should serialize");
+        let (evaluator, test_dir) = watchdog_evaluator(
+            "ipc-wedge",
+            &format!(
+                r#"
+import {{ Box, COMPOSITOR }} from "shoji_wm";
+import {{ createIpcServer }} from "shoji_wm/ipc";
+const ipc = createIpcServer({socket_literal});
+ipc.handle("spin", () => {{ while (true) {{}} }});
+COMPOSITOR.onDisable(() => ipc.close());
+COMPOSITOR.window.composition = () => <Box />;
+"#
+            ),
+        );
+        evaluator
+            .lifecycle_enable("initial", None)
+            .expect("initial lifecycle enable should succeed");
+        // Make the runtime "loaded" and leave a last-answered kind behind.
+        evaluator
+            .evaluate_window(&make_window(true), 1)
+            .expect("composition should evaluate");
+
+        let mut client = UnixStream::connect(&socket_path).expect("IPC should accept");
+        client
+            .write_all(b"{\"id\":1,\"method\":\"spin\"}\n")
+            .expect("IPC request should be written");
+        std::thread::sleep(Duration::from_millis(100));
+
+        let ticking = evaluator.clone();
+        let error = bounded(Duration::from_secs(10), "tick behind a wedge", move || {
+            ticking.evaluate_window(&make_window(false), 2)
+        })
+        .expect_err("a runtime wedged by an IPC handler should be stopped");
+        let report = error.to_string();
+        assert!(report.contains("never got to `evaluate`"), "{report}");
+
+        // The stopped runtime's connections close once its thread is gone.
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("read timeout should be configured");
+        let mut buffer = [0u8; 64];
+        let read = std::io::Read::read(&mut client, &mut buffer);
+        assert!(
+            matches!(read, Ok(0)),
+            "a stopped runtime should close its IPC connections, got {read:?}"
+        );
+
+        let reloaded = reload_bounded(&evaluator);
+        assert!(
+            UnixStream::connect(&socket_path).is_ok(),
+            "the reloaded config should serve IPC again"
+        );
+        bounded(Duration::from_secs(10), "teardown", move || {
+            drop(reloaded);
+            drop(evaluator);
+        });
+        let _ = std::fs::remove_dir_all(&test_dir);
+        let _ = std::fs::remove_dir_all(&socket_dir);
+    }
+
+    #[test]
+    fn embedded_runtime_watchdog_never_answers_a_later_request_with_a_late_reply() {
+        // Holds isolates for hundreds of ms; keep clear of fd counting.
+        let _fd_count = lock_process_fd_count();
+        let (evaluator, test_dir) = watchdog_evaluator(
+            "late-reply",
+            r#"
+import { COMPOSITOR, Label } from "shoji_wm";
+COMPOSITOR.key.bind("ok", "Super+O", () => {});
+COMPOSITOR.key.bind("slow", "Super+L", () => {
+  const end = Date.now() + 900;
+  while (Date.now() < end) {}
+});
+COMPOSITOR.window.composition = () => <Label text="x" />;
+"#,
+        );
+        evaluator
+            .lifecycle_enable("initial", None)
+            .expect("initial lifecycle enable should succeed");
+        let slow = evaluator.clone();
+        let error = bounded(Duration::from_secs(10), "slow binding", move || {
+            slow.invoke_key_binding("slow", 1)
+        })
+        .expect_err("a binding past the budget should be stopped");
+        assert!(error.is_runtime_stopped(), "{error}");
+
+        let reloaded = reload_bounded(&evaluator);
+        for request in 0..20 {
+            let invocation = reloaded
+                .invoke_key_binding("ok", 10 + request)
+                .expect("every request after the reload should get its own answer");
+            assert!(invocation.invoked);
+        }
+        bounded(Duration::from_secs(10), "teardown", move || {
+            drop(reloaded);
+            drop(evaluator);
+        });
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn embedded_runtime_watchdog_spares_a_slow_config_import() {
+        // Holds isolates for hundreds of ms; keep clear of fd counting.
+        let _fd_count = lock_process_fd_count();
+        // Budget for loaded requests is 400 ms; the import takes longer and
+        // must be judged by the load budget instead, through preload too.
+        let (evaluator, test_dir) = watchdog_evaluator(
+            "slow-import",
+            r#"
+import { COMPOSITOR, Label } from "shoji_wm";
+const end = Date.now() + 900;
+while (Date.now() < end) {}
+COMPOSITOR.key.bind("ok", "Super+O", () => {});
+COMPOSITOR.window.composition = () => <Label text="x" />;
+"#,
+        );
+        evaluator.preload().expect("preload should succeed");
+        evaluator
+            .lifecycle_enable("initial", None)
+            .expect("a slow import should not be stopped");
+        assert!(!evaluator.runtime_stopped());
+        assert!(
+            evaluator
+                .invoke_key_binding("ok", 1)
+                .expect("binding should run")
+                .invoked
+        );
+        drop(evaluator);
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn embedded_runtime_watchdog_reports_slow_round_trips_without_stopping() {
+        // Holds isolates for hundreds of ms; keep clear of fd counting.
+        let _fd_count = lock_process_fd_count();
+        use crate::ssd::runtime_watchdog::SLOW_TRIP_COUNT;
+        let (evaluator, test_dir) = watchdog_evaluator(
+            "slow-trip",
+            r#"
+import { COMPOSITOR, Label } from "shoji_wm";
+COMPOSITOR.key.bind("busy", "Super+B", () => {
+  const end = Date.now() + 60;
+  while (Date.now() < end) {}
+});
+COMPOSITOR.window.composition = () => <Label text="x" />;
+"#,
+        );
+        evaluator
+            .lifecycle_enable("initial", None)
+            .expect("initial lifecycle enable should succeed");
+        let before = SLOW_TRIP_COUNT.load(Ordering::Relaxed);
+        // The first trip of a kind is exempt (cold JIT); the second is not.
+        for request in 0..2 {
+            assert!(
+                evaluator
+                    .invoke_key_binding("busy", request)
+                    .expect("a slow binding under the budget should run")
+                    .invoked
+            );
+        }
+        assert!(SLOW_TRIP_COUNT.load(Ordering::Relaxed) > before);
+        assert!(!evaluator.runtime_stopped());
+        drop(evaluator);
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    // The real config binds $XDG_RUNTIME_DIR/shojiwm-wayland-0.sock, as every
+    // other real-config test does, so in a parallel run this could talk to
+    // another test's isolate. Run it alone:
+    //   env -u WAYLAND_DISPLAY XDG_RUNTIME_DIR=<scratch dir> \
+    //     cargo test -p shoji_wm --bins real_config_sends_window_rects -- --ignored
+    #[test]
+    #[ignore = "shares the real config's IPC socket path; run alone with --ignored"]
+    fn real_config_sends_window_rects_only_to_lease_holders() {
+        use crate::ssd::window_model::{
+            PointerModifierStateSnapshot, WindowMovePhaseSnapshot, WindowMoveSourceSnapshot,
+            WindowResizePointSnapshot,
+        };
+        // The real config binds its IPC socket from WAYLAND_DISPLAY; in a
+        // session that is the live socket, so only run with it scrubbed.
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            eprintln!("skipping: run with WAYLAND_DISPLAY unset and XDG_RUNTIME_DIR redirected");
+            return;
+        }
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        let socket_path = PathBuf::from(runtime_dir).join("shojiwm-wayland-0.sock");
+
+        let evaluator = real_config_evaluator();
+        evaluator
+            .lifecycle_enable("initial", None)
+            .expect("real config should enable");
+        let window = make_window(true);
+        evaluator
+            .evaluate_window(&window, 1)
+            .expect("window should evaluate");
+
+        let connect = || {
+            let stream = UnixStream::connect(&socket_path).expect("config IPC should accept");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(400)))
+                .expect("read timeout should be configured");
+            stream
+        };
+        // Lines until the read times out.
+        let drain = |reader: &mut BufReader<UnixStream>| -> Vec<serde_json::Value> {
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => return lines,
+                    Ok(_) => lines.push(
+                        serde_json::from_str(&line).expect("IPC lines should be JSON"),
+                    ),
+                }
+            }
+        };
+        let has_rects = |lines: &[serde_json::Value]| {
+            lines
+                .iter()
+                .any(|line| line.get("event").and_then(|event| event.as_str()) == Some("windows.rects"))
+        };
+
+        let mut holder = connect();
+        let mut bystander = connect();
+        holder
+            .write_all(b"{\"id\":1,\"method\":\"workspaces.get\",\"params\":{\"rectsLease\":\"test-lease\"}}\n")
+            .expect("lease request should be written");
+        bystander
+            .write_all(b"{\"id\":1,\"method\":\"workspaces.get\"}\n")
+            .expect("plain request should be written");
+        let mut holder = BufReader::new(holder);
+        let mut bystander = BufReader::new(bystander);
+        drain(&mut holder);
+        drain(&mut bystander);
+
+        let point = WindowResizePointSnapshot { x: 10.0, y: 20.0 };
+        let move_event = |timestamp: u64| WindowMoveEventSnapshot {
+            source: WindowMoveSourceSnapshot::Modifier,
+            phase: WindowMovePhaseSnapshot::Update,
+            start_pointer: point,
+            current_pointer: WindowResizePointSnapshot { x: 30.0, y: 40.0 },
+            delta: WindowResizePointSnapshot { x: 20.0, y: 20.0 },
+            start_rect: window.rect,
+            current_rect: window.rect,
+            output_name: Some("output-1".into()),
+            modifiers: PointerModifierStateSnapshot {
+                logo: true,
+                alt: false,
+                ctrl: false,
+                shift: false,
+            },
+            timestamp,
+        };
+        evaluator
+            .window_move(&window.id, &move_event(2), 2)
+            .expect("window move should complete");
+        assert!(has_rects(&drain(&mut holder)), "the lease holder should get rects");
+        assert!(
+            !has_rects(&drain(&mut bystander)),
+            "a client without a lease should not get rects"
+        );
+
+        // The lease lapses 2 s after the last renewal.
+        std::thread::sleep(Duration::from_millis(2300));
+        evaluator
+            .window_move(&window.id, &move_event(3), 3)
+            .expect("window move should complete");
+        assert!(
+            !has_rects(&drain(&mut holder)),
+            "an expired lease should get no rects"
+        );
+
+        evaluator
+            .lifecycle_disable("test")
+            .expect("real config should disable");
+        drop(evaluator);
     }
 }
