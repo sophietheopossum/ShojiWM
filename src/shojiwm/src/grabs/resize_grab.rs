@@ -427,28 +427,39 @@ fn resize_rect_for_delta(
     edges: ResizeEdge,
     delta: Point<f64, Logical>,
 ) -> Rectangle<i32, Logical> {
-    let mut x = initial.loc.x;
-    let mut y = initial.loc.y;
     let mut width = initial.size.w;
     let mut height = initial.size.h;
 
     if edges.intersects(ResizeEdge::LEFT) {
-        let dx = delta.x.round() as i32;
-        x += dx;
-        width -= dx;
+        width -= delta.x.round() as i32;
     } else if edges.intersects(ResizeEdge::RIGHT) {
         width += delta.x.round() as i32;
     }
 
     if edges.intersects(ResizeEdge::TOP) {
-        let dy = delta.y.round() as i32;
-        y += dy;
-        height -= dy;
+        height -= delta.y.round() as i32;
     } else if edges.intersects(ResizeEdge::BOTTOM) {
         height += delta.y.round() as i32;
     }
 
-    Rectangle::new((x, y).into(), (width.max(1), height.max(1)).into())
+    let width = width.max(1);
+    let height = height.max(1);
+
+    // A left or top drag keeps the opposite edge where it was, so the origin is
+    // placed from that edge, after the size floor. Moving it by the pointer delta
+    // instead carried a 1 px window along once the drag crossed that edge.
+    let x = if edges.intersects(ResizeEdge::LEFT) {
+        initial.loc.x + initial.size.w - width
+    } else {
+        initial.loc.x
+    };
+    let y = if edges.intersects(ResizeEdge::TOP) {
+        initial.loc.y + initial.size.h - height
+    } else {
+        initial.loc.y
+    };
+
+    Rectangle::new((x, y).into(), (width, height).into())
 }
 
 fn resize_edges_snapshot(edges: ResizeEdge) -> WindowResizeEdgesSnapshot {
@@ -578,4 +589,27 @@ pub fn handle_commit(space: &mut Space<Window>, surface: &WlSurface) -> Option<(
     }
 
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: i32, y: i32, width: i32, height: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (width, height).into())
+    }
+
+    #[test]
+    fn dragging_left_or_top_past_the_opposite_edge_stays_pinned_to_it() {
+        let initial = rect(100, 50, 400, 300);
+        // Right edge at 500, bottom edge at 350: a 1 px window ends there no
+        // matter how far beyond it the pointer goes.
+        for delta in [(500.0, 400.0), (900.0, 1000.0)] {
+            assert_eq!(
+                resize_rect_for_delta(initial, ResizeEdge::TOP_LEFT, Point::from(delta)),
+                rect(499, 349, 1, 1),
+                "delta {delta:?}"
+            );
+        }
+    }
 }
