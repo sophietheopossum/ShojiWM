@@ -262,8 +262,41 @@ export interface WorkspacesViewWindow {
   appId?: string;
   title: string;
   focused: boolean;
+  maximized: boolean;
+  minimized: boolean;
+  fullscreen: boolean;
   /** epoch ms — most recent focus time for MRU ordering. 0 if never focused. */
   lastFocusedAt: number;
+  /**
+   * Client-declared semantic identity ("typed segment" in the Arcan/SHMIF
+   * sense, e.g. "minkamon.disk"), claimed via the windows.identify IPC
+   * method. Lets consumers match windows by what they are instead of what
+   * their title string happens to say. null while unclaimed.
+   */
+  role?: string | null;
+  /**
+   * Layout-space frame rect, sampled at view-build time (animated rects
+   * report their current position). Added for MinkaMon's leader-line
+   * overlay, which cannot learn its own window positions from Wayland.
+   */
+  rect: {
+      x: number;
+      y: number;
+      width: number;
+      height: number
+  };
+  /**
+   * Hover-revealed drag tab currently shown for this window (layout
+   * coords). Attached by the decoration layer in index.tsx at IPC view
+   * build time; null when no tab is up. MinkaMon's leader lines clip
+   * beneath it.
+   */
+  dragTab?: {
+      x: number;
+      y: number;
+      width: number;
+      height: number 
+  } | null;
 }
 
 export interface WorkspacesViewWorkspace {
@@ -405,8 +438,13 @@ const WORKSPACE_VISUAL_ANIMATION_CHANNEL = "workspace.visual";
 const WORKSPACE_VISUAL_RECT_ANIMATION_CHANNEL = `${WORKSPACE_VISUAL_ANIMATION_CHANNEL}.rect`;
 const WORKSPACE_VISUAL_OPACITY_ANIMATION_CHANNEL = `${WORKSPACE_VISUAL_ANIMATION_CHANNEL}.opacity`;
 export const WINDOW_BORDER_PX = 2;
-export const TITLEBAR_HEIGHT = 30;
-export const MAXIMIZED_WINDOW_PADDING = {
+// Transparent chrome ring around each non-maximized window. It is the drag
+// surface (decoration chrome hit-tests as Move) and hosts the hover-revealed
+// drag tab; there is no titlebar.
+export const EDGE_DRAG_HALO_PX = 14;
+// Outer margin around the snap layout (halves/quarters). Maximized windows
+// deliberately get none — they fill the usable area edge to edge.
+export const SNAP_BASE_PADDING = {
   top: 8,
   right: 8,
   bottom: 8,
@@ -421,6 +459,9 @@ export class HybridWindowManager {
   // Tracks MRU focus time per window id so the dock can pick "the most recent
   // window of an app" deterministically. Updated by recordFocus().
   private readonly lastFocusedAt = new Map<string, number>();
+  // windowId -> client-declared role; same lifecycle as lastFocusedAt (no
+  // pruning on close — ids are not reused within a session).
+  private readonly windowRoles = new Map<string, string>();
   private readonly pendingInitialFocusByWindowId = new Map<string, number>();
   private readonly tileabilityByWindowId = new Map<string, boolean>();
   private readonly tileabilitySubscriptionsByWindowId = new Map<
@@ -444,6 +485,13 @@ export class HybridWindowManager {
     width: number;
     height: number;
   } | null = null;
+  // Virtual desktops on/off (minka-settings workspaces.enabled). Off means one
+  // desktop per monitor: every path that could create or show desktop >1
+  // checks this flag.
+  private workspacesEnabled = true;
+  // A fold that arrived mid-drag (e.g. hotplug) waits for the drag to end:
+  // tileDrag/floatingDrag hold the Workspace the fold would delete.
+  private collapseDeferred = false;
   private workspaceGesture: WorkspaceGestureState | null = null;
   private workspaceGestureMode: WorkspaceGestureMode | null = null;
   private workspaceScrollGestureRectAnimationsCancelled = false;
@@ -548,7 +596,7 @@ export class HybridWindowManager {
         this.updateWorkspaceScrollGesture(event);
         return;
       }
-      if (mode === "workspace-switch") {
+      if (mode === "workspace-switch" && this.workspacesEnabled) {
         this.updateWorkspaceGesture(event);
       }
       return;
@@ -647,6 +695,8 @@ export class HybridWindowManager {
     }
     this.syncWorkspaces();
     this.refreshUsableAreaLayouts();
+    // An unplugged monitor's desktops were just re-homed to free indexes.
+    this.collapseWorkspaces();
     this.syncWorkspaceVisibility();
   }
 
@@ -896,6 +946,9 @@ export class HybridWindowManager {
   }
 
   public restore(snapshot: HybridWindowManagerSnapshot) {
+    if (!this.workspacesEnabled) {
+      snapshot = foldWorkspaceSnapshot(snapshot);
+    }
     hotReloadDebug("hybrid-restore", {
       currentMonitor: snapshot.currentMonitor,
       workspaceCount: snapshot.workspaces.length,
@@ -932,6 +985,13 @@ export class HybridWindowManager {
     }
     window.setCloseAnimationDuration(OPEN_CLOSE_ANIMATION_DURATION);
 
+    // Delegate to initializeWindowLayout rather than repeating its body. This
+    // function held a verbatim copy of it, which is what a July patch replayed on
+    // top of the refactor left behind -- and the copy was missing the pieces the
+    // refactor exists for: the findWorkspaceForWindow early return (without which a
+    // window whose workspace changed between initial configure and first commit is
+    // added to a SECOND workspace), the options pass-through, and the
+    // restoredDuringInitialConfigure bookkeeping.
     const layoutWasDeferred = this.deferredInitialLayoutWindowIds.delete(
       window.id,
     );
@@ -943,6 +1003,31 @@ export class HybridWindowManager {
     const restoredExistingWindow =
       initialized.restoredExistingWindow || restoredDuringInitialConfigure;
     const workspace = initialized.workspace;
+
+    // Re-apply the maximised geometry even when the helper returned early.
+    //
+    // initializeWindowLayout early-returns for a window that ALREADY has a workspace, which is
+    // exactly the case on a config hot reload -- and that path never reaches its own isMaximized
+    // block. The inlined version this replaced had no early return, so it always re-applied the
+    // rect. Losing that left a maximised window holding a stale rect across a reload while the
+    // client reconfigured, and every coordinate inside the surface came out offset.
+    //
+    // Idempotent on the other path: the helper has already set these to the same values.
+    if (window.isMaximized()) {
+      // RESTORE_RECT only when unset. Recomputing it on every commit would overwrite the real
+      // pre-maximise size -- which the snapshot restored correctly -- with a synthesised default.
+      if (!window.state[WINDOW_STATE_RESTORE_RECT]()) {
+        window.state[WINDOW_STATE_RESTORE_RECT].set(
+          this.initialRestoreRectForMaximizedWindow(window),
+        );
+      }
+      window.state[WINDOW_STATE_RECT].set(this.maximizedRectForWindow(window));
+      window.state[WINDOW_STATE_MAXIMIZED].set(true);
+    } else {
+      // A floating window's rect is only worth clamping once it actually commits, which is why
+      // this stays here rather than moving into the helper (which also runs at initial configure).
+      this.clampInitialFloatingRect(window, workspace);
+    }
     if (!restoredExistingWindow) {
       scheduleOpenAnimation(window);
     }
@@ -955,6 +1040,62 @@ export class HybridWindowManager {
       restoredExistingWindow,
       scheduledOpenAnimation: !restoredExistingWindow,
     });
+  }
+
+  /**
+   * Panels are a forbidden zone for new floating windows. Clients that get
+   * no size guidance (we configure 0x0 and bounds 0x0) may size themselves
+   * to the full output — Rio does — which legally overlaps the bar since
+   * floating windows are unconstrained. Clamp the initial rect into the
+   * usable area; no-ops for windows that already fit.
+   */
+  private clampInitialFloatingRect(
+    window: WaylandWindow,
+    workspace: Workspace | undefined,
+  ) {
+    if (workspace?.isTiled && workspace.shouldTile(window)) {
+      return;
+    }
+    if (window.state[WINDOW_STATE_FULLSCREEN]()) {
+      return;
+    }
+    const rect = window.state[WINDOW_STATE_RECT]();
+    const x = read(rect.x);
+    const y = read(rect.y);
+    const width = read(rect.width);
+    const height = read(rect.height);
+    if (width <= 1 || height <= 1) {
+      return;
+    }
+    const monitor =
+      this.outputNameAt(x + width / 2, y + height / 2) ?? this.currentMonitor;
+    const usable = monitor ? COMPOSITOR.layer.usableArea(monitor) : null;
+    if (!usable) {
+      return;
+    }
+    const clampedWidth = Math.min(width, usable.width);
+    const clampedHeight = Math.min(height, usable.height);
+    const clampedX = Math.min(
+      Math.max(x, usable.x),
+      usable.x + usable.width - clampedWidth,
+    );
+    const clampedY = Math.min(
+      Math.max(y, usable.y),
+      usable.y + usable.height - clampedHeight,
+    );
+    if (
+      clampedWidth !== width ||
+      clampedHeight !== height ||
+      clampedX !== x ||
+      clampedY !== y
+    ) {
+      window.state[WINDOW_STATE_RECT].set({
+        x: clampedX,
+        y: clampedY,
+        width: clampedWidth,
+        height: clampedHeight,
+      });
+    }
   }
 
   public onStartClose(window: WaylandWindow) {
@@ -985,6 +1126,9 @@ export class HybridWindowManager {
       }
     }
     this.syncWorkspaceVisibility();
+    if (this.collapseDeferred && !this.hasLiveDrag()) {
+      this.collapseWorkspaces();
+    }
     // `window.state[...]` (used for e.g. WINDOW_STATE_RECT, minimized, etc.)
     // is backed by a module-level `signalsByWindowId` map in window-state.ts
     // keyed by window id. Nothing else clears that entry when a window
@@ -997,6 +1141,11 @@ export class HybridWindowManager {
   }
 
   public onFocus(window: WaylandWindow, focused: boolean) {
+    // A deferred fold normally runs when the drag ends; a grab that ended
+    // without an end event is caught here instead.
+    if (this.collapseDeferred && !this.hasLiveDrag()) {
+      this.collapseWorkspaces();
+    }
     const workspace = this.findWorkspaceForWindow(window);
     if (focused) {
       this.windowStack.raise(window);
@@ -1043,6 +1192,13 @@ export class HybridWindowManager {
   }
 
   public onWindowMove(event: WindowMoveEvent) {
+    this.handleWindowMove(event);
+    if (this.collapseDeferred && !this.hasLiveDrag()) {
+      this.collapseWorkspaces();
+    }
+  }
+
+  private handleWindowMove(event: WindowMoveEvent) {
     const workspace = this.findWorkspaceForWindow(event.window);
     if (workspace?.isTiled && workspace.shouldTile(event.window)) {
       this.onTileWindowMove(event, workspace);
@@ -1364,8 +1520,23 @@ export class HybridWindowManager {
     }
 
     if (!event.maximized) {
-      const restoreRect = window.state[WINDOW_STATE_RESTORE_RECT]();
-      if (restoreRect) {
+      // Unmaximize always lands centred at half the screen's dimensions
+      // rather than restoring the pre-maximize rect: a remembered rect can
+      // put the titlebar out of reach (display changes, panel moves), and a
+      // deterministic centred rect means the titlebar is always recoverable.
+      // The stored restore rect is only a signal now — the snap and
+      // interactive-drag paths clear it first to request a silent
+      // unmaximize because they place the window themselves.
+      if (
+          window
+              .state[
+                  WINDOW_STATE_RESTORE_RECT
+              ]()
+      ) {
+        const restoreRect = this
+            .centeredHalfRectForWindow(
+                window,
+            );
         workspace?.syncFloatingWindowRect(window, restoreRect);
         playRectAnimation(
           window,
@@ -1600,6 +1771,11 @@ export class HybridWindowManager {
   }
 
   public moveFocusedWindowToWorkspace(direction: -1 | 1) {
+    // It moves the window before switching, so the switch guard alone would
+    // strand it on a hidden desktop.
+    if (!this.workspacesEnabled) {
+      return;
+    }
     withManagedWindowOnlySSDRebuildSuppressed(() => {
       this.syncWorkspaces();
 
@@ -1653,6 +1829,53 @@ export class HybridWindowManager {
         return;
       }
     }
+  }
+
+  /**
+   * Alt+Tab: cycle focus through the current workspace's windows in stack
+   * order. Fixed order (not MRU) so repeated presses reach every window
+   * without a hold-to-cycle switcher UI (that's an M4 nicety).
+   */
+  public cycleWorkspaceFocus(direction: 1 | -1) {
+    const workspace = this.getCurrentWorkspace();
+    if (!workspace) {
+      return;
+    }
+    const windows = workspace
+      .listWindows()
+      .filter((window) => !window.state[WINDOW_STATE_MINIMIZED]());
+    if (windows.length === 0) {
+      return;
+    }
+    const focused = workspace.focusedWindow();
+    const index = focused
+      ? windows.findIndex((window) => window.id === focused.id)
+      : -1;
+    const next =
+      windows[(index + direction + windows.length) % windows.length];
+    if (!next) {
+      return;
+    }
+    if (workspace.isTiled && workspace.shouldTile(next)) {
+      workspace.focusWindow(next);
+    } else {
+      this.windowStack.raise(next);
+    }
+    next.focus();
+  }
+
+  public closeWindowById(
+      windowId: string,
+  ): boolean {
+    const window = this.findWindowById(windowId);
+    if (
+        !window
+    ) {
+      return false;
+    }
+    window
+        .close();
+    return true;
   }
 
   public toggleFocusedWindowMaximize() {
@@ -1712,6 +1935,191 @@ export class HybridWindowManager {
     this.syncWorkspaceVisibility();
   }
 
+  /**
+   * Turn virtual desktops on or off. Off folds every monitor onto desktop 1;
+   * on only lifts the guards. settings.apply resends the whole settings file
+   * on every edit, so an unchanged value does nothing.
+   */
+  public setWorkspacesEnabled(enabled: boolean): void {
+    if (this.workspacesEnabled === enabled) {
+      return;
+    }
+    this.workspacesEnabled = enabled;
+    this.collapseDeferred = false;
+    if (!enabled) {
+      // Flipped from MinkaConf, so no window drag is in progress; drag state
+      // still set then is stale (a grab can end without an end event).
+      this.collapseWorkspaces({ force: true });
+    }
+  }
+
+  /**
+   * Move every window on a desktop above 1 onto desktop 1 of its monitor and
+   * drop the emptied desktops. Desktop 1 keeps its tiled or floating mode;
+   * windows from desktops in the other mode go through the same conversion as
+   * Super+S first. Floating windows keep their place on screen.
+   */
+  private collapseWorkspaces(options: { force?: boolean } = {}): void {
+    if (this.workspacesEnabled) {
+      return;
+    }
+    const extra = Array.from(this.workspaces.values()).filter(
+      (workspace) => workspace.index !== 1,
+    );
+    const offOne = Array.from(this.activeWorkspaceByMonitor).filter(
+      ([, index]) => index !== 1,
+    );
+    if (extra.length === 0 && offOne.length === 0) {
+      return;
+    }
+    if (!options.force && this.hasLiveDrag()) {
+      this.collapseDeferred = true;
+      return;
+    }
+    this.collapseDeferred = false;
+    // Floating windows moved onto a tiled desktop, pinned to where they were
+    // on screen once the final scroll is known (the focus step can scroll).
+    const migratedFloating: {
+      window: WaylandWindow;
+      target: Workspace;
+      viewportX: number;
+    }[] = [];
+    withManagedWindowOnlySSDRebuildSuppressed(() => {
+      // Drop a vertical swipe in progress, but keep its mode so the rest of
+      // its updates are ignored; a horizontal tile scroll is left alone.
+      if (this.workspaceGestureMode === "workspace-switch") {
+        this.workspaceGesture = null;
+      }
+      const focused = Array.from(this.workspaces.values())
+        .map((workspace) => workspace.focusedWindow())
+        .find((window) => window !== undefined);
+      const monitors = new Set([
+        ...extra.map((workspace) => workspace.monitor),
+        ...offOne.map(([monitor]) => monitor),
+      ]);
+      for (const monitor of monitors) {
+        // Before any add: addWindow takes visibility from target.isActive().
+        this.activeWorkspaceByMonitor.set(monitor, 1);
+        const target = this.ensureWorkspace(monitor, 1);
+        const sources = extra
+          .filter((workspace) => workspace.monitor === monitor)
+          .sort((a, b) => a.index - b.index);
+        for (const source of sources) {
+          source.stopKineticScroll();
+          // Captured before the conversion, which can move floating windows
+          // back to an older floating rect.
+          const viewportBefore = new Map(
+            source
+              .listWindows()
+              .map(
+                (window) =>
+                  [window.id, snapshotManagedRect(window.state[WINDOW_STATE_RECT]())] as const,
+              ),
+          );
+          source.setTiled(target.isTiled);
+          for (const window of source.listWindows()) {
+            if (!target.isTiled) {
+              // A null floating rect would re-centre the window, and
+              // fullscreen is not part of the move snapshot.
+              const rect = window.state[WINDOW_STATE_FULLSCREEN]()
+                ? this.fullscreenRectForWindow(window, monitor)
+                : window.state[WINDOW_STATE_MAXIMIZED]()
+                  ? this.maximizedRectForWindow(window)
+                  : this.onMonitorOrClamped(
+                      window.state[WINDOW_STATE_RECT](),
+                      monitor,
+                      target,
+                    );
+              window.state[WINDOW_STATE_FLOATING_RECT].set(snapshotManagedRect(rect));
+            } else if (!target.shouldTile(window)) {
+              // A floating window on a tiled desktop keeps its floating rect
+              // in content space (viewport + scroll).
+              const rect =
+                viewportBefore.get(window.id) ??
+                snapshotManagedRect(window.state[WINDOW_STATE_RECT]());
+              window.state[WINDOW_STATE_FLOATING_RECT].set({
+                ...rect,
+                x: read(rect.x) + target.scrollPosition,
+              });
+              migratedFloating.push({ window, target, viewportX: read(rect.x) });
+            }
+            const moved = source.takeWindowForMove(window);
+            if (moved) {
+              target.addMovedWindow(window, moved.snapshot);
+            }
+          }
+          this.workspaces.delete(workspaceKey(monitor, source.index));
+        }
+        for (const window of target.listWindows()) {
+          cancelWorkspaceVisualAnimation(window);
+        }
+        // Also invalidates a pending switch timer that would hide it.
+        target.setVisible(true);
+        target.applyLayout({ animate: false, preserveMissingActive: true });
+        this.applyWorkspaceStackPolicy(target);
+      }
+      this.syncWorkspaces();
+      this.syncWorkspaceVisibility();
+      if (focused) {
+        const workspace = this.findWorkspaceForWindow(focused);
+        if (workspace?.isTiled && workspace.shouldTile(focused)) {
+          workspace.focusWindow(focused);
+        } else {
+          this.windowStack.raise(focused);
+        }
+        focused.focus();
+      }
+      const repinned = new Set<Workspace>();
+      for (const { window, target, viewportX } of migratedFloating) {
+        if (!target.hasWindow(window)) {
+          continue;
+        }
+        const rect = snapshotManagedRect(
+          window.state[WINDOW_STATE_FLOATING_RECT]() ?? window.state[WINDOW_STATE_RECT](),
+        );
+        const x = viewportX + target.scrollPosition;
+        if (read(rect.x) !== x) {
+          window.state[WINDOW_STATE_FLOATING_RECT].set({ ...rect, x });
+          repinned.add(target);
+        }
+      }
+      for (const target of repinned) {
+        target.applyLayout({ animate: false, preserveMissingActive: true });
+      }
+    });
+    this.workspaceChangeBroadcaster?.();
+  }
+
+  /** A window drag that is actually still going on (not stale state). */
+  private hasLiveDrag(): boolean {
+    if (!this.isGrabbing) {
+      return false;
+    }
+    for (const drag of [this.tileDrag, this.floatingDrag]) {
+      if (drag && this.findWorkspaceForWindow(drag.window)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * `rect` if its centre is on `monitor`, else clamped into the target's
+   * viewport. Desktops re-homed from an unplugged monitor can hold rects for a
+   * monitor that no longer exists.
+   */
+  private onMonitorOrClamped(
+    rect: ManagedWindowRect,
+    monitor: string,
+    target: Workspace,
+  ): ManagedWindowRect {
+    const centerX = read(rect.x) + read(rect.width) / 2;
+    const centerY = read(rect.y) + read(rect.height) / 2;
+    return this.outputNameAt(centerX, centerY) === monitor
+      ? rect
+      : target.clampToViewport(rect);
+  }
+
   public switchWorkspace(direction: -1 | 1) {
     const monitor = this.currentMonitor || COMPOSITOR.output.list.at(0);
     if (!monitor) {
@@ -1734,6 +2142,11 @@ export class HybridWindowManager {
     this.workspaceGesture = null;
     this.syncWorkspaces();
     if (!monitor || targetIndex < 1) {
+      return;
+    }
+    // Keys, IPC, ext-workspace activation, edge drags and window activation
+    // all switch through here.
+    if (!this.workspacesEnabled && targetIndex !== 1) {
       return;
     }
 
@@ -1812,13 +2225,26 @@ export class HybridWindowManager {
       const list = byMonitor.get(workspace.monitor) ?? [];
       const windows: WorkspacesViewWindow[] = workspace
         .listWindows()
-        .map((window) => ({
-          id: window.id,
-          appId: window.appId(),
-          title: window.title(),
-          focused: window.isFocused(),
-          lastFocusedAt: this.lastFocusedAt.get(window.id) ?? 0,
-        }));
+        .map((window) => {
+          const rect = window.state[WINDOW_STATE_RECT]();
+          return {
+            id: window.id,
+            appId: window.appId(),
+            title: window.title(),
+            focused: window.isFocused(),
+            maximized: window.state[WINDOW_STATE_MAXIMIZED](),
+            minimized: window.state[WINDOW_STATE_MINIMIZED](),
+            fullscreen: window.state[WINDOW_STATE_FULLSCREEN](),
+            lastFocusedAt: this.lastFocusedAt.get(window.id) ?? 0,
+            role: this.windowRoles.get(window.id) ?? null,
+            rect: {
+              x: read(rect.x),
+              y: read(rect.y),
+              width: read(rect.width),
+              height: read(rect.height),
+            },
+          };
+        });
       list.push({
         index: workspace.index,
         windowCount: workspace.windowCount(),
@@ -1861,6 +2287,19 @@ export class HybridWindowManager {
    */
   public recordFocus(windowId: string) {
     this.lastFocusedAt.set(windowId, Date.now());
+  }
+
+  /**
+   * Attach a client-declared semantic role to a window (the Arcan/SHMIF
+   * "typed segment" idea): consumers then match on role rather than title
+   * strings. Empty/null role revokes the claim.
+   */
+  public setWindowRole(windowId: string, role: string | null) {
+    if (role === null || role === "") {
+      this.windowRoles.delete(windowId);
+    } else {
+      this.windowRoles.set(windowId, role);
+    }
   }
 
   private trackPendingInitialFocus(window: WaylandWindow) {
@@ -1907,6 +2346,34 @@ export class HybridWindowManager {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Externally-driven move/resize (IPC `windows.setRect`, used by
+   * MinkaMon's full-overview arrangement): places a floating window at an
+   * exact layout-space rect. Tiled windows are left to the tiler;
+   * maximized windows are restored first so the rect sticks.
+   */
+  public setWindowRectById(
+    windowId: string,
+    rect: ManagedWindowRect,
+  ): boolean {
+    const window = this.findWindowById(windowId);
+    if (!window) {
+      return false;
+    }
+    const workspace = this.findWorkspaceForWindow(window);
+    if (workspace?.isTiled && workspace.shouldTile(window)) {
+      return false;
+    }
+    if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+      window.unmaximize();
+    }
+    stopRectAnimation(window, WINDOW_STATE_RECT);
+    window.state[WINDOW_STATE_RECT].set(rect);
+    workspace?.syncFloatingWindowRect(window, rect);
+    this.applyWorkspaceStackPolicy(workspace);
+    return true;
   }
 
   /** Every managed window across all workspaces (debug/IPC use). */
@@ -1968,6 +2435,41 @@ export class HybridWindowManager {
     // Focus last so it overrides switchWorkspaceTo's focusActiveWindow().
     window.focus();
     return true;
+  }
+
+  /**
+   * Dock drag-to-reorder (IPC `windows.reorder`): put `windowId` directly
+   * before `beforeId` in its own workspace's window order, or last when
+   * `beforeId` is null. An anchor in another workspace is refused, so a
+   * reorder never moves a window between workspaces or monitors. Refused while
+   * a pointer tile drag is live on that workspace: the drag owns the tile
+   * order until it ends. Checked on the live grab rather than
+   * `Workspace.draggingWindowId`, which a tiling toggle mid-drag can leave set.
+   */
+  public reorderWindowById(
+    windowId: string,
+    beforeId: string | null,
+  ): "moved" | "unchanged" | "refused" {
+    const window = this.findWindowById(windowId);
+    const workspace = window ? this.findWorkspaceForWindow(window) : undefined;
+    if (!window || !workspace) {
+      return "refused";
+    }
+    if (this.isGrabbing && this.tileDrag?.workspace === workspace) {
+      return "refused";
+    }
+    const before =
+      beforeId === null ? null : workspace.findWindowById(beforeId);
+    if (before === undefined) {
+      return "refused";
+    }
+    return withManagedWindowOnlySSDRebuildSuppressed(() => {
+      const outcome = workspace.moveWindowBefore(window, before);
+      if (outcome === "moved") {
+        this.applyWorkspaceStackPolicy(workspace);
+      }
+      return outcome;
+    });
   }
 
   /**
@@ -2626,6 +3128,23 @@ export class HybridWindowManager {
     };
   }
 
+  /** Half the screen's dimensions, centred in the usable area. */
+  private centeredHalfRectForWindow(window: WaylandWindow): ManagedWindowRect {
+    const full = this.maximizedRectForWindow(window);
+    const fullX = read(full.x);
+    const fullY = read(full.y);
+    const fullWidth = read(full.width);
+    const fullHeight = read(full.height);
+    const width = Math.round(fullWidth / 2);
+    const height = Math.round(fullHeight / 2);
+    return {
+      x: fullX + Math.round((fullWidth - width) / 2),
+      y: fullY + Math.round((fullHeight - height) / 2),
+      width,
+      height,
+    };
+  }
+
   private maximizedRectForWindow(
     window: WaylandWindow,
     preferredOutput?: string,
@@ -2644,27 +3163,23 @@ export class HybridWindowManager {
       ? COMPOSITOR.layer.usableArea(outputName)
       : undefined;
 
+    // Maximized fills the usable area edge to edge — no padding; the
+    // composition also drops the border and rounded corners for this state.
     if (usable) {
-      return insetRect(
-        {
-          x: usable.x,
-          y: usable.y,
-          width: usable.width,
-          height: usable.height,
-        },
-        MAXIMIZED_WINDOW_PADDING,
-      );
+      return {
+        x: usable.x,
+        y: usable.y,
+        width: usable.width,
+        height: usable.height,
+      };
     }
     if (output?.resolution) {
-      return insetRect(
-        {
-          x: output.position.x,
-          y: output.position.y,
-          width: output.resolution.width / output.scale,
-          height: output.resolution.height / output.scale,
-        },
-        MAXIMIZED_WINDOW_PADDING,
-      );
+      return {
+        x: output.position.x,
+        y: output.position.y,
+        width: output.resolution.width / output.scale,
+        height: output.resolution.height / output.scale,
+      };
     }
     return rect;
   }
@@ -2783,11 +3298,11 @@ export class HybridWindowManager {
     height: number,
   ): ManagedWindowRect {
     const pointer = event.currentPointer;
-    const titlebarCenterY = WINDOW_BORDER_PX + TITLEBAR_HEIGHT / 2;
+    const dragChromeCenterY = WINDOW_BORDER_PX + EDGE_DRAG_HALO_PX / 2;
     const pointerOffsetY =
       event.source === "modifier"
         ? height / 2
-        : Math.min(height / 2, titlebarCenterY);
+        : Math.min(height / 2, dragChromeCenterY);
 
     return {
       x: pointer.x - width / 2,
@@ -2847,14 +3362,14 @@ export class HybridWindowManager {
     };
   }
 
-  /** Usable area inset by the maximized padding — the base for all snap rects. */
+  /** Usable area inset by the snap margin — the base for all snap rects. */
   private monitorSnapBaseRect(monitor: string): ManagedWindowRect | null {
     const usable =
       COMPOSITOR.layer.usableArea(monitor) ?? this.monitorFullRect(monitor);
     if (!usable) {
       return null;
     }
-    return insetRect(usable, MAXIMIZED_WINDOW_PADDING);
+    return insetRect(usable, SNAP_BASE_PADDING);
   }
 
   /** Resolve the snap zone for a pointer near the physical screen edges. */
@@ -3410,6 +3925,13 @@ export class Workspace {
     string,
     WorkspaceWindowSnapshot
   >();
+  // Hot-reload restore order: each restored window's snapshot position and
+  // the ids still waiting to re-enter. Restored windows come back through
+  // addWindow in whatever order the runtime re-announces them, so without
+  // this every Super+Shift+R reshuffles the window order (tiles, Alt+Tab,
+  // the dock).
+  private readonly restoreRankById = new Map<string, number>();
+  private readonly restorePendingIds = new Set<string>();
   private activeWindowId: string | null = null;
   private visibilityAnimationToken = 0;
   private draggingWindowId: string | null = null;
@@ -3495,6 +4017,9 @@ export class Workspace {
         ? this.tileInsertionIndexAfterFocusedWindow()
         : null;
     this.windows.push(window);
+    if (restored && this.restorePendingIds.delete(window.id)) {
+      this.placeRestoredWindow(window);
+    }
     if (tileInsertionIndex !== null) {
       this.moveTileWindowToIndex(window, tileInsertionIndex);
     }
@@ -3734,6 +4259,54 @@ export class Workspace {
     this.applyLayout();
     focused.focus();
     return true;
+  }
+
+  /**
+   * Place `window` directly before `before` in this workspace's window order,
+   * or last when `before` is null. That order is the left-to-right tile
+   * sequence on a tiled workspace and the Alt+Tab ring on every workspace;
+   * MinkaShell's dock drag-to-reorder drives it through `windows.reorder`.
+   * Never focuses. Refused when either window is not in this workspace; the
+   * caller refuses while a pointer tile drag owns the tile order.
+   */
+  public moveWindowBefore(
+    window: WaylandWindow,
+    before: WaylandWindow | null,
+  ): "moved" | "unchanged" | "refused" {
+    const from = this.windows.findIndex((current) => current.id === window.id);
+    const beforeId = before === null ? null : before.id;
+    if (
+      from < 0 ||
+      (before !== null && (beforeId === window.id || !this.hasWindow(before)))
+    ) {
+      return "refused";
+    }
+    const tileOrder = this.tileableWindows()
+      .map((current) => current.id)
+      .join(" ");
+    this.windows.splice(from, 1);
+    const to =
+      beforeId === null
+        ? this.windows.length
+        : this.windows.findIndex((current) => current.id === beforeId);
+    this.windows.splice(to, 0, window);
+    if (to === from) {
+      return "unchanged";
+    }
+    const tiles = this.tileableWindows();
+    if (
+      this.isTiled &&
+      tiles.map((current) => current.id).join(" ") !== tileOrder
+    ) {
+      this.stopKineticScroll();
+      this.markTileReordering(window);
+      const active = this.activeWindow(tiles);
+      if (active) {
+        this.scrollToWindow(active);
+      }
+      this.applyLayout();
+    }
+    return "moved";
   }
 
   private markTileReordering(window: WaylandWindow): void {
@@ -4659,10 +5232,15 @@ export class Workspace {
    *
    * "Within the screen" is measured against the usable area, not the tile
    * viewport: the viewport is inset by TILE_MARGIN for cosmetic spacing, and
-   * content inside that margin is still on screen. Maximized tiles in
-   * particular are wider than the viewport by design (MAXIMIZED_WINDOW_PADDING
-   * < TILE_MARGIN), so an inset-viewport check would eat one key press on a
-   * 4px invisible pan for every fully-visible maximized tile.
+   * content inside that margin is still on screen. Maximized tiles fill the
+   * usable area edge to edge, so they are exactly TILE_MARGIN wider than the
+   * viewport on each side; an inset-viewport check would eat one key press on
+   * an invisible pan for every fully-visible maximized tile.
+   *
+   * That also means a fully-visible maximized tile computes an overflow of
+   * exactly 0, leaving only TILE_FOCUS_OVERFLOW_EPSILON of slack for rounding
+   * (scrollOffset is quantised to physical pixels, so a fractional scale
+   * carries a fraction of a logical pixel here).
    */
   private panActiveTileIntoView(
     tileable: WaylandWindow[],
@@ -4808,6 +5386,12 @@ export class Workspace {
     this.scrollOffset = snapshot.scrollOffset;
     this.tileWidthByWindowId.clear();
     this.restoredWindowStateById.clear();
+    this.restoreRankById.clear();
+    this.restorePendingIds.clear();
+    snapshot.windows.forEach((window, rank) => {
+      this.restoreRankById.set(window.id, rank);
+      this.restorePendingIds.add(window.id);
+    });
     for (const window of snapshot.windows) {
       if (window.tileWidth !== undefined) {
         this.tileWidthByWindowId.set(window.id, window.tileWidth);
@@ -4826,6 +5410,27 @@ export class Workspace {
 
   public getWindows(): WaylandWindow[] {
     return Array.from(this.windows);
+  }
+
+  /**
+   * Put a window re-entering after a hot reload back in its snapshot position:
+   * before the first window already present that ranked after it. Windows
+   * opened during the reload have no rank and keep their place.
+   */
+  private placeRestoredWindow(window: WaylandWindow): void {
+    const rank = this.restoreRankById.get(window.id);
+    const at = this.windows.findIndex((current) => current.id === window.id);
+    if (rank === undefined || at < 0) {
+      return;
+    }
+    this.windows.splice(at, 1);
+    const next = this.windows.findIndex(
+      (current) => (this.restoreRankById.get(current.id) ?? -1) > rank,
+    );
+    this.windows.splice(next < 0 ? this.windows.length : next, 0, window);
+    if (this.restorePendingIds.size === 0) {
+      this.restoreRankById.clear();
+    }
   }
 
   private snapshotWindow(window: WaylandWindow): WorkspaceWindowSnapshot {
@@ -5129,6 +5734,10 @@ export class Workspace {
     return Math.round(this.scrollOffset * scale) / scale;
   }
 
+  public clampToViewport(rect: ManagedWindowRect): ManagedWindowRect {
+    return this.clampRectToViewport(rect);
+  }
+
   private clampRectToViewport(rect: ManagedWindowRect): ManagedWindowRect {
     const viewport = this.tileViewportRect();
     const width = read(rect.width);
@@ -5349,6 +5958,72 @@ export class Workspace {
 
 function workspaceKey(monitor: string, index: number): string {
   return `${monitor}:${index}`;
+}
+
+/**
+ * With desktops off, merge every saved desktop of a monitor into desktop 1
+ * before restore() applies it. Workspace.restore() resets pending state on
+ * each call, and windows re-enter later through their saved desktop, so this
+ * cannot be done by folding live windows after the fact. Desktop 1 (or the
+ * lowest saved index) is the base, as in the live fold; rects that only make
+ * sense on their own desktop are converted, or dropped so the window centres.
+ */
+function foldWorkspaceSnapshot(
+  snapshot: HybridWindowManagerSnapshot,
+): HybridWindowManagerSnapshot {
+  const byMonitor = new Map<string, WorkspaceSnapshot[]>();
+  for (const workspace of snapshot.workspaces) {
+    byMonitor.set(workspace.monitor, [
+      ...(byMonitor.get(workspace.monitor) ?? []),
+      workspace,
+    ]);
+  }
+  const workspaces: WorkspaceSnapshot[] = [];
+  for (const list of byMonitor.values()) {
+    list.sort((a, b) => a.index - b.index);
+    const base = list[0]!;
+    const seen = new Set<string>();
+    const windows: WorkspaceWindowSnapshot[] = [];
+    for (const workspace of list) {
+      for (const window of workspace.windows) {
+        if (seen.has(window.id)) {
+          continue;
+        }
+        seen.add(window.id);
+        if (workspace === base || !window.floatingRect) {
+          windows.push(window);
+        } else if (workspace.isTiled && window.tileWidth === undefined && window.minimized) {
+          // Minimized windows skip tiling, so no tileWidth does not mean the
+          // rect is in content space here: let it re-centre.
+          windows.push({ ...window, floatingRect: null });
+        } else if (workspace.isTiled && window.tileWidth === undefined) {
+          // Floating on a tiled desktop: its content space -> viewport -> base.
+          const x =
+            read(window.floatingRect.x) -
+            workspace.scrollOffset +
+            (base.isTiled ? base.scrollOffset : 0);
+          windows.push({
+            ...window,
+            floatingRect: { ...snapshotManagedRect(window.floatingRect), x },
+          });
+        } else if (!workspace.isTiled && base.isTiled) {
+          // Whether it tiles is unknown here: let it re-centre.
+          windows.push({ ...window, floatingRect: null });
+        } else {
+          // A tile's floating rect is its pre-tiling viewport rect.
+          windows.push(window);
+        }
+      }
+    }
+    workspaces.push({ ...base, index: 1, windows });
+  }
+  return {
+    ...snapshot,
+    activeWorkspaceByMonitor: snapshot.activeWorkspaceByMonitor.map(
+      ([monitor]) => [monitor, 1] as [string, number],
+    ),
+    workspaces,
+  };
 }
 
 function constrainedMax(

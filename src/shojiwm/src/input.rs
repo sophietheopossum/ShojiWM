@@ -2,7 +2,7 @@ use smithay::{
     backend::{
         input::{
             AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
-            GestureEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
+            GestureEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, InputTime, KeyState,
             KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
         },
         session::Session,
@@ -255,7 +255,7 @@ impl ShojiWM {
             event.key_code(),
             event.state(),
             serial,
-            Event::time_msec(event),
+            Event::time(event),
             |data, modifiers, _handle| {
                 data.current_keyboard_modifiers = *modifiers;
                 FilterResult::<KeyboardAction>::Forward
@@ -268,7 +268,7 @@ impl ShojiWM {
         &mut self,
         pos: smithay::utils::Point<f64, smithay::utils::Logical>,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
         let pointer = self.seat.get_pointer().unwrap();
         self.pointer_contents = self.pointer_contents_at(pos);
@@ -290,7 +290,7 @@ impl ShojiWM {
         button: u32,
         state: ButtonState,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
         let pointer = self.seat.get_pointer().unwrap();
         self.pointer_contents = self.pointer_contents_at(pointer.current_location());
@@ -508,7 +508,7 @@ impl ShojiWM {
                 if event.state() == KeyState::Pressed {
                     self.note_keyboard_user_input();
                 }
-                let time = Event::time_msec(&event);
+                let time = Event::time(&event);
                 let key_phase = match event.state() {
                     KeyState::Pressed => crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
                     KeyState::Released => {
@@ -738,7 +738,7 @@ impl ShojiWM {
                         &RelativeMotionEvent {
                             delta: event.delta(),
                             delta_unaccel: event.delta_unaccel(),
-                            utime: event.time(),
+                            time: event.time(),
                         },
                     );
                     pointer.frame(self);
@@ -772,7 +772,7 @@ impl ShojiWM {
                     self.forward_locked_pointer_motion(
                         pos,
                         SERIAL_COUNTER.next_serial(),
-                        event.time_msec(),
+                        event.time(),
                     );
                     return;
                 }
@@ -795,7 +795,7 @@ impl ShojiWM {
                             &RelativeMotionEvent {
                                 delta: event.delta(),
                                 delta_unaccel: event.delta_unaccel(),
-                                utime: event.time(),
+                                time: event.time(),
                             },
                         );
                         pointer.frame(self);
@@ -817,7 +817,7 @@ impl ShojiWM {
                     &MotionEvent {
                         location: pos,
                         serial,
-                        time: event.time_msec(),
+                        time: event.time(),
                     },
                 );
                 pointer.relative_motion(
@@ -826,18 +826,18 @@ impl ShojiWM {
                     &RelativeMotionEvent {
                         delta: event.delta(),
                         delta_unaccel: event.delta_unaccel(),
-                        utime: event.time(),
+                        time: event.time(),
                     },
                 );
                 pointer.frame(self);
                 self.activate_pointer_constraint_at(pos);
 
-                self.dispatch_pointer_move_events(previous_pos, pos, event.time_msec());
+                self.dispatch_pointer_move_events(previous_pos, pos, event.time().millis());
                 self.update_decoration_hover_target(pos);
                 if !pointer.is_grabbed() {
                     self.update_decoration_cursor_icon(pos);
                 }
-                self.note_pointer_input_for_latency(event.time());
+                self.note_pointer_input_for_latency(event.time().micros());
                 self.request_redraw_for_pointer_motion();
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
@@ -865,7 +865,7 @@ impl ShojiWM {
                 }
 
                 if self.session_lock_active {
-                    self.forward_locked_pointer_motion(pos, serial, event.time_msec());
+                    self.forward_locked_pointer_motion(pos, serial, event.time());
                     return;
                 }
 
@@ -878,17 +878,17 @@ impl ShojiWM {
                     &MotionEvent {
                         location: pos,
                         serial,
-                        time: event.time_msec(),
+                        time: event.time(),
                     },
                 );
                 pointer.frame(self);
                 self.activate_pointer_constraint_at(pos);
-                self.dispatch_pointer_move_events(previous_pos, pos, event.time_msec());
+                self.dispatch_pointer_move_events(previous_pos, pos, event.time().millis());
                 self.update_decoration_hover_target(pos);
                 if !pointer.is_grabbed() {
                     self.update_decoration_cursor_icon(pos);
                 }
-                self.note_pointer_input_for_latency(event.time());
+                self.note_pointer_input_for_latency(event.time().micros());
                 self.request_redraw_for_pointer_motion();
             }
             InputEvent::PointerButton { event, .. } => {
@@ -929,7 +929,7 @@ impl ShojiWM {
                         button,
                         button_state,
                         serial,
-                        event.time_msec(),
+                        event.time(),
                     );
                     return;
                 }
@@ -944,7 +944,7 @@ impl ShojiWM {
                             button,
                             state: button_state,
                             serial,
-                            time: event.time_msec(),
+                            time: event.time(),
                         },
                     );
                     pointer.frame(self);
@@ -1026,7 +1026,7 @@ impl ShojiWM {
                         &MotionEvent {
                             location: pointer.current_location(),
                             serial,
-                            time: event.time_msec(),
+                            time: event.time(),
                         },
                     );
                     pointer.frame(self);
@@ -1247,7 +1247,7 @@ impl ShojiWM {
                                         button,
                                         state: button_state,
                                         serial,
-                                        time: event.time_msec(),
+                                        time: event.time(),
                                     },
                                 );
                                 if let Err(error) =
@@ -1271,7 +1271,7 @@ impl ShojiWM {
                                         button,
                                         state: button_state,
                                         serial,
-                                        time: event.time_msec(),
+                                        time: event.time(),
                                     },
                                 );
                                 self.request_window_maximize(
@@ -1287,7 +1287,7 @@ impl ShojiWM {
                                         button,
                                         state: button_state,
                                         serial,
-                                        time: event.time_msec(),
+                                        time: event.time(),
                                     },
                                 );
                                 self.request_window_maximize(
@@ -1303,7 +1303,7 @@ impl ShojiWM {
                                         button,
                                         state: button_state,
                                         serial,
-                                        time: event.time_msec(),
+                                        time: event.time(),
                                     },
                                 );
                                 self.request_window_minimize(
@@ -1321,7 +1321,7 @@ impl ShojiWM {
                                         button,
                                         state: button_state,
                                         serial,
-                                        time: event.time_msec(),
+                                        time: event.time(),
                                     },
                                 );
 
@@ -1456,7 +1456,7 @@ impl ShojiWM {
                                         button,
                                         state: button_state,
                                         serial,
-                                        time: event.time_msec(),
+                                        time: event.time(),
                                     },
                                 );
                             }
@@ -1532,7 +1532,7 @@ impl ShojiWM {
                         button,
                         state: button_state,
                         serial,
-                        time: event.time_msec(),
+                        time: event.time(),
                     },
                 );
                 pointer.frame(self);
@@ -1581,7 +1581,7 @@ impl ShojiWM {
                     .amount_v120(Axis::Vertical)
                     .map(|value| value * scroll_factor);
 
-                let mut frame = AxisFrame::new(event.time_msec()).source(source);
+                let mut frame = AxisFrame::new(event.time()).source(source);
                 if horizontal_amount != 0.0 {
                     frame = frame.value(Axis::Horizontal, horizontal_amount);
                     if let Some(discrete) = horizontal_amount_discrete {
@@ -1661,7 +1661,7 @@ impl ShojiWM {
                 {
                     return;
                 }
-                let timestamp = u64::from(event.time_msec());
+                let timestamp = u64::from(event.time().millis());
                 let device = event.device();
                 let pointer_position = self
                     .seat
@@ -1707,7 +1707,7 @@ impl ShojiWM {
                 {
                     return;
                 }
-                let timestamp = u64::from(event.time_msec());
+                let timestamp = u64::from(event.time().millis());
                 let delta_x = event.delta_x();
                 let delta_y = event.delta_y();
                 let device = event.device();
@@ -1762,7 +1762,7 @@ impl ShojiWM {
                     self.runtime_gesture_swipe = None;
                     return;
                 }
-                let timestamp = u64::from(event.time_msec());
+                let timestamp = u64::from(event.time().millis());
                 let device = event.device();
                 let pointer_position = self
                     .seat
@@ -2937,7 +2937,7 @@ impl ShojiWM {
                 &MotionEvent {
                     location,
                     serial: SERIAL_COUNTER.next_serial(),
-                    time: time_msec,
+                    time: InputTime::from_millis(time_msec),
                 },
             );
             pointer.frame(self);
