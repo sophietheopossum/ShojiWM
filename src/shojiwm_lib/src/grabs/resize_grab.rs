@@ -599,6 +599,140 @@ mod tests {
         Rectangle::new((x, y).into(), (width, height).into())
     }
 
+    fn right(rect: Rectangle<i32, Logical>) -> i32 {
+        rect.loc.x + rect.size.w
+    }
+
+    fn bottom(rect: Rectangle<i32, Logical>) -> i32 {
+        rect.loc.y + rect.size.h
+    }
+
+    #[test]
+    fn xdg_edges_reach_the_runtime_as_the_same_sides() {
+        // `From` reinterprets the protocol value as our bits, so the two
+        // layouts have to agree: a mismatch would resize the wrong side.
+        use xdg_toplevel::ResizeEdge as Xdg;
+        let cases = [
+            (Xdg::None, ResizeEdge::empty(), (false, false, false, false)),
+            (Xdg::Top, ResizeEdge::TOP, (false, false, true, false)),
+            (Xdg::Bottom, ResizeEdge::BOTTOM, (false, false, false, true)),
+            (Xdg::Left, ResizeEdge::LEFT, (true, false, false, false)),
+            (Xdg::Right, ResizeEdge::RIGHT, (false, true, false, false)),
+            (
+                Xdg::TopLeft,
+                ResizeEdge::TOP_LEFT,
+                (true, false, true, false),
+            ),
+            (
+                Xdg::TopRight,
+                ResizeEdge::TOP_RIGHT,
+                (false, true, true, false),
+            ),
+            (
+                Xdg::BottomLeft,
+                ResizeEdge::BOTTOM_LEFT,
+                (true, false, false, true),
+            ),
+            (
+                Xdg::BottomRight,
+                ResizeEdge::BOTTOM_RIGHT,
+                (false, true, false, true),
+            ),
+        ];
+        for (xdg, edges, (left, right, top, bottom)) in cases {
+            assert_eq!(ResizeEdge::from(xdg), edges, "{xdg:?}");
+            assert_eq!(
+                resize_edges_snapshot(edges),
+                WindowResizeEdgesSnapshot {
+                    left,
+                    right,
+                    top,
+                    bottom
+                },
+                "{xdg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn right_and_bottom_edges_grow_in_place() {
+        let initial = rect(100, 50, 400, 300);
+        let current = resize_rect_for_delta(
+            initial,
+            ResizeEdge::BOTTOM_RIGHT,
+            Point::from((30.0, -20.0)),
+        );
+        assert_eq!(current, rect(100, 50, 430, 280));
+    }
+
+    #[test]
+    fn a_side_handle_ignores_the_other_axis() {
+        // The pointer never moves perfectly straight; drift along the axis a
+        // side handle does not resize must not leak into the rect.
+        let initial = rect(100, 50, 400, 300);
+        let drift = Point::from((30.0, 45.0));
+        assert_eq!(
+            resize_rect_for_delta(initial, ResizeEdge::RIGHT, drift),
+            rect(100, 50, 430, 300)
+        );
+        assert_eq!(
+            resize_rect_for_delta(initial, ResizeEdge::TOP, drift),
+            rect(100, 95, 400, 255)
+        );
+    }
+
+    #[test]
+    fn left_and_top_edges_keep_the_opposite_edges_anchored() {
+        let initial = rect(100, 50, 400, 300);
+        assert_eq!(
+            resize_rect_for_delta(initial, ResizeEdge::TOP_LEFT, Point::from((-40.0, -25.0))),
+            rect(60, 25, 440, 325)
+        );
+        assert_eq!(
+            resize_rect_for_delta(initial, ResizeEdge::TOP_LEFT, Point::from((60.0, 35.0))),
+            rect(160, 85, 340, 265)
+        );
+    }
+
+    #[test]
+    fn fractional_deltas_move_origin_and_size_by_the_same_whole_pixel() {
+        // At a fractional scale the pointer moves in fractions of a logical
+        // pixel, but a resize rect stays whole (`xdg_toplevel.configure` only
+        // speaks whole pixels). The origin and the size have to round
+        // together, or the anchored edge wobbles by a pixel under the pointer.
+        let initial = rect(100, 50, 400, 300);
+        for d in [
+            0.4,
+            0.5,
+            0.6,
+            10.49,
+            10.5,
+            -0.4,
+            -0.5,
+            -10.5,
+            1.0 / 3.0,
+            -2.0 / 3.0,
+        ] {
+            let current = resize_rect_for_delta(initial, ResizeEdge::TOP_LEFT, Point::from((d, d)));
+            assert_eq!(right(current), right(initial), "delta {d}");
+            assert_eq!(bottom(current), bottom(initial), "delta {d}");
+            assert_eq!(current.loc.x - initial.loc.x, d.round() as i32, "delta {d}");
+        }
+    }
+
+    #[test]
+    fn dragging_past_the_opposite_edge_floors_the_size_at_one_pixel() {
+        let initial = rect(100, 50, 400, 300);
+        assert_eq!(
+            resize_rect_for_delta(
+                initial,
+                ResizeEdge::BOTTOM_RIGHT,
+                Point::from((-500.0, -400.0))
+            ),
+            rect(100, 50, 1, 1)
+        );
+    }
+
     #[test]
     fn dragging_left_or_top_past_the_opposite_edge_stays_pinned_to_it() {
         let initial = rect(100, 50, 400, 300);
