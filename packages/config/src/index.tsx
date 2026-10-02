@@ -27,6 +27,7 @@ import {
 import type {
   InputAccelProfile,
   InputScrollMethod,
+  KeyBindingController,
   ManagedWindowRect,
   OutputSubpixel,
 } from "shoji_wm/types";
@@ -104,6 +105,9 @@ interface MinkaSettings {
   // Shell-side keys (e.g. shell.layout) ride along untouched: MinkaConf owns
   // the whole file and MinkaShell reads it directly.
   shell?: { layout?: string };
+  // Virtual desktops (MinkaConf layout page). Only an explicit false turns
+  // them off; MinkaShell reads the same key to hide its desktop pills.
+  workspaces?: { enabled?: boolean };
 }
 
 // User-facing settings owned by MinkaConf. Read at runtime, NOT imported as
@@ -149,6 +153,10 @@ function loadMinkaSettings(): MinkaSettings {
 }
 
 let activeSettings: MinkaSettings = loadMinkaSettings();
+
+function workspacesEnabled(): boolean {
+  return activeSettings.workspaces?.enabled !== false;
+}
 import {
   HybridWindowManager,
   EDGE_DRAG_HALO_PX,
@@ -204,6 +212,9 @@ COMPOSITOR.window.decoration.configure((_window, context) => {
 });
 
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
+// Before onEnable registers the restore below, so a reload with desktops off
+// folds the saved desktops instead of recreating them.
+HYBRID_WINDOW_MANAGER.setWorkspacesEnabled(workspacesEnabled());
 const HOT_RELOAD_WINDOW_MANAGER_STATE = "config.hybrid-window-manager";
 const FULLSCREEN_Z_INDEX = 2_000_000_000;
 const FLOATING_WINDOW_Z_INDEX_BASE = 1_500_000_000;
@@ -539,8 +550,9 @@ WORKSPACE_IPC.handle("windows.minimize", (params) => {
 // running session predates the edit ("reload with Super+Shift+R") instead
 // of silently half-applying. History: 1 = input + display scale;
 // 2 = full display schema (position/mode/enabled/mirror/hdr);
-// 3 = cursor theme + size; 4 = display subpixel layout.
-const MINKA_CONFIG_REVISION = 4;
+// 3 = cursor theme + size; 4 = display subpixel layout;
+// 5 = workspaces.enabled (virtual desktops on/off).
+const MINKA_CONFIG_REVISION = 5;
 WORKSPACE_IPC.handle("minka.revision", () => ({
   revision: MINKA_CONFIG_REVISION,
 }));
@@ -553,7 +565,14 @@ WORKSPACE_IPC.handle("settings.apply", (params) => {
   if (!params || typeof params !== "object") {
     return { ok: false, error: "expected a settings object" };
   }
+  const desktopsWereEnabled = workspacesEnabled();
   activeSettings = params as MinkaSettings;
+  // MinkaConf sends the whole file on every edit: act only on a change.
+  if (workspacesEnabled() !== desktopsWereEnabled) {
+    HYBRID_WINDOW_MANAGER.setWorkspacesEnabled(workspacesEnabled());
+    syncDesktopKeyBindings(workspacesEnabled());
+    scheduleWorkspaceBroadcast();
+  }
   COMPOSITOR.input.reconfigure();
   COMPOSITOR.output.reconfigure();
   applyCursorSettings();
@@ -902,22 +921,39 @@ COMPOSITOR.key.bind("tile-move-right", "Super+Shift+Right", () => {
   HYBRID_WINDOW_MANAGER.moveFocusedTile(1);
   scheduleWorkspaceBroadcast();
 });
-COMPOSITOR.key.bind("window-move-workspace-prev", "Super+Shift+Up", () => {
-  HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(-1);
-  scheduleWorkspaceBroadcast();
-});
-COMPOSITOR.key.bind("window-move-workspace-next", "Super+Shift+Down", () => {
-  HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(1);
-  scheduleWorkspaceBroadcast();
-});
-COMPOSITOR.key.bind("workspace-prev", "Super+Ctrl+Up", () => {
-  HYBRID_WINDOW_MANAGER.switchWorkspace(-1);
-  scheduleWorkspaceBroadcast();
-});
-COMPOSITOR.key.bind("workspace-next", "Super+Ctrl+Down", () => {
-  HYBRID_WINDOW_MANAGER.switchWorkspace(1);
-  scheduleWorkspaceBroadcast();
-});
+// Virtual-desktop keys, bound only while desktops are on: an unbound shortcut
+// is not intercepted, so with desktops off these reach the focused app.
+const DESKTOP_KEY_BINDINGS: ReadonlyArray<readonly [string, string, () => void]> = [
+  ["window-move-workspace-prev", "Super+Shift+Up", () =>
+    HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(-1)],
+  ["window-move-workspace-next", "Super+Shift+Down", () =>
+    HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(1)],
+  ["workspace-prev", "Super+Ctrl+Up", () => HYBRID_WINDOW_MANAGER.switchWorkspace(-1)],
+  ["workspace-next", "Super+Ctrl+Down", () => HYBRID_WINDOW_MANAGER.switchWorkspace(1)],
+];
+
+// Feature-detected: tsc checks against the repo SDK, but the session runs the
+// installed one, which has no unbind until it is reinstalled.
+const keyUnbind = (COMPOSITOR.key as Partial<KeyBindingController>).unbind;
+
+function syncDesktopKeyBindings(enabled: boolean): void {
+  for (const [id, shortcut, run] of DESKTOP_KEY_BINDINGS) {
+    if (enabled) {
+      COMPOSITOR.key.bind(id, shortcut, () => {
+        // Without unbind a live switch-off leaves the keys bound until the
+        // next reload; they do nothing meanwhile.
+        if (!workspacesEnabled()) {
+          return;
+        }
+        run();
+        scheduleWorkspaceBroadcast();
+      });
+    } else if (typeof keyUnbind === "function") {
+      keyUnbind.call(COMPOSITOR.key, id);
+    }
+  }
+}
+syncDesktopKeyBindings(workspacesEnabled());
 
 let fpsCounter = false;
 COMPOSITOR.key.bind("fps", "Super+Shift+F", () => {
