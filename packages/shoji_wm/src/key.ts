@@ -68,6 +68,15 @@ export const KEY_BINDING_CONTROLLER: KeyBindingController = {
       pendingKeyBindingConfig = true;
     }
   },
+  unbind(id) {
+    const removed = registrationEntriesTarget().delete(id);
+    registrationHandlersTarget().delete(id);
+    // While a config is loading, commitKeyBindingRegistration sends the set.
+    if (removed && !stagedKeyBindingEntries) {
+      pendingKeyBindingConfig = true;
+    }
+    return removed;
+  },
 };
 
 export function beginKeyBindingRegistration(): void {

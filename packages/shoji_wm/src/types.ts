@@ -1576,6 +1576,9 @@ export interface KeyBindingOptions {
  *
  * // Tap binding: fires on Super key release / タップバインド: Superキーリリースで発火
  * COMPOSITOR.key.bind("launcher", "Super", openLauncher, { on: "release" });
+ *
+ * // Let Super+T reach applications again / Super+T を再びアプリに渡す
+ * COMPOSITOR.key.unbind("launch-terminal");
  * ```
  */
 export interface KeyBindingController {
@@ -1591,6 +1594,17 @@ export interface KeyBindingController {
     handler: () => void,
     options?: KeyBindingOptions,
   ): void;
+  /**
+   * Remove the shortcut registered under `id`, so the key combination reaches
+   * the focused client again. Returns `false` when no binding has that `id`.
+   * Safe to call after the config has loaded (e.g. from an IPC handler); the
+   * compositor receives the updated set with the next runtime response.
+   * `id` で登録したショートカットを解除し、そのキーの組み合わせがフォーカス中の
+   * クライアントに再び届くようにします。該当する `id` がない場合は `false` を返します。
+   * 設定の読み込み後（IPC ハンドラー内など）にも呼び出せ、更新された一覧は
+   * 次のランタイムレスポンスでコンポジターに送られます。
+   */
+  unbind(id: string): boolean;
 }
 
 /**
