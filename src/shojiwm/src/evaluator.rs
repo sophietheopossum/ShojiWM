@@ -8899,4 +8899,224 @@ COMPOSITOR.window.composition = () => <Box />;
         );
         assert_eq!(steps, vec![frame(1.0), frame(2.0), frame(4.0)]);
     }
+
+    // Reads $HOME/.config/minka-settings.json through the real config, so it
+    // needs a scratch HOME, and it talks to the real config's IPC socket.
+    // Build with `cargo test --no-run`, then run the test binary directly:
+    //   env -u WAYLAND_DISPLAY XDG_RUNTIME_DIR=<scratch>/run HOME=<scratch>/home \
+    //     <test binary> real_config_virtual_desktops_off --ignored --test-threads=1
+    #[test]
+    #[ignore = "needs a scratch HOME and the real config's IPC socket; run alone with --ignored"]
+    fn real_config_virtual_desktops_off_folds_and_releases_keys() {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            eprintln!("skipping: run with WAYLAND_DISPLAY unset and a scratch HOME");
+            return;
+        }
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME should be set"));
+        let settings_path = home.join(".config/minka-settings.json");
+        // Never overwrite a real settings file, only this test's own fixture.
+        if let Ok(existing) = std::fs::read_to_string(&settings_path)
+            && !existing.contains("__shojiTestFixture")
+        {
+            eprintln!("skipping: {settings_path:?} is not a test fixture");
+            return;
+        }
+        std::fs::create_dir_all(settings_path.parent().expect("settings dir"))
+            .expect("settings dir should be created");
+        let fixture = |enabled: bool| {
+            serde_json::json!({
+                "__shojiTestFixture": true,
+                "input": {
+                    "pointerAccel": 0.4, "accelProfile": "adaptive", "naturalScroll": false,
+                    "touchpad": {
+                        "naturalScroll": false, "tapToClick": true, "scrollMethod": "twoFinger",
+                        "scrollFactor": 1, "disableWhileTyping": false
+                    },
+                    "keyboard": { "layout": "us", "variant": "" }
+                },
+                "displays": {},
+                "workspaces": { "enabled": enabled }
+            })
+        };
+        std::fs::write(&settings_path, fixture(true).to_string())
+            .expect("fixture should be written");
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        let socket_path = PathBuf::from(runtime_dir).join("shojiwm-wayland-0.sock");
+
+        const DESKTOP_KEYS: [&str; 4] = [
+            "window-move-workspace-prev",
+            "window-move-workspace-next",
+            "workspace-prev",
+            "workspace-next",
+        ];
+        let bound = |update: &Option<RuntimeKeyBindingConfigUpdate>| -> Vec<String> {
+            update
+                .as_ref()
+                .expect("the response should carry the binding set")
+                .entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect()
+        };
+        let has_desktop_keys =
+            |ids: &[String]| DESKTOP_KEYS.iter().all(|key| ids.iter().any(|id| id == key));
+        let no_desktop_keys =
+            |ids: &[String]| DESKTOP_KEYS.iter().all(|key| !ids.iter().any(|id| id == key));
+
+        struct Ipc {
+            reader: BufReader<UnixStream>,
+            writer: UnixStream,
+            next_id: u64,
+        }
+        impl Ipc {
+            fn connect(path: &std::path::Path) -> Self {
+                let stream = UnixStream::connect(path).expect("config IPC should accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("read timeout should be configured");
+                Self {
+                    reader: BufReader::new(stream.try_clone().expect("stream should clone")),
+                    writer: stream,
+                    next_id: 1,
+                }
+            }
+            fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+                let id = self.next_id;
+                self.next_id += 1;
+                let frame = serde_json::json!({ "id": id, "method": method, "params": params });
+                self.writer
+                    .write_all(format!("{frame}\n").as_bytes())
+                    .expect("request should be written");
+                loop {
+                    let mut line = String::new();
+                    self.reader.read_line(&mut line).expect("reply should arrive");
+                    let message: serde_json::Value =
+                        serde_json::from_str(&line).expect("reply should be JSON");
+                    if message["id"] == serde_json::json!(id) {
+                        return message["result"].clone();
+                    }
+                }
+            }
+        }
+        // TEST-1's desktops as (index, window ids).
+        let desktops = |view: &serde_json::Value| -> Vec<(u64, Vec<String>)> {
+            view["monitors"]
+                .as_array()
+                .expect("monitors")
+                .iter()
+                .filter(|monitor| monitor["name"] == "TEST-1")
+                .flat_map(|monitor| monitor["workspaces"].as_array().expect("workspaces").iter())
+                .map(|workspace| {
+                    let ids = workspace["windows"]
+                        .as_array()
+                        .expect("windows")
+                        .iter()
+                        .map(|window| window["id"].as_str().expect("id").to_owned())
+                        .collect();
+                    (workspace["index"].as_u64().expect("index"), ids)
+                })
+                .collect()
+        };
+        let open = |evaluator: &EmbeddedDecorationEvaluator, id: &str, now: u64| {
+            let window = make_named_window(id, "kitty", false, false);
+            evaluator
+                .evaluate_window_preview(&window, now)
+                .expect("preview should evaluate");
+            let focused = make_named_window(id, "kitty", true, false);
+            evaluator
+                .evaluate_window(&focused, now + 10)
+                .expect("window should evaluate");
+        };
+
+        // Desktops on: a window on desktop 1 and one on desktop 2.
+        let evaluator = real_config_evaluator();
+        let mut display_state = std::collections::BTreeMap::new();
+        display_state.insert("TEST-1".to_string(), test_output_snapshot("TEST-1"));
+        evaluator.set_display_state(display_state);
+        let enabled = evaluator
+            .lifecycle_enable("initial", None)
+            .expect("initial lifecycle should succeed");
+        assert!(has_desktop_keys(&bound(&enabled.key_binding_config)));
+        open(&evaluator, "0xa", 100);
+        assert!(
+            evaluator
+                .invoke_key_binding("workspace-next", 200)
+                .expect("desktop key should run")
+                .invoked
+        );
+        open(&evaluator, "0xb", 300);
+        let mut ipc = Ipc::connect(&socket_path);
+        let before = desktops(&ipc.request("workspaces.get", serde_json::json!({})));
+        assert!(
+            before.iter().any(|(index, ids)| *index == 2 && ids == &["0xb"]),
+            "0xb should open on desktop 2: {before:?}"
+        );
+
+        // Off, live, as MinkaConf does it (save, then apply): one desktop
+        // holding both windows, and the keys released.
+        std::fs::write(&settings_path, fixture(false).to_string())
+            .expect("fixture should be written");
+        assert_eq!(
+            ipc.request("settings.apply", fixture(false)),
+            serde_json::json!({ "ok": true })
+        );
+        let folded = desktops(&ipc.request("workspaces.get", serde_json::json!({})));
+        assert_eq!(folded.len(), 1, "one desktop after folding: {folded:?}");
+        assert_eq!(folded[0].0, 1);
+        let mut ids = folded[0].1.clone();
+        ids.sort();
+        assert_eq!(ids, ["0xa", "0xb"], "no window lost: {folded:?}");
+        let tick = evaluator.scheduler_tick(400.0).expect("tick should succeed");
+        assert!(no_desktop_keys(&bound(&tick.key_binding_config)));
+        assert!(
+            !evaluator
+                .invoke_key_binding("workspace-next", 410)
+                .expect("an unbound key should not fail")
+                .invoked
+        );
+        ipc.request("workspaces.switch", serde_json::json!({ "direction": 1 }));
+        ipc.request("workspaces.activate", serde_json::json!({ "monitor": "TEST-1", "index": 2 }));
+        let still = desktops(&ipc.request("workspaces.get", serde_json::json!({})));
+        assert!(still.iter().all(|(index, _)| *index == 1), "no way back to desktop 2: {still:?}");
+
+        // A reload with desktops off keeps one desktop and binds no desktop keys.
+        drop(ipc);
+        let persisted = evaluator
+            .lifecycle_disable("reload")
+            .expect("lifecycle disable should succeed");
+        let reloaded = evaluator.fresh_like();
+        let enabled = reloaded
+            .lifecycle_enable("reload", Some(&persisted))
+            .expect("reload should succeed");
+        assert!(no_desktop_keys(&bound(&enabled.key_binding_config)));
+        let state = &persisted["config.hybrid-window-manager"];
+        assert!(
+            state["workspaces"]
+                .as_array()
+                .expect("saved workspaces")
+                .iter()
+                .filter(|workspace| workspace["monitor"] == "TEST-1")
+                .all(|workspace| workspace["index"] == 1),
+            "saved state should hold one desktop: {state}"
+        );
+
+        // On again, live: the keys come back.
+        let mut ipc = Ipc::connect(&socket_path);
+        std::fs::write(&settings_path, fixture(true).to_string())
+            .expect("fixture should be written");
+        assert_eq!(
+            ipc.request("settings.apply", fixture(true)),
+            serde_json::json!({ "ok": true })
+        );
+        let tick = reloaded.scheduler_tick(600.0).expect("tick should succeed");
+        assert!(has_desktop_keys(&bound(&tick.key_binding_config)));
+
+        drop(ipc);
+        reloaded
+            .lifecycle_disable("test")
+            .expect("lifecycle disable should succeed");
+        drop(reloaded);
+        drop(evaluator);
+        let _ = std::fs::remove_file(&settings_path);
+    }
 }
