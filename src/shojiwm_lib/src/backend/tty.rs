@@ -8314,7 +8314,7 @@ fn log_gap_readback_probe(
     let mut opaque = 0usize;
     let mut min_alpha = u8::MAX;
     let mut max_alpha = 0u8;
-    for px in bytes.chunks_exact(4) {
+    for px in bytes.as_chunks::<4>().0 {
         let alpha = px[3];
         min_alpha = min_alpha.min(alpha);
         max_alpha = max_alpha.max(alpha);
