@@ -287,7 +287,7 @@ export interface WorkspacesViewWindow {
   };
   /**
    * Hover-revealed drag tab currently shown for this window (layout
-   * coords). Attached by the decoration layer in index.tsx at IPC view
+   * coords). Attached by minka/workspace-ipc.ts at IPC view
    * build time; null when no tab is up. MinkaMon's leader lines clip
    * beneath it.
    */
