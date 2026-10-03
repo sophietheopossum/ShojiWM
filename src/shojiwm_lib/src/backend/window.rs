@@ -1125,7 +1125,10 @@ pub fn clipped_popup_elements(
 mod region_bounds_tests {
     use super::*;
 
-    fn region(rects: &[(RectangleKind, (i32, i32, i32, i32))]) -> RegionAttributes {
+    /// (kind, (x, y, width, height))
+    type RectSpec = (RectangleKind, (i32, i32, i32, i32));
+
+    fn region(rects: &[RectSpec]) -> RegionAttributes {
         RegionAttributes {
             rects: rects
                 .iter()

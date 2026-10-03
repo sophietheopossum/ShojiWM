@@ -1963,7 +1963,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
                                     pixels.as_mut_ptr().cast(),
                                 );
                                 let mut row = [[0u8; 4]; 3];
-                                for (i, px) in pixels.chunks_exact(4).enumerate() {
+                                for (i, px) in pixels.as_chunks::<4>().0.iter().enumerate() {
                                     row[i] = [px[0], px[1], px[2], px[3]];
                                 }
                                 out.push(row);
@@ -5918,11 +5918,15 @@ fn decode_png_and_scale(bytes: &[u8], target_width: i32, target_height: i32) -> 
     let rgba = match info.color_type {
         ColorType::Rgba => source.to_vec(),
         ColorType::Rgb => source
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|chunk| [chunk[0], chunk[1], chunk[2], 255])
             .collect(),
         ColorType::GrayscaleAlpha => source
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|chunk| [chunk[0], chunk[0], chunk[0], chunk[1]])
             .collect(),
         ColorType::Grayscale => source
@@ -6015,7 +6019,7 @@ fn gap_stage_readback(renderer: &mut GlesRenderer, label: &str, tex: &GlesTextur
         );
         gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, prev_read_fbo as u32);
         let mut row = [[0u8; 4]; 3];
-        for (i, px) in pixels.chunks_exact(4).enumerate() {
+        for (i, px) in pixels.as_chunks::<4>().0.iter().enumerate() {
             row[i] = [px[0], px[1], px[2], px[3]];
         }
         tracing::info!(

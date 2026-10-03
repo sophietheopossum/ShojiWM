@@ -97,14 +97,11 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for App {
         _: &QueueHandle<Self>,
     ) {
         use wayland_client::Proxy;
-        match event {
-            zwlr_foreign_toplevel_handle_v1::Event::AppId { app_id } => {
-                state.app_ids.insert(handle.id().protocol_id(), app_id);
-                if !state.handles.iter().any(|h| h == handle) {
-                    state.handles.push(handle.clone());
-                }
+        if let zwlr_foreign_toplevel_handle_v1::Event::AppId { app_id } = event {
+            state.app_ids.insert(handle.id().protocol_id(), app_id);
+            if !state.handles.iter().any(|h| h == handle) {
+                state.handles.push(handle.clone());
             }
-            _ => {}
         }
     }
 }
