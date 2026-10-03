@@ -794,11 +794,15 @@ fn decode_png_and_scale(bytes: &[u8], target_width: i32, target_height: i32) -> 
     let rgba = match info.color_type {
         ColorType::Rgba => source.to_vec(),
         ColorType::Rgb => source
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|chunk| [chunk[0], chunk[1], chunk[2], 255])
             .collect(),
         ColorType::GrayscaleAlpha => source
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|chunk| [chunk[0], chunk[0], chunk[0], chunk[1]])
             .collect(),
         ColorType::Grayscale => source
@@ -1058,11 +1062,15 @@ fn decode_png_raw(bytes: &[u8]) -> Option<(Vec<u8>, i32, i32)> {
     let rgba = match info.color_type {
         ColorType::Rgba => source.to_vec(),
         ColorType::Rgb => source
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|chunk| [chunk[0], chunk[1], chunk[2], 255])
             .collect(),
         ColorType::GrayscaleAlpha => source
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|chunk| [chunk[0], chunk[0], chunk[0], chunk[1]])
             .collect(),
         ColorType::Grayscale => source
@@ -1117,7 +1125,7 @@ fn image_fit_cache_key(fit: Option<ImageFit>) -> &'static str {
 
 fn rgba_to_argb8888(rgba: &[u8]) -> Vec<u8> {
     let mut argb = Vec::with_capacity(rgba.len());
-    for chunk in rgba.chunks_exact(4) {
+    for chunk in rgba.as_chunks::<4>().0 {
         let alpha = chunk[3] as u16;
         let red = ((chunk[0] as u16 * alpha) / 255) as u8;
         let green = ((chunk[1] as u16 * alpha) / 255) as u8;
