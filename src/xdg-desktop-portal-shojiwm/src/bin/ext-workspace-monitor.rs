@@ -244,10 +244,12 @@ fn main() {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     while Instant::now() < deadline {
         queue.flush().expect("flush");
-        conn.prepare_read().map(|guard| {
+        if let Some(guard) = conn.prepare_read() {
             let _ = guard.read_without_dispatch();
-        });
-        queue.dispatch_pending(&mut app).expect("dispatch");
+        }
+        queue
+            .dispatch_pending(&mut app)
+            .expect("dispatch");
         std::thread::sleep(Duration::from_millis(20));
     }
     println!(

@@ -6966,7 +6966,7 @@ fn log_gap_readback_probe(
     let mut opaque = 0usize;
     let mut min_alpha = u8::MAX;
     let mut max_alpha = 0u8;
-    for px in bytes.chunks_exact(4) {
+    for px in bytes.as_chunks::<4>().0 {
         let alpha = px[3];
         min_alpha = min_alpha.min(alpha);
         max_alpha = max_alpha.max(alpha);
@@ -9732,7 +9732,7 @@ fn configured_background_effect_elements_for_layer(
         .hash(&mut hasher);
     let signature = hasher.finish();
     let source_damage_hit = crate::backend::shader_effect::source_damage_intersects_rect(
-        &backdrop_effect,
+        backdrop_effect,
         smithay::utils::Rectangle::new(
             smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
             (effect_rect.width, effect_rect.height).into(),
@@ -9947,7 +9947,7 @@ fn configured_background_effect_elements_for_layer(
             input_size,
             sample_region,
             output_size,
-            &backdrop_effect,
+            backdrop_effect,
             crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
         )?
     } else {
@@ -9959,7 +9959,7 @@ fn configured_background_effect_elements_for_layer(
             input_size,
             sample_region,
             output_size,
-            &backdrop_effect,
+            backdrop_effect,
             crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
         )?
     };
@@ -10062,7 +10062,7 @@ fn configured_background_effect_elements_for_layer(
                 rect_local,
                 rect_local,
                 captured_local_rect,
-                &backdrop_effect,
+                backdrop_effect,
                 alpha,
                 scale.x as f32,
                 None,
@@ -10224,7 +10224,7 @@ fn lower_layer_scene_elements(
                 ));
             }
             let source_damage_hit = crate::backend::shader_effect::source_damage_intersects_rect(
-                &backdrop_effect,
+                backdrop_effect,
                 smithay::utils::Rectangle::new(
                     smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
                     (effect_rect.width, effect_rect.height).into(),
@@ -10434,7 +10434,7 @@ fn lower_layer_scene_elements(
                     input_size,
                     sample_region,
                     output_size,
-                    &backdrop_effect,
+                    backdrop_effect,
                     crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
                 )?
             } else {
@@ -10446,7 +10446,7 @@ fn lower_layer_scene_elements(
                     input_size,
                     sample_region,
                     output_size,
-                    &backdrop_effect,
+                    backdrop_effect,
                     crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
                 )?
             };
@@ -10518,7 +10518,7 @@ fn lower_layer_scene_elements(
                         rect_local,
                         rect_local,
                         captured_local_rect,
-                        &backdrop_effect,
+                        backdrop_effect,
                         1.0,
                         scale.x as f32,
                         None,
@@ -12490,7 +12490,7 @@ fn connector_connected(
                     ),
                 };
                 match feedback {
-                    Err(err) => Err(Box::<dyn std::error::Error>::from(err)),
+                    Err(err) => Err(err),
                     Ok(feedback) => Ok((drm_output, feedback)),
                 }
             }
