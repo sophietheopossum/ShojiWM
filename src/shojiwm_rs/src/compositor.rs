@@ -666,11 +666,10 @@ impl LayerController {
         untrack(|| runtime::global().layers.with(|layers| layers.values().cloned().collect()))
     }
 
-    /// The part of `output` not reserved by exclusive zones (tracked).
-    pub fn usable_area(&self, output: &str) -> Option<Rect> {
-        let snapshot = runtime::global().outputs.with(|outputs| outputs.get(output).cloned())?;
-        let area = output_logical_rect(&snapshot)?;
-        let (mut top, mut right, mut bottom, mut left) = (0.0, 0.0, 0.0, 0.0);
+    /// Space reserved on each edge of `output` by layer exclusive zones
+    /// (tracked).
+    pub fn reserved_insets(&self, output: &str) -> LayerInsets {
+        let mut insets = LayerInsets::default();
         runtime::global().layers.with(|layers| {
             for layer in layers.values() {
                 if layer.output_name != output {
@@ -681,21 +680,39 @@ impl LayerController {
                 };
                 let size = size as f64;
                 match layer.exclusive_edge.or_else(|| edge_from_anchor(layer)) {
-                    Some(LayerEdgeSnapshot::Top) => top += size,
-                    Some(LayerEdgeSnapshot::Bottom) => bottom += size,
-                    Some(LayerEdgeSnapshot::Left) => left += size,
-                    Some(LayerEdgeSnapshot::Right) => right += size,
+                    Some(LayerEdgeSnapshot::Top) => insets.top += size,
+                    Some(LayerEdgeSnapshot::Bottom) => insets.bottom += size,
+                    Some(LayerEdgeSnapshot::Left) => insets.left += size,
+                    Some(LayerEdgeSnapshot::Right) => insets.right += size,
                     None => {}
                 }
             }
         });
+        insets
+    }
+
+    /// The part of `output` not reserved by exclusive zones (tracked).
+    pub fn usable_area(&self, output: &str) -> Option<Rect> {
+        let snapshot = runtime::global().outputs.with(|outputs| outputs.get(output).cloned())?;
+        let area = output_logical_rect(&snapshot)?;
+        let insets = self.reserved_insets(output);
         Some(Rect::new(
-            area.x + left,
-            area.y + top,
-            (area.width - left - right).max(0.0),
-            (area.height - top - bottom).max(0.0),
+            area.x + insets.left,
+            area.y + insets.top,
+            (area.width - insets.left - insets.right).max(0.0),
+            (area.height - insets.top - insets.bottom).max(0.0),
         ))
     }
+}
+
+/// Logical pixels reserved on each edge of an output; see
+/// [`LayerController::reserved_insets`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LayerInsets {
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub left: f64,
 }
 
 fn edge_from_anchor(layer: &WaylandLayerSnapshot) -> Option<LayerEdgeSnapshot> {

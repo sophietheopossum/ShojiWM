@@ -89,7 +89,7 @@ pub mod prelude {
             set_interval, set_timeout,
         },
         compositor::{
-            Command, DisableEvent, EnableEvent, InputChangeEvent, OutputChangeEvent, OutputConfig,
+            Command, DisableEvent, EnableEvent, InputChangeEvent, LayerInsets, OutputChangeEvent, OutputConfig,
             OutputContext, OutputPower, OutputPowerOptions, Sender, SurfaceRef,
         },
         effect::{
