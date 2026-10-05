@@ -24,6 +24,14 @@ pub struct AddWindowOptions {
     pub restore_scroll_if_initially_floating: bool,
 }
 
+/// What [`Workspace::move_window_before`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorderOutcome {
+    Moved,
+    Unchanged,
+    Refused,
+}
+
 /// What a window carries along when it moves between workspaces.
 #[derive(Debug, Clone)]
 pub struct WorkspaceWindowSnapshot {
@@ -364,6 +372,46 @@ impl Workspace {
         self.apply_layout(LayoutOptions::default());
         focused.focus();
         true
+    }
+
+    /// Place `window` directly before `before` in this workspace's window
+    /// order, or last when `before` is `None`. That order is the left-to-right
+    /// tile sequence on a tiled workspace and the Alt+Tab ring on every
+    /// workspace; MinkaShell's dock drag-to-reorder drives it through
+    /// `windows.reorder`. Never focuses. Refused when either window is not in
+    /// this workspace; the caller refuses while a pointer tile drag owns the
+    /// tile order.
+    pub fn move_window_before(&mut self, window: Window, before: Option<Window>) -> ReorderOutcome {
+        let Some(from) = self.windows.iter().position(|current| *current == window) else {
+            return ReorderOutcome::Refused;
+        };
+        if before.is_some_and(|before| before == window || !self.has_window(before)) {
+            return ReorderOutcome::Refused;
+        }
+        let tile_order = self.tileable_windows();
+        self.windows.remove(from);
+        let to = match before {
+            Some(before) => self
+                .windows
+                .iter()
+                .position(|current| *current == before)
+                .expect("checked above"),
+            None => self.windows.len(),
+        };
+        self.windows.insert(to, window);
+        if to == from {
+            return ReorderOutcome::Unchanged;
+        }
+        let tiles = self.tileable_windows();
+        if self.is_tiled && tiles != tile_order {
+            self.stop_kinetic_scroll();
+            self.mark_tile_reordering(window);
+            if let Some(active) = self.active_window_in(&tiles) {
+                self.scroll_to_window(active, false);
+            }
+            self.apply_layout(LayoutOptions::default());
+        }
+        ReorderOutcome::Moved
     }
 
     fn mark_tile_reordering(&mut self, window: Window) {
@@ -1106,6 +1154,11 @@ impl Workspace {
     /// A focused tile sticking out on the side the focus key heads first
     /// pans fully into view; the next press moves on. Measured against the
     /// usable area (content inside the cosmetic margin is on screen).
+    /// Maximized tiles fill the usable area edge to edge, so they are
+    /// exactly TILE_MARGIN wider than the viewport on each side: a
+    /// fully-visible one overflows by exactly 0, leaving
+    /// TILE_FOCUS_OVERFLOW_EPSILON of slack for rounding (the scroll offset
+    /// is quantised to physical pixels).
     fn pan_active_tile_into_view(&mut self, tileable: &[Window], index: usize, direction: i32) -> bool {
         let viewport = self.tile_viewport_rect();
         let window_left = self.tile_left_for_index(tileable, index, viewport);
@@ -1447,6 +1500,10 @@ impl Workspace {
             return self.scroll_offset;
         }
         (self.scroll_offset * scale).round() / scale
+    }
+
+    pub fn clamp_to_viewport(&self, rect: Rect) -> Rect {
+        self.clamp_rect_to_viewport(rect)
     }
 
     fn clamp_rect_to_viewport(&self, rect: Rect) -> Rect {

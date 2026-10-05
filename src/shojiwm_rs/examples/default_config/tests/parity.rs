@@ -1396,3 +1396,137 @@ fn real_config_virtual_desktops_off_folds_and_releases_keys() {
     drop(s);
     let _ = std::fs::remove_file(&settings_path);
 }
+
+/// The table keybinds.ts registers, in order, with virtual desktops on.
+const TYPESCRIPT_KEY_BINDINGS: [(&str, &str); 34] = [
+    ("terminal", "Super+T"),
+    ("chrome", "Super+B"),
+    ("discord", "Super+D"),
+    ("dolphin", "Super+E"),
+    ("play", "XF86AudioPlay"),
+    ("pause", "XF86AudioPause"),
+    ("next", "XF86AudioNext"),
+    ("prev", "XF86AudioPrev"),
+    ("brightness-up", "XF86MonBrightnessUp"),
+    ("brightness-down", "XF86MonBrightnessDown"),
+    ("start-menu", "Super+A"),
+    ("start-menu-tap", "Super"),
+    ("screenshot", "Super+P"),
+    ("screenshot-freeze", "Super+Ctrl+P"),
+    ("minkashot", "Print"),
+    ("cycle-windows", "Alt+Tab"),
+    ("cycle-windows-back", "Alt+Shift+Tab"),
+    ("toggle-tiling-mode", "Super+S"),
+    ("close-focused-window", "Super+Q"),
+    ("close-focused-window-alt-f4", "Alt+F4"),
+    ("toggle-focused-window-maximize", "Super+M"),
+    ("toggle-focused-window-fullscreen", "Super+F"),
+    ("tile-focus-left-quick", "Super+Left"),
+    ("tile-focus-right-quick", "Super+Right"),
+    ("tile-focus-left", "Super+Ctrl+Left"),
+    ("tile-focus-right", "Super+Ctrl+Right"),
+    ("tile-move-left", "Super+Shift+Left"),
+    ("tile-move-right", "Super+Shift+Right"),
+    ("window-move-workspace-prev", "Super+Shift+Up"),
+    ("window-move-workspace-next", "Super+Shift+Down"),
+    ("workspace-prev", "Super+Ctrl+Up"),
+    ("workspace-next", "Super+Ctrl+Down"),
+    ("fps", "Super+Shift+F"),
+    ("profile", "Super+Shift+T"),
+];
+
+/// Reads the real minka-settings.json, like every session here: with
+/// desktops switched off there, the four desktop keys are absent.
+#[test]
+fn key_bindings_match_the_typescript_config() {
+    use shojiwm_rs::runtime_key_binding::RuntimeKeyBindingPhase;
+
+    let s = session(false);
+    let bindings = s
+        .published_key_bindings()
+        .expect("the runtime should have published the binding set");
+    let desktop_keys = &TYPESCRIPT_KEY_BINDINGS[28..32];
+    let expected: Vec<(&str, &str)> = TYPESCRIPT_KEY_BINDINGS
+        .iter()
+        .copied()
+        .filter(|binding| {
+            crate::minka::settings::workspaces_enabled() || !desktop_keys.contains(binding)
+        })
+        .collect();
+    let table: Vec<(&str, &str)> = bindings
+        .entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry.shortcut.as_str()))
+        .collect();
+    assert_eq!(table, expected);
+    let on_release: Vec<&str> = bindings
+        .entries
+        .iter()
+        .filter(|entry| entry.on == RuntimeKeyBindingPhase::Release)
+        .map(|entry| entry.id.as_str())
+        .collect();
+    assert_eq!(on_release, ["start-menu-tap"]);
+    for entry in &bindings.entries {
+        assert!(entry.compile().is_ok(), "{entry:?} should compile");
+    }
+}
+
+/// The dock reveals when the pointer reaches the bottom 10px of a monitor,
+/// and stays until it leaves the bottom 120px.
+#[test]
+fn dock_proximity_has_hysteresis() {
+    use shojiwm_rs::ssd::{
+        PointerHitTargetSnapshot, PointerMoveEventSnapshot, PointerMovePointSnapshot,
+    };
+
+    let mut s = session(false);
+    let mut client = Client::connect(&s.socket);
+    // Accepted on a server thread: a reply proves it is registered for
+    // broadcasts.
+    client.request(&mut s, "minka.revision", json!({}));
+    let mut now = 100;
+    let mut inside_after = |s: &mut Session, y: f64| -> Vec<bool> {
+        now += 10;
+        s.pointer_move_async(
+            PointerMoveEventSnapshot {
+                position: PointerMovePointSnapshot { x: 960.0, y },
+                delta: PointerMovePointSnapshot { x: 0.0, y: 0.0 },
+                target: PointerHitTargetSnapshot::None,
+                output_name: Some("TEST-1".into()),
+                modifiers: PointerModifierStateSnapshot {
+                    logo: false,
+                    alt: false,
+                    ctrl: false,
+                    shift: false,
+                },
+                timestamp: now,
+            },
+            now,
+        );
+        client
+            .drain(s)
+            .iter()
+            .filter(|line| line["event"] == "dock.proximity")
+            .map(|line| line["payload"]["inside"] == true)
+            .collect()
+    };
+    assert_eq!(
+        inside_after(&mut s, 1000.0),
+        [false],
+        "the first report is a leave"
+    );
+    assert_eq!(
+        inside_after(&mut s, 1075.0),
+        [true],
+        "the bottom 10px reveal the dock"
+    );
+    assert!(
+        inside_after(&mut s, 1000.0).is_empty(),
+        "it stays while within 120px"
+    );
+    assert_eq!(inside_after(&mut s, 900.0), [false], "it hides past 120px");
+    assert!(
+        inside_after(&mut s, 1065.0).is_empty(),
+        "the reveal needs the bottom 10px again"
+    );
+}

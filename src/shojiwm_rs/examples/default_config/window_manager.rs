@@ -32,6 +32,8 @@ use crate::{
     workspace::{AddWindowOptions, LayoutOptions, Workspace, WorkspaceTransition},
 };
 
+pub use crate::workspace::ReorderOutcome;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapZone {
     Maximize,
@@ -151,8 +153,13 @@ const WORKSPACE_VISUAL_ANIMATION_CHANNEL: &str = "workspace.visual";
 const WORKSPACE_VISUAL_RECT_ANIMATION_CHANNEL: &str = "workspace.visual.rect";
 const WORKSPACE_VISUAL_OPACITY_ANIMATION_CHANNEL: &str = "workspace.visual.opacity";
 pub const WINDOW_BORDER_PX: f64 = 2.0;
-pub const TITLEBAR_HEIGHT: f64 = 30.0;
-const MAXIMIZED_WINDOW_PADDING: f64 = 8.0;
+/// Transparent chrome ring around each non-maximized window. It is the drag
+/// surface (decoration chrome hit-tests as Move) and hosts the hover-revealed
+/// drag tab; there is no titlebar.
+pub const EDGE_DRAG_HALO_PX: f64 = 14.0;
+/// Outer margin around the snap layout (halves/quarters). Maximized windows
+/// deliberately get none: they fill the usable area edge to edge.
+const SNAP_BASE_PADDING: f64 = 8.0;
 
 pub type NaturalRootRect = fn(Window) -> Rect;
 pub type ActiveWorkspaces = Rc<RefCell<BTreeMap<String, u32>>>;
@@ -179,8 +186,8 @@ pub fn inset_rect(rect: Rect, top: f64, right: f64, bottom: f64, left: f64) -> R
     )
 }
 
-fn inset_maximized(rect: Rect) -> Rect {
-    let padding = MAXIMIZED_WINDOW_PADDING;
+fn inset_snap_base(rect: Rect) -> Rect {
+    let padding = SNAP_BASE_PADDING;
     inset_rect(rect, padding, padding, padding, padding)
 }
 
@@ -206,17 +213,23 @@ pub fn output_name_at(x: f64, y: f64) -> Option<String> {
         .find(|name| output_rect(name).is_some_and(|rect| rect.contains(x, y)))
 }
 
-/// The maximized rect of `window` on `output`: its usable area minus the
-/// maximize padding.
+/// The maximized rect of `window` on `output`: its whole usable area. A
+/// maximized window fills it edge to edge, with no padding; the composition
+/// also drops the border and rounded corners for this state.
 pub fn maximized_rect_on(window: Window, output: Option<&str>) -> Rect {
     let rect = get(window, &WINDOW_STATE_RECT);
     let Some(output) = output else {
         return rect;
     };
     if let Some(usable) = COMPOSITOR.layer.usable_area(output) {
-        return inset_maximized(usable);
+        return usable;
     }
-    output_rect(output).map_or(rect, inset_maximized)
+    output_rect(output).unwrap_or(rect)
+}
+
+/// `Math.round`: halves round up, towards positive infinity.
+pub fn js_round(value: f64) -> f64 {
+    (value + 0.5).floor()
 }
 
 fn wall_clock_ms() -> f64 {
@@ -262,7 +275,45 @@ pub struct WindowView {
     pub app_id: Option<String>,
     pub title: String,
     pub focused: bool,
+    pub maximized: bool,
+    pub minimized: bool,
+    pub fullscreen: bool,
     pub last_focused_at: f64,
+    /// Client-declared semantic identity ("typed segment" in the Arcan/SHMIF
+    /// sense, e.g. "minkamon.disk"), claimed via the windows.identify IPC
+    /// method, so consumers can match windows by what they are instead of
+    /// what their title says. `None` while unclaimed.
+    pub role: Option<String>,
+    /// Layout-space frame rect, sampled at view-build time. MinkaMon's
+    /// leader lines need it: a client cannot learn its own window position
+    /// from Wayland.
+    pub rect: Rect,
+}
+
+impl WindowView {
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut view = serde_json::json!({
+            "id": self.id,
+            "title": self.title,
+            "focused": self.focused,
+            "maximized": self.maximized,
+            "minimized": self.minimized,
+            "fullscreen": self.fullscreen,
+            "lastFocusedAt": self.last_focused_at,
+            "role": self.role,
+            "rect": {
+                "x": self.rect.x,
+                "y": self.rect.y,
+                "width": self.rect.width,
+                "height": self.rect.height,
+            },
+        });
+        // Left out rather than null while unknown, as in the TypeScript view.
+        if let Some(app_id) = &self.app_id {
+            view["appId"] = app_id.as_str().into();
+        }
+        view
+    }
 }
 
 impl WorkspacesView {
@@ -277,13 +328,7 @@ impl WorkspacesView {
                     "windowCount": workspace.window_count,
                     "isTiled": workspace.is_tiled,
                     "active": workspace.active,
-                    "windows": workspace.windows.iter().map(|window| serde_json::json!({
-                        "id": window.id,
-                        "appId": window.app_id,
-                        "title": window.title,
-                        "focused": window.focused,
-                        "lastFocusedAt": window.last_focused_at,
-                    })).collect::<Vec<_>>(),
+                    "windows": workspace.windows.iter().map(WindowView::to_json).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         })
@@ -502,6 +547,11 @@ impl WindowManager {
     pub fn window_z_index(&self, window: Window) -> ReadSignal<i32> {
         self.state.borrow().window_stack.z_index(window)
     }
+
+    /// Whether the manager is mid-call (a callback fired from inside it).
+    pub fn is_busy(&self) -> bool {
+        self.state.try_borrow_mut().is_err()
+    }
 }
 
 pub struct HybridWindowManager {
@@ -515,6 +565,16 @@ pub struct HybridWindowManager {
     outbox: Outbox,
     /// MRU focus time per window, for the dock.
     last_focused_at: HashMap<String, f64>,
+    /// Window id -> client-declared role. Never pruned on close: ids are not
+    /// reused within a session.
+    window_roles: HashMap<String, String>,
+    /// Virtual desktops on/off (minka-settings workspaces.enabled). Off means
+    /// one desktop per monitor: every path that could create or show a
+    /// desktop above 1 checks this.
+    workspaces_enabled: bool,
+    /// A fold that arrived mid-drag (a hotplug, say) waits for the drag to
+    /// end: the drag holds a workspace the fold would delete.
+    collapse_deferred: bool,
     pending_initial_focus: HashMap<Window, f64>,
     tileability: HashMap<Window, bool>,
     tileability_subscriptions: HashMap<Window, Scope>,
@@ -560,6 +620,9 @@ impl HybridWindowManager {
             },
             outbox: Outbox::default(),
             last_focused_at: HashMap::new(),
+            window_roles: HashMap::new(),
+            workspaces_enabled: true,
+            collapse_deferred: false,
             pending_initial_focus: HashMap::new(),
             tileability: HashMap::new(),
             tileability_subscriptions: HashMap::new(),
@@ -675,8 +738,10 @@ impl HybridWindowManager {
                     self.workspace_gesture = None;
                     self.update_workspace_scroll_gesture(event);
                 }
-                Some(GestureMode::WorkspaceSwitch) => self.update_workspace_gesture(event),
-                None => {}
+                Some(GestureMode::WorkspaceSwitch) if self.workspaces_enabled => {
+                    self.update_workspace_gesture(event)
+                }
+                _ => {}
             },
             GestureSwipePhaseSnapshot::End | GestureSwipePhaseSnapshot::Cancel => {
                 if self.workspace_gesture_mode == Some(GestureMode::WorkspaceScroll) {
@@ -767,6 +832,8 @@ impl HybridWindowManager {
         }
         self.sync_workspaces();
         self.refresh_usable_area_layouts();
+        // An unplugged monitor's desktops were just re-homed to free indexes.
+        self.collapse_workspaces(false);
         self.sync_workspace_visibility();
     }
 
@@ -925,15 +992,74 @@ impl HybridWindowManager {
         window.set_close_animation_duration(OPEN_CLOSE_ANIMATION_DURATION as u64);
 
         let deferred = self.deferred_initial_layout.remove(&window);
-        let (_, restored) = self.initialize_window_layout(
+        let (workspace, restored) = self.initialize_window_layout(
             window,
             AddWindowOptions {
                 restore_scroll_if_initially_floating: deferred,
             },
         );
         let restored_during_configure = self.restored_during_initial_configure.remove(&window);
+
+        // Re-apply the maximized geometry even when the helper returned early
+        // (the window already joined a workspace at initial configure).
+        // Idempotent otherwise: the helper has just set the same values.
+        if window.is_maximized().get_untracked() {
+            // The restore rect only when unset: recomputing it on every commit
+            // would replace the real pre-maximize size with a default.
+            if get(window, &WINDOW_STATE_RESTORE_RECT).is_none() {
+                set(
+                    window,
+                    &WINDOW_STATE_RESTORE_RECT,
+                    Some(self.initial_restore_rect_for_maximized_window(window)),
+                );
+            }
+            set(window, &WINDOW_STATE_RECT, self.maximized_rect_for_window(window, None));
+            set(window, &WINDOW_STATE_MAXIMIZED, true);
+        } else {
+            // A floating rect is only worth clamping once the window actually
+            // commits, which is why this is not in the helper (it also runs at
+            // initial configure).
+            self.clamp_initial_floating_rect(window, workspace);
+        }
         if !(restored || restored_during_configure) {
             schedule_open_animation(window);
+        }
+    }
+
+    /// Panels are a forbidden zone for new floating windows. A client given
+    /// no size guidance (a 0x0 configure) may size itself to the whole
+    /// output, as Rio does, which overlaps the bar since floating windows
+    /// are unconstrained. Clamps the initial rect into the usable area;
+    /// windows that already fit are left alone.
+    fn clamp_initial_floating_rect(&self, window: Window, workspace: Option<u64>) {
+        if workspace
+            .and_then(|id| self.workspace_by_id(id))
+            .is_some_and(|ws| ws.is_tiled && ws.should_tile(window))
+        {
+            return;
+        }
+        if get(window, &WINDOW_STATE_FULLSCREEN) {
+            return;
+        }
+        let rect = get(window, &WINDOW_STATE_RECT);
+        if rect.width <= 1.0 || rect.height <= 1.0 {
+            return;
+        }
+        let monitor = output_name_at(rect.center_x(), rect.center_y())
+            .or_else(|| (!self.current_monitor.is_empty()).then(|| self.current_monitor.clone()));
+        let Some(usable) = monitor.and_then(|monitor| COMPOSITOR.layer.usable_area(&monitor)) else {
+            return;
+        };
+        let width = rect.width.min(usable.width);
+        let height = rect.height.min(usable.height);
+        let clamped = Rect::new(
+            rect.x.max(usable.x).min(usable.x + usable.width - width),
+            rect.y.max(usable.y).min(usable.y + usable.height - height),
+            width,
+            height,
+        );
+        if clamped != rect {
+            set(window, &WINDOW_STATE_RECT, clamped);
         }
     }
 
@@ -968,9 +1094,17 @@ impl HybridWindowManager {
             }
         }
         self.sync_workspace_visibility();
+        if self.collapse_deferred && !self.has_live_drag() {
+            self.collapse_workspaces(false);
+        }
     }
 
     pub fn on_focus(&mut self, window: Window, focused: bool) {
+        // A deferred fold normally runs when the drag ends; a grab that ended
+        // without an end event is caught here instead.
+        if self.collapse_deferred && !self.has_live_drag() {
+            self.collapse_workspaces(false);
+        }
         if !focused {
             return;
         }
@@ -1022,6 +1156,13 @@ impl HybridWindowManager {
     }
 
     pub fn on_window_move(&mut self, window: Window, event: &WindowMoveEventSnapshot) {
+        self.handle_window_move(window, event);
+        if self.collapse_deferred && !self.has_live_drag() {
+            self.collapse_workspaces(false);
+        }
+    }
+
+    fn handle_window_move(&mut self, window: Window, event: &WindowMoveEventSnapshot) {
         let workspace = self.find_workspace_for_window(window);
         if let Some(id) = workspace {
             let ws = self.workspace_by_id(id).expect("live");
@@ -1314,7 +1455,15 @@ impl HybridWindowManager {
         }
 
         if !event.maximized {
-            if let Some(restore) = get(window, &WINDOW_STATE_RESTORE_RECT) {
+            // Unmaximize always lands centred at half the screen's dimensions
+            // rather than restoring the pre-maximize rect: a remembered rect
+            // can put the window out of reach (display changes, panel moves),
+            // and a deterministic centred rect is always recoverable. The
+            // stored restore rect is only a signal now: the snap and
+            // interactive-drag paths clear it first to request a silent
+            // unmaximize, because they place the window themselves.
+            if get(window, &WINDOW_STATE_RESTORE_RECT).is_some() {
+                let restore = self.centered_half_rect_for_window(window);
                 if let Some(id) = workspace {
                     self.ws(id).sync_floating_window_rect(window, restore);
                 }
@@ -1498,6 +1647,11 @@ impl HybridWindowManager {
     }
 
     pub fn move_focused_window_to_workspace(&mut self, direction: i32) {
+        // It moves the window before switching, so the switch guard alone
+        // would strand it on a hidden desktop.
+        if !self.workspaces_enabled {
+            return;
+        }
         self.sync_workspaces();
         let focused = self
             .workspaces
@@ -1535,6 +1689,43 @@ impl HybridWindowManager {
         if let Some(window) = self.workspaces.iter().find_map(Workspace::focused_window) {
             window.close();
         }
+    }
+
+    /// Alt+Tab: cycle focus through the current workspace's windows in stack
+    /// order. A fixed order (not MRU), so repeated presses reach every window
+    /// without a hold-to-cycle switcher.
+    pub fn cycle_workspace_focus(&mut self, direction: i32) {
+        let Some(id) = self.current_workspace() else {
+            return;
+        };
+        let ws = self.workspace_by_id(id).expect("live");
+        let windows: Vec<Window> = ws
+            .list_windows()
+            .into_iter()
+            .filter(|window| !get(*window, &WINDOW_STATE_MINIMIZED))
+            .collect();
+        if windows.is_empty() {
+            return;
+        }
+        let index = ws
+            .focused_window()
+            .and_then(|focused| windows.iter().position(|window| *window == focused))
+            .map_or(-1, |index| index as i64);
+        let next = windows[(index + direction as i64).rem_euclid(windows.len() as i64) as usize];
+        if ws.is_tiled && ws.should_tile(next) {
+            self.ws(id).focus_window(next);
+        } else {
+            self.window_stack.raise(next);
+        }
+        next.focus();
+    }
+
+    pub fn close_window_by_id(&self, id: &str) -> bool {
+        let Some(window) = self.find_window_by_id(id) else {
+            return false;
+        };
+        window.close();
+        true
     }
 
     pub fn toggle_focused_window_maximize(&self) {
@@ -1580,6 +1771,201 @@ impl HybridWindowManager {
         self.sync_workspace_visibility();
     }
 
+    /// Turn virtual desktops on or off. Off folds every monitor onto desktop
+    /// 1; on only lifts the guards. settings.apply resends the whole settings
+    /// file on every edit, so an unchanged value does nothing.
+    pub fn set_workspaces_enabled(&mut self, enabled: bool) {
+        if self.workspaces_enabled == enabled {
+            return;
+        }
+        self.workspaces_enabled = enabled;
+        self.collapse_deferred = false;
+        if !enabled {
+            // Flipped from MinkaConf, so no window drag is in progress; drag
+            // state still set then is stale (a grab can end without an end
+            // event).
+            self.collapse_workspaces(true);
+        }
+    }
+
+    /// Move every window on a desktop above 1 onto desktop 1 of its monitor
+    /// and drop the emptied desktops. Desktop 1 keeps its tiled or floating
+    /// mode; windows from desktops in the other mode go through the same
+    /// conversion as Super+S first. Floating windows keep their place on
+    /// screen.
+    fn collapse_workspaces(&mut self, force: bool) {
+        if self.workspaces_enabled {
+            return;
+        }
+        let extra: Vec<(u64, String, u32)> = self
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.index != 1)
+            .map(|workspace| (workspace.id, workspace.monitor.clone(), workspace.index))
+            .collect();
+        let off_one: Vec<String> = self
+            .active_workspace_by_monitor
+            .borrow()
+            .iter()
+            .filter(|(_, index)| **index != 1)
+            .map(|(monitor, _)| monitor.clone())
+            .collect();
+        if extra.is_empty() && off_one.is_empty() {
+            return;
+        }
+        if !force && self.has_live_drag() {
+            self.collapse_deferred = true;
+            return;
+        }
+        self.collapse_deferred = false;
+
+        // Drop a vertical swipe in progress, but keep its mode so the rest of
+        // its updates are ignored; a horizontal tile scroll is left alone.
+        if self.workspace_gesture_mode == Some(GestureMode::WorkspaceSwitch) {
+            self.workspace_gesture = None;
+        }
+        let focused = self.workspaces.iter().find_map(Workspace::focused_window);
+        let mut monitors: Vec<String> = Vec::new();
+        for monitor in extra.iter().map(|(_, monitor, _)| monitor).chain(&off_one) {
+            if !monitors.contains(monitor) {
+                monitors.push(monitor.clone());
+            }
+        }
+        // Floating windows moved onto a tiled desktop, pinned to where they
+        // were on screen once the final scroll is known (focusing can scroll).
+        let mut migrated_floating: Vec<(Window, u64, f64)> = Vec::new();
+        for monitor in &monitors {
+            // Before any add: adding takes visibility from the target's
+            // activity.
+            self.set_active_index(monitor, 1);
+            let target = self.ensure_workspace(monitor, 1);
+            let mut sources: Vec<(u64, u32)> = extra
+                .iter()
+                .filter(|(_, source_monitor, _)| source_monitor == monitor)
+                .map(|(id, _, index)| (*id, *index))
+                .collect();
+            sources.sort_by_key(|(_, index)| *index);
+            for (source, _) in sources {
+                self.ws(source).stop_kinetic_scroll();
+                let windows = self.workspace_by_id(source).expect("live").list_windows();
+                // Captured before the conversion, which can move floating
+                // windows back to an older floating rect.
+                let viewport_before: HashMap<Window, Rect> = windows
+                    .iter()
+                    .map(|window| (*window, get(*window, &WINDOW_STATE_RECT)))
+                    .collect();
+                let target_tiled = self.workspace_by_id(target).expect("live").is_tiled;
+                self.ws(source).set_tiled(target_tiled);
+                for window in self.workspace_by_id(source).expect("live").list_windows() {
+                    if !target_tiled {
+                        // A missing floating rect would re-centre the window,
+                        // and fullscreen is not part of the move snapshot.
+                        let rect = if get(window, &WINDOW_STATE_FULLSCREEN) {
+                            self.fullscreen_rect_for_window(window, Some(monitor))
+                        } else if get(window, &WINDOW_STATE_MAXIMIZED) {
+                            self.maximized_rect_for_window(window, None)
+                        } else {
+                            self.on_monitor_or_clamped(get(window, &WINDOW_STATE_RECT), monitor, target)
+                        };
+                        set(window, &WINDOW_STATE_FLOATING_RECT, Some(rect));
+                    } else if !self.workspace_by_id(target).expect("live").should_tile(window) {
+                        // A floating window on a tiled desktop keeps its
+                        // floating rect in content space (viewport + scroll).
+                        let rect = viewport_before
+                            .get(&window)
+                            .copied()
+                            .unwrap_or_else(|| get(window, &WINDOW_STATE_RECT));
+                        let scroll = self.workspace_by_id(target).expect("live").scroll_position();
+                        set(
+                            window,
+                            &WINDOW_STATE_FLOATING_RECT,
+                            Some(Rect {
+                                x: rect.x + scroll,
+                                ..rect
+                            }),
+                        );
+                        migrated_floating.push((window, target, rect.x));
+                    }
+                    if let Some(snapshot) = self.ws(source).take_window_for_move(window) {
+                        self.ws(target).add_moved_window(window, snapshot);
+                    }
+                }
+                self.workspaces.retain(|workspace| workspace.id != source);
+            }
+            for window in self.workspace_by_id(target).expect("live").list_windows() {
+                cancel_workspace_visual_animation(window);
+            }
+            // Also invalidates a pending switch timer that would hide it.
+            self.ws(target).set_visible(true);
+            self.ws(target).apply_layout(LayoutOptions {
+                animate: Some(false),
+                preserve_missing_active: true,
+                ..LayoutOptions::default()
+            });
+            self.apply_workspace_stack_policy(Some(target));
+        }
+        self.sync_workspaces();
+        self.sync_workspace_visibility();
+        if let Some(focused) = focused {
+            let workspace = self.find_workspace_for_window(focused);
+            match workspace {
+                Some(id)
+                    if self
+                        .workspace_by_id(id)
+                        .is_some_and(|ws| ws.is_tiled && ws.should_tile(focused)) =>
+                {
+                    self.ws(id).focus_window(focused)
+                }
+                _ => self.window_stack.raise(focused),
+            }
+            focused.focus();
+        }
+        let mut repinned: Vec<u64> = Vec::new();
+        for (window, target, viewport_x) in migrated_floating {
+            let Some(ws) = self.workspace_by_id(target).filter(|ws| ws.has_window(window)) else {
+                continue;
+            };
+            let rect = get(window, &WINDOW_STATE_FLOATING_RECT).unwrap_or_else(|| get(window, &WINDOW_STATE_RECT));
+            let x = viewport_x + ws.scroll_position();
+            if rect.x != x {
+                set(window, &WINDOW_STATE_FLOATING_RECT, Some(Rect { x, ..rect }));
+                if !repinned.contains(&target) {
+                    repinned.push(target);
+                }
+            }
+        }
+        for target in repinned {
+            self.ws(target).apply_layout(LayoutOptions {
+                animate: Some(false),
+                preserve_missing_active: true,
+                ..LayoutOptions::default()
+            });
+        }
+        self.outbox.workspaces_changed = true;
+    }
+
+    /// A window drag that is actually still going on (not stale state).
+    fn has_live_drag(&self) -> bool {
+        if !self.is_grabbing {
+            return false;
+        }
+        [&self.tile_drag, &self.floating_drag]
+            .into_iter()
+            .flatten()
+            .any(|drag| self.find_workspace_for_window(drag.window).is_some())
+    }
+
+    /// `rect` if its centre is on `monitor`, else clamped into the target's
+    /// viewport. Desktops re-homed from an unplugged monitor can hold rects
+    /// for a monitor that no longer exists.
+    fn on_monitor_or_clamped(&self, rect: Rect, monitor: &str, target: u64) -> Rect {
+        if output_name_at(rect.center_x(), rect.center_y()).as_deref() == Some(monitor) {
+            rect
+        } else {
+            self.workspace_by_id(target).expect("live").clamp_to_viewport(rect)
+        }
+    }
+
     pub fn switch_workspace(&mut self, direction: i32) {
         let monitor = if self.current_monitor.is_empty() {
             output_list().into_iter().next().unwrap_or_default()
@@ -1599,6 +1985,11 @@ impl HybridWindowManager {
         self.workspace_gesture = None;
         self.sync_workspaces();
         if monitor.is_empty() || target_index < 1 {
+            return;
+        }
+        // Keys, IPC, ext-workspace activation, edge drags and window
+        // activation all switch through here.
+        if !self.workspaces_enabled && target_index != 1 {
             return;
         }
         let current = self.active_index(monitor);
@@ -1683,10 +2074,15 @@ impl HybridWindowManager {
                             let id = window.id();
                             WindowView {
                                 last_focused_at: self.last_focused_at.get(&id).copied().unwrap_or(0.0),
+                                role: self.window_roles.get(&id).cloned(),
                                 id,
                                 app_id: window.app_id().get_untracked(),
                                 title: window.title().get_untracked(),
                                 focused: window.is_focused().get_untracked(),
+                                maximized: get(window, &WINDOW_STATE_MAXIMIZED),
+                                minimized: get(window, &WINDOW_STATE_MINIMIZED),
+                                fullscreen: get(window, &WINDOW_STATE_FULLSCREEN),
+                                rect: get(window, &WINDOW_STATE_RECT),
                             }
                         })
                         .collect(),
@@ -1731,6 +2127,16 @@ impl HybridWindowManager {
         self.last_focused_at.insert(window.id(), wall_clock_ms());
     }
 
+    /// Attach a client-declared semantic role to a window (the Arcan/SHMIF
+    /// "typed segment" idea), so consumers match on role rather than title.
+    /// An empty or missing role revokes the claim.
+    pub fn set_window_role(&mut self, id: &str, role: Option<&str>) {
+        match role.filter(|role| !role.is_empty()) {
+            Some(role) => self.window_roles.insert(id.to_owned(), role.to_owned()),
+            None => self.window_roles.remove(id),
+        };
+    }
+
     fn track_pending_initial_focus(&mut self, window: Window) {
         let token = wall_clock_ms();
         self.pending_initial_focus.insert(window, token);
@@ -1768,6 +2174,38 @@ impl HybridWindowManager {
             .find_map(|workspace| workspace.find_window_by_id(id))
     }
 
+    /// Externally-driven move/resize (IPC `windows.setRect`, MinkaMon's
+    /// full-overview arrangement): place a floating window at an exact
+    /// layout-space rect. Tiles are left to the tiler; a maximized window is
+    /// restored first so the rect sticks.
+    pub fn set_window_rect_by_id(&mut self, id: &str, rect: Rect) -> bool {
+        let Some(window) = self.find_window_by_id(id) else {
+            return false;
+        };
+        let workspace = self.find_workspace_for_window(window);
+        if workspace
+            .and_then(|id| self.workspace_by_id(id))
+            .is_some_and(|ws| ws.is_tiled && ws.should_tile(window))
+        {
+            return false;
+        }
+        if get(window, &WINDOW_STATE_MAXIMIZED) {
+            window.unmaximize();
+        }
+        stop_rect_animation(window, &WINDOW_STATE_RECT);
+        set(window, &WINDOW_STATE_RECT, rect);
+        if let Some(id) = workspace {
+            self.ws(id).sync_floating_window_rect(window, rect);
+        }
+        self.apply_workspace_stack_policy(workspace);
+        true
+    }
+
+    /// Every managed window across all workspaces.
+    pub fn list_windows(&self) -> Vec<Window> {
+        self.workspaces.iter().flat_map(Workspace::list_windows).collect()
+    }
+
     /// "Go to this window" for the dock: unminimize, switch workspace, pan,
     /// focus. Returns whether the window exists.
     pub fn activate_window_by_id(&mut self, id: &str) -> bool {
@@ -1792,6 +2230,36 @@ impl HybridWindowManager {
         }
         window.focus();
         true
+    }
+
+    /// Dock drag-to-reorder (IPC `windows.reorder`): put the window directly
+    /// before `before_id` in its own workspace's window order, or last when
+    /// there is none. An anchor in another workspace is refused, so a reorder
+    /// never moves a window between workspaces or monitors. Refused while a
+    /// pointer tile drag is live on that workspace: the drag owns the tile
+    /// order until it ends.
+    pub fn reorder_window_by_id(&mut self, id: &str, before_id: Option<&str>) -> ReorderOutcome {
+        let Some(window) = self.find_window_by_id(id) else {
+            return ReorderOutcome::Refused;
+        };
+        let Some(workspace) = self.find_workspace_for_window(window) else {
+            return ReorderOutcome::Refused;
+        };
+        if self.is_grabbing && self.tile_drag.as_ref().is_some_and(|drag| drag.workspace == workspace) {
+            return ReorderOutcome::Refused;
+        }
+        let before = match before_id {
+            None => None,
+            Some(before_id) => match self.workspace_by_id(workspace).expect("live").find_window_by_id(before_id) {
+                Some(before) => Some(before),
+                None => return ReorderOutcome::Refused,
+            },
+        };
+        let outcome = self.ws(workspace).move_window_before(window, before);
+        if outcome == ReorderOutcome::Moved {
+            self.apply_workspace_stack_policy(Some(workspace));
+        }
+        outcome
     }
 
     pub fn activate(&mut self, monitor: &str, index: u32) {
@@ -2315,6 +2783,19 @@ impl HybridWindowManager {
         )
     }
 
+    /// Half the screen's dimensions, centred in the usable area.
+    fn centered_half_rect_for_window(&self, window: Window) -> Rect {
+        let full = self.maximized_rect_for_window(window, None);
+        let width = js_round(full.width / 2.0);
+        let height = js_round(full.height / 2.0);
+        Rect::new(
+            full.x + js_round((full.width - width) / 2.0),
+            full.y + js_round((full.height - height) / 2.0),
+            width,
+            height,
+        )
+    }
+
     fn maximized_rect_for_window(&self, window: Window, preferred: Option<&str>) -> Rect {
         let rect = get(window, &WINDOW_STATE_RECT);
         let output = preferred
@@ -2418,13 +2899,13 @@ impl HybridWindowManager {
     // the zone, broadcasts it and applies the snap on drop.
     // ----------------------------------------------------------------------
 
-    /// Usable area inset by the maximize padding: the base of snap rects.
+    /// Usable area inset by the snap margin: the base of snap rects.
     fn monitor_snap_base_rect(&self, monitor: &str) -> Option<Rect> {
         COMPOSITOR
             .layer
             .usable_area(monitor)
             .or_else(|| output_rect(monitor))
-            .map(inset_maximized)
+            .map(inset_snap_base)
     }
 
     fn floating_snap_zone_at(&self, monitor: &str, x: f64, y: f64) -> Option<SnapZone> {
@@ -2791,11 +3272,11 @@ pub fn clear_window_snap_state(window: Window) {
 
 fn restore_rect_for_maximized_move(event: &WindowMoveEventSnapshot, width: f64, height: f64) -> Rect {
     let pointer = event.current_pointer;
-    let titlebar_center_y = WINDOW_BORDER_PX + TITLEBAR_HEIGHT / 2.0;
+    let drag_chrome_center_y = WINDOW_BORDER_PX + EDGE_DRAG_HALO_PX / 2.0;
     let pointer_offset_y = if event.source == WindowMoveSourceSnapshot::Modifier {
         height / 2.0
     } else {
-        (height / 2.0).min(titlebar_center_y)
+        (height / 2.0).min(drag_chrome_center_y)
     };
     Rect::new(pointer.x - width / 2.0, pointer.y - pointer_offset_y, width, height)
 }
