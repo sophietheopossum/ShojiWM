@@ -1365,6 +1365,9 @@ mod tests {
 
     use super::*;
 
+    /// The TypeScript config's scenario tests, ported.
+    mod parity;
+
     fn output(name: &str, x: i32) -> WaylandOutputSnapshot {
         WaylandOutputSnapshot {
             name: name.into(),
