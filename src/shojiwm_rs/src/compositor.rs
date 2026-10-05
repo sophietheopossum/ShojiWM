@@ -764,6 +764,12 @@ impl InputController {
     pub fn grab(&self, options: InputGrabOptions) -> InputGrab {
         crate::input_grab::grab(options)
     }
+
+    /// Re-run the factory and send its config, e.g. after settings it reads
+    /// changed outside any signal.
+    pub fn reconfigure(&self) {
+        reconfigure_input(true);
+    }
 }
 
 pub(crate) fn reconfigure_input(force: bool) {
