@@ -99,10 +99,10 @@ pub mod prelude {
         compositor::{
             Command, CursorPosition, CursorPositionSnapshot, CursorTransform, DisableEvent,
             EnableEvent, FramePacing, HeadlessOutputOptions, HotCorner, HotCornerOptions,
-            InputChangeEvent, KeyBindOptions, LockBackground, OutputChangeEvent, OutputConfig,
-            OutputContext, OutputPower, OutputPowerOptions, PointerRegion, PointerRegionAnchor,
-            PointerRegionEventSnapshot, PointerRegionOffset, PointerRegionPhase, PointerRegionSize,
-            Sender, SurfaceRef,
+            InputChangeEvent, KeyBindOptions, LayerInsets, LockBackground, OutputChangeEvent,
+            OutputConfig, OutputContext, OutputPower, OutputPowerOptions, PointerRegion,
+            PointerRegionAnchor, PointerRegionEventSnapshot, PointerRegionOffset,
+            PointerRegionPhase, PointerRegionSize, Sender, SurfaceRef,
         },
         dnd::{
             DragAction, DragActions, DragDevice, DragEnd, DragEndKind, DragIconInfo, DragPoint,
