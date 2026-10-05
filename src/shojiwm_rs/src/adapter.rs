@@ -925,6 +925,7 @@ impl ConfigRuntime for ReactiveRuntime {
             return Ok(());
         }
         self.enabled = true;
+        runtime::set_enabled(true);
         guard(|| {
             batch(|| {
                 let event = EnableEvent {
