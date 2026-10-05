@@ -1849,6 +1849,9 @@ fn power_on_surface(surface: &mut SurfaceData) {
     if let Some(target) = surface.cross_gpu.as_mut() {
         target.reset(&surface.output);
     }
+    // Switching the CRTC off lost its vblank phase too, so the grid starts over.
+    surface.vblank_observations.clear();
+    surface.last_grid_frame_target = None;
     surface.redraw_state = if surface.frame_pending {
         TtyRedrawState::WaitingForVBlank { redraw_needed: true }
     } else {
