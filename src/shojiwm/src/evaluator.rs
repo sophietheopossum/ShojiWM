@@ -8642,6 +8642,16 @@ COMPOSITOR.output.configure(() => ({{
             .map(|runtime| runtime.child.bridge_id())
     }
 
+    // The real config's IPC socket for this test's isolate. Every test isolate
+    // gets a runtime dir of its own (`TestRuntimeDir`) with WAYLAND_DISPLAY set
+    // to "test", so the path follows the isolate, and a reload moves it.
+    fn config_ipc_socket(evaluator: &EmbeddedDecorationEvaluator) -> PathBuf {
+        let bridge_id = current_bridge_id(evaluator).expect("the config runtime should be running");
+        std::env::temp_dir()
+            .join(format!("shoji-test-{}-{bridge_id}", std::process::id()))
+            .join("shojiwm-test.sock")
+    }
+
     fn current_runtime_exits(evaluator: &EmbeddedDecorationEvaluator, timeout: Duration) -> bool {
         evaluator.runtime.lock().is_ok_and(|guard| {
             guard
@@ -8986,13 +8996,12 @@ COMPOSITOR.window.composition = () => <Label text="x" />;
         let _ = std::fs::remove_dir_all(&test_dir);
     }
 
-    // The real config binds $XDG_RUNTIME_DIR/shojiwm-wayland-0.sock, as every
-    // other real-config test does, so in a parallel run this could talk to
-    // another test's isolate. Run it alone:
-    //   env -u WAYLAND_DISPLAY XDG_RUNTIME_DIR=<scratch dir> \
-    //     cargo test -p shoji_wm --bins real_config_sends_window_rects -- --ignored
+    // Talks to the real config's IPC server, on the socket of this test's own
+    // isolate (see config_ipc_socket). Run it on its own:
+    //   env -u WAYLAND_DISPLAY \
+    //     cargo test -p shoji_wm --lib real_config_sends_window_rects -- --ignored
     #[test]
-    #[ignore = "shares the real config's IPC socket path; run alone with --ignored"]
+    #[ignore = "talks to the real config's IPC server; run alone with --ignored"]
     fn real_config_sends_window_rects_only_to_lease_holders() {
         use shojiwm_lib::ssd::window_model::{
             PointerModifierStateSnapshot, WindowMovePhaseSnapshot, WindowMoveSourceSnapshot,
@@ -9004,9 +9013,6 @@ COMPOSITOR.window.composition = () => <Label text="x" />;
             eprintln!("skipping: run with WAYLAND_DISPLAY unset and XDG_RUNTIME_DIR redirected");
             return;
         }
-        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-        let socket_path = PathBuf::from(runtime_dir).join("shojiwm-wayland-0.sock");
-
         let evaluator = real_config_evaluator();
         evaluator
             .lifecycle_enable("initial", None)
@@ -9016,6 +9022,7 @@ COMPOSITOR.window.composition = () => <Label text="x" />;
             .evaluate_window(&window, 1)
             .expect("window should evaluate");
 
+        let socket_path = config_ipc_socket(&evaluator);
         let connect = || {
             let stream = UnixStream::connect(&socket_path).expect("config IPC should accept");
             stream
@@ -9306,9 +9313,6 @@ COMPOSITOR.window.composition = () => <Box />;
         };
         std::fs::write(&settings_path, fixture(true).to_string())
             .expect("fixture should be written");
-        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-        let socket_path = PathBuf::from(runtime_dir).join("shojiwm-wayland-0.sock");
-
         const DESKTOP_KEYS: [&str; 4] = [
             "window-move-workspace-prev",
             "window-move-workspace-next",
@@ -9411,7 +9415,7 @@ COMPOSITOR.window.composition = () => <Box />;
                 .invoked
         );
         open(&evaluator, "0xb", 300);
-        let mut ipc = Ipc::connect(&socket_path);
+        let mut ipc = Ipc::connect(&config_ipc_socket(&evaluator));
         let before = desktops(&ipc.request("workspaces.get", serde_json::json!({})));
         assert!(
             before.iter().any(|(index, ids)| *index == 2 && ids == &["0xb"]),
@@ -9467,7 +9471,7 @@ COMPOSITOR.window.composition = () => <Box />;
         );
 
         // On again, live: the keys come back.
-        let mut ipc = Ipc::connect(&socket_path);
+        let mut ipc = Ipc::connect(&config_ipc_socket(&reloaded));
         std::fs::write(&settings_path, fixture(true).to_string())
             .expect("fixture should be written");
         assert_eq!(
