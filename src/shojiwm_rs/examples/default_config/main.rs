@@ -1042,8 +1042,11 @@ mod tests {
     fn start() -> RuntimeHandle {
         let dir = std::env::temp_dir().join(format!("shojiwm-default-config-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: tests in this module run one at a time on their own thread
-        // before anything else reads the environment.
+        // Held until the config is enabled, which binds its IPC socket from
+        // these: unlocked, a parity session could bind here, or this config
+        // in a parity session's directory.
+        let _environment = parity::lock_environment();
+        // SAFETY: every test sets the environment under that lock.
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", &dir);
             std::env::set_var("WAYLAND_DISPLAY", "test-display");
