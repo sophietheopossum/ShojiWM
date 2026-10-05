@@ -1437,6 +1437,9 @@ fn power_on_surface(surface: &mut SurfaceData) {
     surface.power_cleared = false;
     // The swapchain contents predate the dark period; render the first frame from scratch.
     surface.drm_output.reset_buffers();
+    // Switching the CRTC off lost its vblank phase too, so the grid starts over.
+    surface.vblank_observations.clear();
+    surface.last_grid_frame_target = None;
     surface.redraw_state = if surface.frame_pending {
         TtyRedrawState::WaitingForVBlank { redraw_needed: true }
     } else {
