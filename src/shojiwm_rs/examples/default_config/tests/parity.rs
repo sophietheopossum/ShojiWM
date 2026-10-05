@@ -9,7 +9,7 @@ use std::{
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::{
-        Mutex, OnceLock, PoisonError,
+        Mutex, MutexGuard, OnceLock, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -69,6 +69,12 @@ impl Drop for Session {
 static ENVIRONMENT: Mutex<()> = Mutex::new(());
 static SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// Taken by every test that sets the environment, until its config is
+/// enabled.
+pub(super) fn lock_environment() -> MutexGuard<'static, ()> {
+    ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// A freshly enabled config. `tiled` tiles the empty workspace first, where
 /// the TypeScript tests restore a tiled workspace from persisted state: this
 /// runtime has none to restore.
@@ -85,7 +91,7 @@ fn session(tiled: bool) -> Session {
         "/../../packages/config"
     ));
     let runtime = {
-        let _environment = ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner);
+        let _environment = lock_environment();
         // SAFETY: every session sets these under the lock, and the socket is
         // bound from them before it is released.
         unsafe {
