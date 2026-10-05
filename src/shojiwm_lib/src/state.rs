@@ -3108,6 +3108,9 @@ impl ShojiWM {
         self.configured_popup_surface_policies.clear();
         self.layer_effect_evaluation_cache.clear();
         self.popup_effect_evaluation_cache.clear();
+        // Layer backdrops are reused while their effect signature matches and nothing behind
+        // them was damaged; full damage reaches neither, so drop them too.
+        self.layer_backdrop_cache.clear();
         // A reload after editing only a shader file leaves every effect spec equal, so no
         // element reports damage; redraw everything once so the rebuilt programs show.
         self.request_full_damage();
