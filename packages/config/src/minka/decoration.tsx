@@ -166,12 +166,30 @@ export function createWindowComposition(
       );
     }
 
+    // Hover state of the drag halo below. It is declared before the branches
+    // without a halo so they can drop a stale hover: they never receive the
+    // halo's hover-leave, so without this the window would keep pointer motion
+    // signalled (every motion re-evaluating every window again), MinkaMon would
+    // keep a ghost drag tab, and the old tab would come back with the halo.
+    const [hoveredEdge, setHoveredEdge] = useState<
+      "top" | "bottom" | "left" | "right" | null
+    >(null);
+    const leaveHalo = () => {
+      pointer.setEdgeHovered(window.id, false);
+      ipc.publishDragTab(window.id, () => null);
+      if (hoveredEdge.peek() !== null) {
+        // After this render, not during it.
+        setTimeout(() => setHoveredEdge(null), 0);
+      }
+    };
+
     // Fullscreen: drop all chrome (titlebar, border, rounded corners) and let
     // the client surface fill its managed rect edge to edge. The rect is set to
     // the whole output by onWindowFullscreenRequest. Rendering nothing but the
     // bare ClientWindow is also what lets the tty backend promote the client
     // buffer to the primary plane (direct scanout).
     if (window.state[WINDOW_STATE_FULLSCREEN]()) {
+      leaveHalo();
       return (
         <ManagedWindow
           rect={managedRect}
@@ -199,6 +217,7 @@ export function createWindowComposition(
 
     // use less Server-Side Decoration
     if (useClientDecoration) {
+      leaveHalo();
       return (
         <ManagedWindow
           rect={managedRect}
@@ -248,6 +267,7 @@ export function createWindowComposition(
       // Without the halo a maximized window is not pointer-draggable; unmaximize re-centres it, so
     // it can never get stuck. Floating windows below keep the full chrome.
     if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+      leaveHalo();
       return (
         <ManagedWindow
           rect={managedRect}
@@ -270,9 +290,6 @@ export function createWindowComposition(
     // that edge as the visible affordance; the tab itself is plain chrome, so
     // grabbing it drags too. Chrome can't render above the client surface,
     // which is why the tab lives outside the window instead of overlapping it.
-    const [hoveredEdge, setHoveredEdge] = useState<
-      "top" | "bottom" | "left" | "right" | null
-    >(null);
     const dragEdgeHover =
       (edge: "top" | "bottom" | "left" | "right") => (inside: boolean) => {
         if (inside) {
