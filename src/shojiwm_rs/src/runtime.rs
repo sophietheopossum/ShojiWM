@@ -165,6 +165,7 @@ thread_local! {
     static ACTIONS: RefCell<Vec<RuntimeWindowAction>> = const { RefCell::new(Vec::new()) };
     static DIRTY_WINDOWS: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     static LAYER_EFFECTS_DIRTY: Cell<bool> = const { Cell::new(false) };
+    static ENABLED: Cell<bool> = const { Cell::new(false) };
     pub(crate) static WINDOWS: RefCell<Windows> = RefCell::new(Windows::default());
     pub(crate) static GLOBAL: RefCell<Option<GlobalSignals>> = const { RefCell::new(None) };
 }
@@ -192,6 +193,16 @@ pub(crate) fn global() -> GlobalSignals {
             }
         })
     })
+}
+
+/// Whether the compositor has enabled the config yet: outputs, input devices
+/// and `WAYLAND_DISPLAY` are known from then on.
+pub(crate) fn is_enabled() -> bool {
+    ENABLED.with(Cell::get)
+}
+
+pub(crate) fn set_enabled(enabled: bool) {
+    ENABLED.with(|cell| cell.set(enabled));
 }
 
 pub(crate) fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
@@ -476,4 +487,5 @@ pub(crate) fn reset() {
     WINDOWS.with(|windows| windows.borrow_mut().clear());
     GLOBAL.with(|global| *global.borrow_mut() = None);
     LAYER_EFFECTS_DIRTY.with(|dirty| dirty.set(false));
+    ENABLED.with(|enabled| enabled.set(false));
 }
