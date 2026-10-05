@@ -2258,18 +2258,9 @@ fn native_shader_uniform_array_value(
     }
     Ok(match width {
         1 => shojiwm_lib::ssd::ShaderUniformValue::FloatArray(values.to_vec()),
-        2 => shojiwm_lib::ssd::ShaderUniformValue::Vec2Array(
-            values.chunks_exact(2).map(|v| [v[0], v[1]]).collect(),
-        ),
-        3 => shojiwm_lib::ssd::ShaderUniformValue::Vec3Array(
-            values.chunks_exact(3).map(|v| [v[0], v[1], v[2]]).collect(),
-        ),
-        4 => shojiwm_lib::ssd::ShaderUniformValue::Vec4Array(
-            values
-                .chunks_exact(4)
-                .map(|v| [v[0], v[1], v[2], v[3]])
-                .collect(),
-        ),
+        2 => shojiwm_lib::ssd::ShaderUniformValue::Vec2Array(values.as_chunks::<2>().0.to_vec()),
+        3 => shojiwm_lib::ssd::ShaderUniformValue::Vec3Array(values.as_chunks::<3>().0.to_vec()),
+        4 => shojiwm_lib::ssd::ShaderUniformValue::Vec4Array(values.as_chunks::<4>().0.to_vec()),
         _ => unreachable!(),
     })
 }

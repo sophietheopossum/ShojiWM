@@ -868,6 +868,13 @@ impl std::fmt::Debug for EmbeddedDecorationEvaluator {
     }
 }
 
+/// (display state, input state, generation); a `None` map means the runtime's copy is current.
+type InteractionStatePayload = (
+    Option<std::collections::BTreeMap<String, WaylandOutputSnapshot>>,
+    Option<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>,
+    u64,
+);
+
 impl EmbeddedDecorationEvaluator {
     pub fn for_workspace(config_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -1450,14 +1457,7 @@ impl EmbeddedDecorationEvaluator {
     /// changed; the runtime keeps the last copy it was sent, and an absent field
     /// is the reuse signal. Mirrors the gate the cached and scheduler paths use.
     /// The returned generation is recorded once the write succeeds.
-    fn interaction_state_payload(
-        &self,
-        last_sent: u64,
-    ) -> (
-        Option<std::collections::BTreeMap<String, WaylandOutputSnapshot>>,
-        Option<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>,
-        u64,
-    ) {
+    fn interaction_state_payload(&self, last_sent: u64) -> InteractionStatePayload {
         let generation = self.runtime_state_generation.load(Ordering::Acquire);
         if last_sent == generation {
             return (None, None, generation);

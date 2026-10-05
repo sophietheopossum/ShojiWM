@@ -287,7 +287,7 @@ impl SessionLockHandler for ShojiWM {
         let parked_owner = self.session_lock_focus_owner.take();
         if self.window_keyboard_focus.is_none() {
             let restored = parked_owner
-                .filter(|root| smithay::utils::IsAlive::alive(root))
+                .filter(smithay::utils::IsAlive::alive)
                 .and_then(|root| self.window_for_root_surface(&root).cloned())
                 .filter(|window| self.window_allows_input(window));
             if let Some(window) = restored.or_else(|| self.elect_focus_successor()) {

@@ -183,7 +183,9 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for App {
             }
             zwlr_foreign_toplevel_handle_v1::Event::State { state: raw } => {
                 let states: Vec<u32> = raw
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                     .collect();
                 let names: Vec<&str> = states
