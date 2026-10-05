@@ -1,4 +1,4 @@
-import { COMPOSITOR, signal, type ReadonlySignal } from "shoji_wm";
+import { COMPOSITOR, signal } from "shoji_wm";
 import type { HybridWindowManager } from "../window-manager";
 import { createDockProximity } from "./dock";
 import type { WorkspaceIpc } from "./workspace-ipc";
@@ -8,12 +8,24 @@ export interface PointerPosition {
   y: number;
 }
 
+/**
+ * The global pointer position for the decoration's drag tabs. Writing a signal
+ * that no composition reads makes the runtime re-evaluate every window, so
+ * pointer motion is only signalled while some window has a hovered edge.
+ */
+export interface PointerTracking {
+  /** Where the pointer is now. Inside a computed, re-runs it on pointer motion. */
+  current(): PointerPosition;
+  /** A window's drag edge hover started or ended. */
+  setEdgeHovered(windowId: string, hovered: boolean): void;
+}
+
 // Feeds compositor events to the window manager and keeps IPC clients in
-// step. Returns the global pointer position for the decoration's drag tabs.
+// step. Returns the pointer tracking for the decoration's drag tabs.
 export function wireWindowEvents(
   windowManager: HybridWindowManager,
   ipc: WorkspaceIpc,
-): ReadonlySignal<PointerPosition> {
+): PointerTracking {
   const { scheduleWorkspaceBroadcast, scheduleRectsBroadcast } = ipc;
 
   // The dock displays live window titles, so a title change must refresh the
@@ -43,8 +55,12 @@ export function wireWindowEvents(
     scheduleWorkspaceBroadcast();
   });
 
+  // Windows with a hovered drag edge: only their compositions read the pointer.
+  const edgeHoveredWindows = new Set<string>();
+
   COMPOSITOR.event.onClose((window) => {
     windowManager.onClose(window);
+    edgeHoveredWindows.delete(window.id);
     titleSubscriptions.get(window.id)?.();
     titleSubscriptions.delete(window.id);
     scheduleWorkspaceBroadcast();
@@ -63,13 +79,19 @@ export function wireWindowEvents(
   });
 
   // Global pointer position for the drag tabs: each tab centres on the mouse
-  // along its edge. Only compositions with a hovered edge depend on this
-  // signal, so idle windows do no work per pointer motion.
-  const [pointerPosition, setPointerPosition] = signal<PointerPosition>({ x: 0, y: 0 });
+  // along its edge. The position itself is a plain value, always current, so a
+  // tab whose hover just started reads where the pointer is now; the signal
+  // only tells hovered compositions that it moved. Writing it while nothing is
+  // hovered would re-evaluate every window on every pointer motion.
+  let latestPointer: PointerPosition = { x: 0, y: 0 };
+  const [pointerMoves, setPointerMoves] = signal(0);
   const trackDockProximity = createDockProximity(ipc.server);
 
   COMPOSITOR.event.onPointerMoveAsync((event) => {
-    setPointerPosition({ x: event.position.x, y: event.position.y });
+    latestPointer = { x: event.position.x, y: event.position.y };
+    if (edgeHoveredWindows.size > 0) {
+      setPointerMoves(pointerMoves.peek() + 1);
+    }
     windowManager.onPointerMove(event);
     trackDockProximity(event);
   });
@@ -133,5 +155,18 @@ export function wireWindowEvents(
     scheduleWorkspaceBroadcast();
   });
 
-  return pointerPosition;
+  return {
+    current() {
+      // Read for the dependency alone: a computed calling this re-runs on motion.
+      pointerMoves.value;
+      return latestPointer;
+    },
+    setEdgeHovered(windowId, hovered) {
+      if (hovered) {
+        edgeHoveredWindows.add(windowId);
+      } else {
+        edgeHoveredWindows.delete(windowId);
+      }
+    },
+  };
 }

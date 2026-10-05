@@ -13,7 +13,6 @@ import {
   read,
   shaderStage,
   useState,
-  type ReadonlySignal,
   type WaylandWindow,
 } from "shoji_wm";
 import type {
@@ -37,7 +36,7 @@ import {
   WINDOW_STATE_WORKSPACE_VISIBLE,
   type HybridWindowManager,
 } from "../window-manager";
-import type { PointerPosition } from "./events";
+import type { PointerTracking } from "./events";
 import type { WorkspaceIpc } from "./workspace-ipc";
 
 const FULLSCREEN_Z_INDEX = 2_000_000_000;
@@ -70,7 +69,7 @@ export function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
 export function createWindowComposition(
   windowManager: HybridWindowManager,
   ipc: WorkspaceIpc,
-  pointerPosition: ReadonlySignal<PointerPosition>,
+  pointer: PointerTracking,
 ): WindowCompositionFunction {
   return (window: WaylandWindow) => {
     const decoration = window.decoration();
@@ -281,10 +280,11 @@ export function createWindowComposition(
         } else if (read(hoveredEdge) === edge) {
           setHoveredEdge(null);
         }
+        pointer.setEdgeHovered(window.id, read(hoveredEdge) !== null);
       };
     // Trapezium drag tabs (SVG assets, red stipple + border) attached to the
     // window border, centred on the pointer along the hovered edge. The
-    // position computeds read pointerPosition only while their edge is
+    // position computeds read the pointer only while their edge is
     // hovered, so idle windows never re-evaluate on mouse motion.
     const DRAG_TAB_LENGTH = 72;
     const DRAG_TAB_THICKNESS = 12;
@@ -306,7 +306,7 @@ export function createWindowComposition(
           DRAG_TAB_LENGTH,
       );
       const centred = Math.round(
-        pointerPosition.value.x - read(rect.x) -
+        pointer.current().x - read(rect.x) -
           DRAG_TAB_LENGTH
           / 2,
       );
@@ -328,7 +328,7 @@ export function createWindowComposition(
           DRAG_TAB_LENGTH,
       );
       const centred = Math.round(
-        pointerPosition.value.y - read(rect.y) - DRAG_TAB_LENGTH / 2,
+        pointer.current().y - read(rect.y) - DRAG_TAB_LENGTH / 2,
       );
       return Math.min(max, Math.max(
           dragTabMin,

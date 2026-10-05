@@ -78,12 +78,12 @@ configureDisplays();
 configureInput(HYBRID_WINDOW_MANAGER);
 configureRendering();
 
-const pointerPosition = wireWindowEvents(HYBRID_WINDOW_MANAGER, WORKSPACE_IPC);
+const pointer = wireWindowEvents(HYBRID_WINDOW_MANAGER, WORKSPACE_IPC);
 
 COMPOSITOR.window.composition = createWindowComposition(
   HYBRID_WINDOW_MANAGER,
   WORKSPACE_IPC,
-  pointerPosition,
+  pointer,
 );
 
 export default COMPOSITOR;
