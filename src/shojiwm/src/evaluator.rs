@@ -8952,7 +8952,7 @@ COMPOSITOR.window.composition = () => <Box />;
         let bound = |update: &Option<RuntimeKeyBindingConfigUpdate>| -> Vec<String> {
             update
                 .as_ref()
-                .expect("the response should carry the binding set")
+                .expect("the runtime should have published the binding set")
                 .entries
                 .iter()
                 .map(|entry| entry.id.clone())
@@ -9033,10 +9033,10 @@ COMPOSITOR.window.composition = () => <Box />;
         let mut display_state = std::collections::BTreeMap::new();
         display_state.insert("TEST-1".to_string(), test_output_snapshot("TEST-1"));
         evaluator.set_display_state(display_state);
-        let enabled = evaluator
+        evaluator
             .lifecycle_enable("initial", None)
             .expect("initial lifecycle should succeed");
-        assert!(has_desktop_keys(&bound(&enabled.key_binding_config)));
+        assert!(has_desktop_keys(&bound(&published_key_bindings(&evaluator))));
         open(&evaluator, "0xa", 100);
         assert!(
             evaluator
@@ -9066,8 +9066,8 @@ COMPOSITOR.window.composition = () => <Box />;
         let mut ids = folded[0].1.clone();
         ids.sort();
         assert_eq!(ids, ["0xa", "0xb"], "no window lost: {folded:?}");
-        let tick = evaluator.scheduler_tick(400.0).expect("tick should succeed");
-        assert!(no_desktop_keys(&bound(&tick.key_binding_config)));
+        evaluator.scheduler_tick(400.0).expect("tick should succeed");
+        assert!(no_desktop_keys(&bound(&published_key_bindings(&evaluator))));
         assert!(
             !evaluator
                 .invoke_key_binding("workspace-next", 410)
@@ -9085,10 +9085,10 @@ COMPOSITOR.window.composition = () => <Box />;
             .lifecycle_disable("reload")
             .expect("lifecycle disable should succeed");
         let reloaded = evaluator.fresh_like();
-        let enabled = reloaded
+        reloaded
             .lifecycle_enable("reload", Some(&persisted))
             .expect("reload should succeed");
-        assert!(no_desktop_keys(&bound(&enabled.key_binding_config)));
+        assert!(no_desktop_keys(&bound(&published_key_bindings(&reloaded))));
         let state = &persisted["config.hybrid-window-manager"];
         assert!(
             state["workspaces"]
@@ -9108,8 +9108,8 @@ COMPOSITOR.window.composition = () => <Box />;
             ipc.request("settings.apply", fixture(true)),
             serde_json::json!({ "ok": true })
         );
-        let tick = reloaded.scheduler_tick(600.0).expect("tick should succeed");
-        assert!(has_desktop_keys(&bound(&tick.key_binding_config)));
+        reloaded.scheduler_tick(600.0).expect("tick should succeed");
+        assert!(has_desktop_keys(&bound(&published_key_bindings(&reloaded))));
 
         drop(ipc);
         reloaded
