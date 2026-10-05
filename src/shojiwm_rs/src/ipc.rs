@@ -10,7 +10,9 @@
 //! ```
 //!
 //! Sockets are served on background threads; handlers run on the compositor
-//! thread like every other config callback.
+//! thread like every other config callback. Writes are handed to a
+//! per-client writer thread, so a client that stops reading never stalls the
+//! compositor: it is dropped once its queue is full.
 //!
 //! ```no_run
 //! use shojiwm_rs::{ipc::IpcServer, prelude::*};
@@ -36,8 +38,8 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{SyncSender, sync_channel},
     },
-    time::Duration,
 };
 
 use serde_json::{Value, json};
@@ -55,10 +57,17 @@ struct Request {
     params: Value,
 }
 
+/// Frames a client may have waiting before it counts as stuck.
+const CLIENT_QUEUE_FRAMES: usize = 1024;
+
 struct Client {
     id: u64,
-    stream: Mutex<UnixStream>,
-    alive: AtomicBool,
+    /// Both are released on disconnect, so a dead connection holds no socket
+    /// and no writer thread however long the config keeps an [`IpcClient`].
+    stream: Mutex<Option<UnixStream>>,
+    /// Frames for the client's writer thread.
+    outbox: Mutex<Option<SyncSender<String>>>,
+    alive: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -68,13 +77,29 @@ impl Client {
         }
         let mut frame = message.to_string();
         frame.push('\n');
-        let ok = self
-            .stream
+        // Full: the client has stopped reading. Disconnected: its writer is gone.
+        let queued = self
+            .outbox
             .lock()
-            .map(|mut stream| stream.write_all(frame.as_bytes()).is_ok())
+            .ok()
+            .and_then(|outbox| outbox.as_ref().map(|outbox| outbox.try_send(frame).is_ok()))
             .unwrap_or(false);
-        if !ok {
-            self.alive.store(false, Ordering::Relaxed);
+        if !queued {
+            self.disconnect();
+        }
+    }
+
+    fn disconnect(&self) {
+        self.alive.store(false, Ordering::Relaxed);
+        // Ends the writer thread once it has written what is queued...
+        if let Ok(mut outbox) = self.outbox.lock() {
+            outbox.take();
+        }
+        // ...or at once if it is stuck on a full socket buffer.
+        if let Ok(mut stream) = self.stream.lock()
+            && let Some(stream) = stream.take()
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
         }
     }
 }
@@ -202,19 +227,37 @@ impl IpcServer {
                     let Ok(stream) = stream else {
                         continue;
                     };
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                    let Ok(reader) = stream.try_clone() else {
+                    let (Ok(reader), Ok(mut writer)) = (stream.try_clone(), stream.try_clone()) else {
                         continue;
                     };
+                    let (outbox, frames) = sync_channel::<String>(CLIENT_QUEUE_FRAMES);
+                    let alive = Arc::new(AtomicBool::new(true));
+                    {
+                        let alive = alive.clone();
+                        let _ = std::thread::Builder::new()
+                            .name("shoji-ipc-writer".into())
+                            .spawn(move || {
+                                // Ends when the client is dropped (its outbox closes)
+                                // or the socket fails.
+                                for frame in frames {
+                                    if writer.write_all(frame.as_bytes()).is_err() {
+                                        alive.store(false, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                            });
+                    }
                     let client = Arc::new(Client {
                         id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
-                        stream: Mutex::new(stream),
-                        alive: AtomicBool::new(true),
+                        stream: Mutex::new(Some(stream)),
+                        outbox: Mutex::new(Some(outbox)),
+                        alive,
                     });
                     if let Ok(mut clients) = clients.lock() {
                         clients.push(client.clone());
                     }
                     let sender = sender.clone();
+                    let clients = clients.clone();
                     let _ = std::thread::Builder::new()
                         .name("shoji-ipc-client".into())
                         .spawn(move || {
@@ -235,7 +278,11 @@ impl IpcServer {
                                     params: message.get("params").cloned().unwrap_or(Value::Null),
                                 });
                             }
-                            client.alive.store(false, Ordering::Relaxed);
+                            // Hung up: release the connection now, not at the next broadcast.
+                            client.disconnect();
+                            if let Ok(mut clients) = clients.lock() {
+                                clients.retain(|other| !Arc::ptr_eq(other, &client));
+                            }
                         });
                 }
             })?;
@@ -292,10 +339,7 @@ impl IpcServer {
         }
         if let Ok(mut clients) = self.clients.lock() {
             for client in clients.drain(..) {
-                client.alive.store(false, Ordering::Relaxed);
-                if let Ok(stream) = client.stream.lock() {
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                }
+                client.disconnect();
             }
         }
     }
@@ -328,7 +372,10 @@ fn remove_stale_socket(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::{
+        sync::atomic::AtomicUsize,
+        time::{Duration, Instant},
+    };
 
     /// A directory for one test's sockets, removed when the test ends.
     struct Scratch(PathBuf);
@@ -461,6 +508,73 @@ mod tests {
         let error = IpcServer::bind(path.clone()).err().expect("a regular file must be refused");
         assert_eq!(error.kind(), ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read_to_string(&path).expect("file kept"), "not a socket");
+    }
+
+    #[test]
+    fn a_client_that_stops_reading_is_dropped_without_stalling() {
+        runtime::reset();
+        let scratch = Scratch::new();
+        let path = scratch.path("stuck.sock");
+        let server = IpcServer::bind(path.clone()).expect("server");
+        let _stuck = UnixStream::connect(&path).expect("connect");
+        wait_for(|| server.client_count() == 1);
+
+        // Keep broadcasting until the socket buffer and the queue are both
+        // full. Every call must return at once: a blocking write would stall
+        // the compositor thread for the write timeout.
+        let payload = json!("x".repeat(16 * 1024));
+        let mut slowest = Duration::ZERO;
+        for _ in 0..4096 {
+            let started = Instant::now();
+            server.broadcast("flood", payload.clone());
+            slowest = slowest.max(started.elapsed());
+            if server.client_count() == 0 {
+                break;
+            }
+        }
+        assert!(slowest < Duration::from_millis(100), "a broadcast blocked for {slowest:?}");
+        assert_eq!(server.client_count(), 0, "the stuck client is dropped");
+        server.close();
+        runtime::reset();
+    }
+
+    #[test]
+    fn a_client_that_disconnects_is_released_at_once() {
+        runtime::reset();
+        let scratch = Scratch::new();
+        let path = scratch.path("gone.sock");
+        let server = IpcServer::bind(path.clone()).expect("server");
+        let kept = Rc::new(RefCell::new(None::<IpcClient>));
+        {
+            let kept = kept.clone();
+            server.handle_with_client("hello", move |_params, client| {
+                *kept.borrow_mut() = Some(client.clone());
+                Ok(None)
+            });
+        }
+        let mut client = UnixStream::connect(&path).expect("connect");
+        writeln!(client, r#"{{"method":"hello"}}"#).expect("send");
+        serve_until(|| kept.borrow().is_some());
+        drop(client);
+
+        // No broadcast prunes it: the server lets go of the connection as
+        // soon as the client hangs up, even while the config holds a handle.
+        wait_for(|| server.clients.lock().map(|clients| clients.is_empty()).unwrap_or(false));
+        let kept = kept.borrow().clone().expect("handle");
+        assert!(!kept.is_alive());
+        kept.send("late", json!(null));
+        server.close();
+        runtime::reset();
+    }
+
+    fn wait_for(mut done: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("condition not reached");
     }
 
     #[test]
