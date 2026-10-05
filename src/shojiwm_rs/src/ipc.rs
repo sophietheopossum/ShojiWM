@@ -40,6 +40,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{SyncSender, sync_channel},
     },
+    time::Duration,
 };
 
 use serde_json::{Value, json};
@@ -231,8 +232,15 @@ impl IpcServer {
                     if closed.load(Ordering::Relaxed) {
                         break;
                     }
-                    let Ok(stream) = stream else {
-                        continue;
+                    let stream = match stream {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            // Out of file descriptors, accept() fails at once and keeps
+                            // failing while the connection waits; back off, don't spin.
+                            tracing::debug!(%error, "IPC accept failed");
+                            std::thread::sleep(Duration::from_millis(100));
+                            continue;
+                        }
                     };
                     let (Ok(reader), Ok(mut writer)) = (stream.try_clone(), stream.try_clone()) else {
                         continue;
@@ -260,7 +268,17 @@ impl IpcServer {
                         outbox: Mutex::new(Some(outbox)),
                         alive,
                     });
-                    if let Ok(mut clients) = clients.lock() {
+                    {
+                        let Ok(mut clients) = clients.lock() else {
+                            client.disconnect();
+                            continue;
+                        };
+                        // close() sets `closed` before draining under this lock, so a
+                        // connection accepted while it runs is turned away here.
+                        if closed.load(Ordering::Relaxed) {
+                            client.disconnect();
+                            break;
+                        }
                         // Clients that went away hold their socket until
                         // dropped here: a config that never broadcasts
                         // (where `broadcast` prunes them) would otherwise
@@ -386,10 +404,7 @@ fn remove_stale_socket(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        sync::atomic::AtomicUsize,
-        time::{Duration, Instant},
-    };
+    use std::{sync::atomic::AtomicUsize, time::Instant};
 
     /// A directory for one test's sockets, removed when the test ends.
     struct Scratch(PathBuf);
