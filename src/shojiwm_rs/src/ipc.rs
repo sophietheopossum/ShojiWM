@@ -4,6 +4,7 @@
 //! ```text
 //! client -> server   { "id"?: number, "method": string, "params"?: any }
 //! server -> client   { "id": number, "result": any }        (response)
+//!                    { "id": number }                       (response, no result)
 //!                    { "id": number, "error": string }      (error)
 //!                    { "event": string, "payload": any }    (broadcast)
 //! ```
@@ -16,6 +17,11 @@
 //!
 //! let ipc = IpcServer::new().expect("socket");
 //! ipc.handle("ping", |_params| Ok(serde_json::json!("pong")));
+//! // Push to the caller only, e.g. for a subscription.
+//! ipc.handle_with_client("subscribe", |_params, client| {
+//!     client.send("subscribed", serde_json::json!({ "client": client.id() }));
+//!     Ok(None)
+//! });
 //! ipc.broadcast("hello", serde_json::json!({ "from": "config" }));
 //! ```
 
@@ -29,7 +35,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -38,7 +44,9 @@ use serde_json::{Value, json};
 
 use crate::{compositor::COMPOSITOR, runtime};
 
-type Handler = Rc<dyn Fn(&Value) -> Result<Value, String>>;
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+
+type Handler = Rc<dyn Fn(&Value, &IpcClient) -> Result<Option<Value>, String>>;
 
 struct Request {
     client: Arc<Client>,
@@ -48,6 +56,7 @@ struct Request {
 }
 
 struct Client {
+    id: u64,
     stream: Mutex<UnixStream>,
     alive: AtomicBool,
 }
@@ -67,6 +76,28 @@ impl Client {
         if !ok {
             self.alive.store(false, Ordering::Relaxed);
         }
+    }
+}
+
+/// The connection a request came from: answer it beyond the reply, e.g. push
+/// events to only the clients that asked for them.
+#[derive(Clone)]
+pub struct IpcClient(Arc<Client>);
+
+impl IpcClient {
+    /// Push `{ event, payload }` to this client only.
+    pub fn send(&self, event: &str, payload: Value) {
+        self.0.write(&json!({ "event": event, "payload": payload }));
+    }
+
+    /// Whether the connection is still open.
+    pub fn is_alive(&self) -> bool {
+        self.0.alive.load(Ordering::Relaxed)
+    }
+
+    /// Unique per connection, for keying per-client state.
+    pub fn id(&self) -> u64 {
+        self.0.id
     }
 }
 
@@ -143,8 +174,10 @@ impl IpcServer {
             COMPOSITOR.channel(move |request: Request| {
                 let handler = handlers.borrow().get(&request.method).cloned();
                 let response = match handler {
-                    Some(handler) => match handler(&request.params) {
-                        Ok(result) => json!({ "result": result }),
+                    Some(handler) => match handler(&request.params, &IpcClient(request.client.clone())) {
+                        Ok(Some(result)) => json!({ "result": result }),
+                        // Like a TypeScript handler that returns nothing.
+                        Ok(None) => json!({}),
                         Err(error) => json!({ "error": error }),
                     },
                     None => json!({ "error": format!("unknown method: {}", request.method) }),
@@ -174,6 +207,7 @@ impl IpcServer {
                         continue;
                     };
                     let client = Arc::new(Client {
+                        id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
                         stream: Mutex::new(stream),
                         alive: AtomicBool::new(true),
                     });
@@ -211,6 +245,17 @@ impl IpcServer {
     /// Answer `method`; the result (or error) goes back to the caller when
     /// it sent an `id`.
     pub fn handle(&self, method: &str, handler: impl Fn(&Value) -> Result<Value, String> + 'static) {
+        self.handle_with_client(method, move |params, _client| handler(params).map(Some));
+    }
+
+    /// Like [`handle`](Self::handle), but the handler also gets the calling
+    /// client. Returning `Ok(None)` replies `{ "id" }` without a `result`,
+    /// as a TypeScript handler that returns nothing does.
+    pub fn handle_with_client(
+        &self,
+        method: &str,
+        handler: impl Fn(&Value, &IpcClient) -> Result<Option<Value>, String> + 'static,
+    ) {
         self.handlers
             .borrow_mut()
             .insert(method.to_owned(), Rc::new(handler));
@@ -337,6 +382,74 @@ mod tests {
         assert!(UnixStream::connect(&path).is_ok());
         server.close();
         assert!(!path.exists());
+    }
+
+    /// Run the queued requests as a runtime turn would, until `done`.
+    fn serve_until(mut done: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            let channels = runtime::with_registry(|registry| registry.channels.clone());
+            for channel in channels {
+                channel();
+            }
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("IPC request was not served");
+    }
+
+    fn connect(path: &Path) -> (UnixStream, BufReader<UnixStream>) {
+        let stream = UnixStream::connect(path).expect("connect");
+        stream.set_read_timeout(Some(Duration::from_millis(5))).expect("timeout");
+        let reader = BufReader::new(stream.try_clone().expect("clone"));
+        (stream, reader)
+    }
+
+    fn try_read(reader: &mut BufReader<UnixStream>) -> Option<Value> {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(n) if n > 0 => Some(serde_json::from_str(line.trim()).expect("frame is JSON")),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn handlers_can_answer_their_caller_only() {
+        runtime::reset();
+        let scratch = Scratch::new();
+        let path = scratch.path("clients.sock");
+        let server = IpcServer::bind(path.clone()).expect("server");
+        server.handle_with_client("subscribe", |_params, client| {
+            client.send("subscribed", json!({ "client": client.id() }));
+            Ok(Some(json!(client.id())))
+        });
+        server.handle_with_client("quiet", |_params, _client| Ok(None));
+
+        let (mut caller, mut caller_in) = connect(&path);
+        let (_bystander, mut bystander_in) = connect(&path);
+        writeln!(caller, r#"{{"id":1,"method":"subscribe"}}"#).expect("send");
+
+        let mut frames = Vec::new();
+        serve_until(|| {
+            while let Some(frame) = try_read(&mut caller_in) {
+                frames.push(frame);
+            }
+            frames.len() == 2
+        });
+        let id = frames[1]["result"].as_u64().expect("the reply carries the client id");
+        assert_eq!(frames[0], json!({ "event": "subscribed", "payload": { "client": id } }));
+        assert!(try_read(&mut bystander_in).is_none(), "the other client gets nothing");
+
+        writeln!(caller, r#"{{"id":2,"method":"quiet"}}"#).expect("send");
+        let mut reply = None;
+        serve_until(|| {
+            reply = reply.take().or_else(|| try_read(&mut caller_in));
+            reply.is_some()
+        });
+        assert_eq!(reply, Some(json!({ "id": 2 })), "no result key, like a void TS handler");
+        server.close();
+        runtime::reset();
     }
 
     #[test]
