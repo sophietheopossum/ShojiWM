@@ -22,9 +22,10 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, ErrorKind, Write},
     os::unix::net::{UnixListener, UnixStream},
-    path::PathBuf,
+    os::unix::fs::FileTypeExt,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc, Mutex,
@@ -35,7 +36,7 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::compositor::COMPOSITOR;
+use crate::{compositor::COMPOSITOR, runtime};
 
 type Handler = Rc<dyn Fn(&Value) -> Result<Value, String>>;
 
@@ -82,23 +83,63 @@ pub struct IpcServer {
     handlers: Rc<RefCell<HashMap<String, Handler>>>,
     clients: Arc<Mutex<Vec<Arc<Client>>>>,
     closed: Arc<AtomicBool>,
-    path: PathBuf,
+    path: Rc<RefCell<Option<PathBuf>>>,
 }
 
 impl IpcServer {
+    /// Serve on [`default_socket_path`]. The path names the compositor's
+    /// `WAYLAND_DISPLAY`, which is only known once the config is enabled, so
+    /// a server created while the config is set up starts listening then;
+    /// handlers can be registered right away either way. A failure to listen
+    /// at that point (see [`bind`](Self::bind)) can only be logged, so this
+    /// returns an error only when the config is already enabled.
     pub fn new() -> std::io::Result<Self> {
-        Self::bind(default_socket_path())
+        Self::deferred(default_socket_path)
     }
 
+    fn deferred(path: impl Fn() -> PathBuf + 'static) -> std::io::Result<Self> {
+        let server = Self::unbound();
+        if runtime::is_enabled() {
+            server.listen(path())?;
+        } else {
+            let deferred = server.clone();
+            COMPOSITOR.on_enable(move |_| {
+                if let Err(error) = deferred.listen(path()) {
+                    tracing::warn!(%error, "config IPC socket unavailable");
+                }
+            });
+        }
+        Ok(server)
+    }
+
+    /// Serve on `path` right away. A socket file nothing answers on is
+    /// replaced; a path another server still answers on fails with
+    /// `AddrInUse`, and one that is not a socket is never removed.
     pub fn bind(path: PathBuf) -> std::io::Result<Self> {
-        let _ = std::fs::remove_file(&path);
+        let server = Self::unbound();
+        server.listen(path)?;
+        Ok(server)
+    }
+
+    fn unbound() -> Self {
+        Self {
+            handlers: Rc::default(),
+            clients: Arc::default(),
+            closed: Arc::new(AtomicBool::new(false)),
+            path: Rc::default(),
+        }
+    }
+
+    fn listen(&self, path: PathBuf) -> std::io::Result<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        remove_stale_socket(&path)?;
         let listener = UnixListener::bind(&path)?;
-        let handlers: Rc<RefCell<HashMap<String, Handler>>> = Rc::default();
-        let clients: Arc<Mutex<Vec<Arc<Client>>>> = Arc::default();
-        let closed = Arc::new(AtomicBool::new(false));
+        *self.path.borrow_mut() = Some(path);
 
         let sender = {
-            let handlers = handlers.clone();
+            let handlers = self.handlers.clone();
             COMPOSITOR.channel(move |request: Request| {
                 let handler = handlers.borrow().get(&request.method).cloned();
                 let response = match handler {
@@ -116,63 +157,55 @@ impl IpcServer {
             })
         };
 
-        {
-            let clients = clients.clone();
-            let closed = closed.clone();
-            std::thread::Builder::new()
-                .name("shoji-ipc-accept".into())
-                .spawn(move || {
-                    for stream in listener.incoming() {
-                        if closed.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let Ok(stream) = stream else {
-                            continue;
-                        };
-                        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                        let Ok(reader) = stream.try_clone() else {
-                            continue;
-                        };
-                        let client = Arc::new(Client {
-                            stream: Mutex::new(stream),
-                            alive: AtomicBool::new(true),
-                        });
-                        if let Ok(mut clients) = clients.lock() {
-                            clients.push(client.clone());
-                        }
-                        let sender = sender.clone();
-                        let _ = std::thread::Builder::new()
-                            .name("shoji-ipc-client".into())
-                            .spawn(move || {
-                                for line in BufReader::new(reader).lines() {
-                                    let Ok(line) = line else {
-                                        break;
-                                    };
-                                    let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
-                                        continue;
-                                    };
-                                    let Some(method) = message.get("method").and_then(Value::as_str) else {
-                                        continue;
-                                    };
-                                    sender.send(Request {
-                                        client: client.clone(),
-                                        id: message.get("id").filter(|id| !id.is_null()).cloned(),
-                                        method: method.to_owned(),
-                                        params: message.get("params").cloned().unwrap_or(Value::Null),
-                                    });
-                                }
-                                client.alive.store(false, Ordering::Relaxed);
-                            });
+        let clients = self.clients.clone();
+        let closed = self.closed.clone();
+        std::thread::Builder::new()
+            .name("shoji-ipc-accept".into())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    if closed.load(Ordering::Relaxed) {
+                        break;
                     }
-                })?;
-        }
-
-        Ok(Self {
-            handlers,
-            clients,
-            closed,
-            path,
-        })
+                    let Ok(stream) = stream else {
+                        continue;
+                    };
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                    let Ok(reader) = stream.try_clone() else {
+                        continue;
+                    };
+                    let client = Arc::new(Client {
+                        stream: Mutex::new(stream),
+                        alive: AtomicBool::new(true),
+                    });
+                    if let Ok(mut clients) = clients.lock() {
+                        clients.push(client.clone());
+                    }
+                    let sender = sender.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("shoji-ipc-client".into())
+                        .spawn(move || {
+                            for line in BufReader::new(reader).lines() {
+                                let Ok(line) = line else {
+                                    break;
+                                };
+                                let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
+                                    continue;
+                                };
+                                let Some(method) = message.get("method").and_then(Value::as_str) else {
+                                    continue;
+                                };
+                                sender.send(Request {
+                                    client: client.clone(),
+                                    id: message.get("id").filter(|id| !id.is_null()).cloned(),
+                                    method: method.to_owned(),
+                                    params: message.get("params").cloned().unwrap_or(Value::Null),
+                                });
+                            }
+                            client.alive.store(false, Ordering::Relaxed);
+                        });
+                }
+            })?;
+        Ok(())
     }
 
     /// Answer `method`; the result (or error) goes back to the caller when
@@ -207,9 +240,11 @@ impl IpcServer {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        // Unblock the accept loop.
-        let _ = UnixStream::connect(&self.path);
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(path) = self.path.borrow_mut().take() {
+            // Unblock the accept loop.
+            let _ = UnixStream::connect(&path);
+            let _ = std::fs::remove_file(&path);
+        }
         if let Ok(mut clients) = self.clients.lock() {
             for client in clients.drain(..) {
                 client.alive.store(false, Ordering::Relaxed);
@@ -218,5 +253,121 @@ impl IpcServer {
                 }
             }
         }
+    }
+}
+
+/// Clear a socket file left behind by a server that is gone, but never take
+/// over one that still answers: that is another compositor's live socket,
+/// e.g. the session's own while this one runs nested inside it.
+fn remove_stale_socket(path: &Path) -> std::io::Result<()> {
+    match UnixStream::connect(path) {
+        Ok(_) => Err(std::io::Error::new(
+            ErrorKind::AddrInUse,
+            format!("{} is served by another process", path.display()),
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
+            // connect() is also refused on a regular file; leave those alone.
+            if !std::fs::symlink_metadata(path)?.file_type().is_socket() {
+                return Err(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    format!("{} exists and is not a socket", path.display()),
+                ));
+            }
+            std::fs::remove_file(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A directory for one test's sockets, removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "shojiwm-rs-ipc-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Self(dir)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn bind_leaves_a_live_socket_alone() {
+        let scratch = Scratch::new();
+        let path = scratch.path("live.sock");
+        let live = UnixListener::bind(&path).expect("live server");
+
+        let error = IpcServer::bind(path.clone()).err().expect("a served path must be refused");
+        assert_eq!(error.kind(), ErrorKind::AddrInUse);
+
+        // The live server keeps its socket and still accepts.
+        assert!(path.exists());
+        let _client = UnixStream::connect(&path).expect("live socket still answers");
+        assert!(live.accept().is_ok());
+    }
+
+    #[test]
+    fn bind_replaces_a_stale_socket() {
+        let scratch = Scratch::new();
+        let path = scratch.path("stale.sock");
+        drop(UnixListener::bind(&path).expect("old server"));
+        assert!(path.exists(), "a dropped listener leaves its file behind");
+
+        let server = IpcServer::bind(path.clone()).expect("a stale socket is taken over");
+        assert!(UnixStream::connect(&path).is_ok());
+        server.close();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn bind_never_removes_a_file_that_is_not_a_socket() {
+        let scratch = Scratch::new();
+        let path = scratch.path("file.sock");
+        std::fs::write(&path, "not a socket").expect("file");
+
+        let error = IpcServer::bind(path.clone()).err().expect("a regular file must be refused");
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).expect("file kept"), "not a socket");
+    }
+
+    #[test]
+    fn a_server_made_during_setup_listens_once_enabled() {
+        runtime::reset();
+        let scratch = Scratch::new();
+        let path = scratch.path("deferred.sock");
+        let server = {
+            let path = path.clone();
+            IpcServer::deferred(move || path.clone()).expect("server")
+        };
+        assert!(!path.exists(), "nothing is bound during setup");
+
+        runtime::set_enabled(true);
+        runtime::emit(
+            |listeners| listeners.enable.clone(),
+            |listener| listener(&crate::compositor::EnableEvent { reason: "initial".into() }),
+        );
+        assert!(UnixStream::connect(&path).is_ok(), "listening after enable");
+        server.close();
+        runtime::reset();
     }
 }
