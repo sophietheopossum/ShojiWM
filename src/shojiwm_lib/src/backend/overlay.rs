@@ -747,7 +747,7 @@ mod tests {
         assert_eq!(overlays.slots[&key].control.id, second);
         assert!(!get(&owner, failed).unwrap().alive());
         get(&owner, second).unwrap().dispose();
-        overlays.tick(&[output.clone()], false);
+        overlays.tick(std::slice::from_ref(&output), false);
 
         let mut live = snapshot_effect();
         live.input = EffectInput::Backdrop;
@@ -790,9 +790,9 @@ mod tests {
             cached_id,
             "an idle live source must reuse its result"
         );
-        overlays.tick(&[output.clone()], false); // drain the creation wake
+        overlays.tick(std::slice::from_ref(&output), false); // drain the creation wake
         assert!(
-            !overlays.tick(&[output.clone()], false),
+            !overlays.tick(std::slice::from_ref(&output), false),
             "idle persistent effects must not request animation frames"
         );
 
@@ -837,7 +837,7 @@ mod tests {
             other_control.alive(),
             "changing one output must not disable the other"
         );
-        overlays.tick(&[output.clone()], false);
+        overlays.tick(std::slice::from_ref(&output), false);
         assert!(!other_control.alive());
         assert!(
             !overlays.slots.contains_key(&other_key),
@@ -858,7 +858,7 @@ mod tests {
         let locked_control = get(&owner, locked_id).unwrap();
         let mut scene = vec![element(&renderer, &red, 1.0)];
         overlays.render(&mut renderer, &output, size, scale, &mut scene, 0, |e| e);
-        overlays.tick(&[output.clone()], true);
+        overlays.tick(std::slice::from_ref(&output), true);
         assert!(!locked_control.alive());
         assert!(
             overlays.slots.is_empty(),
