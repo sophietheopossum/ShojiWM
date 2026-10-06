@@ -5209,6 +5209,7 @@ dependencies = [
 name = "shojiwm_rs"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
  "shojiwm_lib",
  "smithay",
