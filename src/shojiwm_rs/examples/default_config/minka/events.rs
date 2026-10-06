@@ -64,11 +64,12 @@ pub fn wire_window_events(wm: &WindowManager, ipc: &WorkspaceIpc) -> PointerTrac
     // the IPC view. The broadcast is diffed, so noisy title churn
     // (terminals) only goes out when the string actually changed.
     let title_subscriptions: Rc<RefCell<HashMap<Window, Scope>>> = Rc::default();
-
-    {
-        let (wm, ipc, titles) = (wm.clone(), ipc.clone(), title_subscriptions.clone());
-        COMPOSITOR.event.on_open(move |window| {
-            wm.with(|wm| wm.on_open(window));
+    let subscribe_title = {
+        let (ipc, titles) = (ipc.clone(), title_subscriptions.clone());
+        move |window: Window| {
+            if titles.borrow().contains_key(&window) {
+                return;
+            }
             let scope = untrack(Scope::root);
             let ipc = ipc.clone();
             let first_run = Cell::new(true);
@@ -78,9 +79,15 @@ pub fn wire_window_events(wm: &WindowManager, ipc: &WorkspaceIpc) -> PointerTrac
                     untrack(|| ipc.schedule_workspace_broadcast());
                 }
             });
-            if let Some(previous) = titles.borrow_mut().insert(window, scope) {
-                previous.dispose();
-            }
+            titles.borrow_mut().insert(window, scope);
+        }
+    };
+
+    {
+        let (wm, subscribe_title) = (wm.clone(), subscribe_title.clone());
+        COMPOSITOR.event.on_open(move |window| {
+            wm.with(|wm| wm.on_open(window));
+            subscribe_title(window);
         });
     }
     {
@@ -93,6 +100,9 @@ pub fn wire_window_events(wm: &WindowManager, ipc: &WorkspaceIpc) -> PointerTrac
         let (wm, ipc) = (wm.clone(), ipc.clone());
         COMPOSITOR.event.on_first_commit(move |window| {
             wm.with(|wm| wm.on_first_commit(window));
+            // A window the compositor re-seeds (after reporting it closed
+            // when an output went away) comes back without an open.
+            subscribe_title(window);
             ipc.schedule_workspace_broadcast();
         });
     }
