@@ -62,6 +62,21 @@ pub fn apply_cursor_settings() {
     }
 }
 
+/// A session that ended because the config hung leaves only a marker line
+/// and a core dump, and the next one starts like any other: say so once the
+/// shell can show it.
+pub fn report_previous_hangs() {
+    for hang in shojiwm_rs::watchdog::previous_hangs() {
+        COMPOSITOR.process.spawn(Command::exec([
+            "sh",
+            "-c",
+            "sleep 15; exec notify-send -u critical -a ShojiWM \"$0\" \"$1\"",
+            "The config watchdog ended the last session",
+            hang.as_str(),
+        ]));
+    }
+}
+
 /// The rest of the desktop: shell, Minka apps and session daemons.
 ///
 /// Skipped when `MINKA_NESTED=1`: a nested instance for testing must not
