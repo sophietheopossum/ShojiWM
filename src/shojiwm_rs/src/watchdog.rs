@@ -34,7 +34,7 @@ use shojiwm_lib::{
     runtime_api::{
         ConfigRuntime, DecorationRequest as D, EffectRequest as E, InputRequest as I,
         ReloadPreparation, RuntimeError, RuntimeEvent as Ev, RuntimeReply, RuntimeRequest as R,
-        WindowRequest as W, WorkspaceRequest,
+        SchedulerTickRequest, WindowRequest as W, WorkspaceRequest,
     },
     ssd::WaylandWindowSnapshot,
 };
@@ -100,6 +100,8 @@ kinds! {
     KeyBinding = "invokeKeyBinding",
     PointerMove = "pointerMove",
     GestureSwipe = "gestureSwipe",
+    PointerRegion = "pointerRegion",
+    InputGrab = "inputGrab",
     BackgroundEffect = "getEffectConfig",
     LayerEffects = "evaluateLayerEffects",
     PopupEffects = "evaluatePopupEffects",
@@ -497,7 +499,7 @@ fn describe(request: R<'_>) -> (Kind, Option<&str>) {
         }
         R::Decoration(D::StartClose { window_id }) => (Kind::StartClose, Some(window_id)),
         R::Decoration(D::Closed { window_id }) => (Kind::WindowClosed, Some(window_id)),
-        R::SchedulerTick => (Kind::SchedulerTick, None),
+        R::SchedulerTick(..) => (Kind::SchedulerTick, None),
         R::Window(W::Resize { .. }) => (Kind::WindowResize, None),
         R::Window(W::Move { .. }) => (Kind::WindowMove, None),
         R::Window(W::Maximize { window, .. }) => (Kind::MaximizeRequest, Some(app(window))),
@@ -507,6 +509,8 @@ fn describe(request: R<'_>) -> (Kind, Option<&str>) {
         R::Input(I::KeyBinding { binding_id }) => (Kind::KeyBinding, Some(binding_id)),
         R::Input(I::PointerMove(_)) => (Kind::PointerMove, None),
         R::Input(I::GestureSwipe(_)) => (Kind::GestureSwipe, None),
+        R::Input(I::PointerRegion(_)) => (Kind::PointerRegion, None),
+        R::Input(I::InputGrab { .. }) => (Kind::InputGrab, None),
         R::Effect(E::Background) => (Kind::BackgroundEffect, None),
         R::Effect(E::Layers { .. }) => (Kind::LayerEffects, None),
         R::Effect(E::Popups { .. }) => (Kind::PopupEffects, None),
@@ -1310,7 +1314,13 @@ mod tests {
             })),
             ("evaluateCached", None)
         );
-        assert_eq!(named(R::SchedulerTick), ("schedulerTick", None));
+        assert_eq!(
+            named(R::SchedulerTick(SchedulerTickRequest {
+                output: None,
+                frame_outputs: &[]
+            })),
+            ("schedulerTick", None)
+        );
         assert_eq!(named(R::Effect(E::Background)), ("getEffectConfig", None));
         assert_eq!(
             named(R::Effect(E::Layers {
@@ -1399,7 +1409,7 @@ mod tests {
                     drop(note("ipc test.method"));
                     stuck(&self.release, false);
                 }
-                R::SchedulerTick => stuck(&self.release, false),
+                R::SchedulerTick(..) => stuck(&self.release, false),
                 _ => {}
             }
             Ok(RuntimeReply::Done)
@@ -1471,7 +1481,15 @@ mod tests {
         runtime
             .request(0.0, R::Input(I::KeyBinding { binding_id: "nap" }))
             .unwrap();
-        runtime.request(0.0, R::SchedulerTick).unwrap();
+        runtime
+            .request(
+                0.0,
+                R::SchedulerTick(SchedulerTickRequest {
+                    output: None,
+                    frame_outputs: &[],
+                }),
+            )
+            .unwrap();
         let report = reports.try_recv().expect("the stuck call was never reported");
         assert_eq!(report.kind, "schedulerTick");
         assert_eq!(report.label, None, "blamed the earlier key binding");
