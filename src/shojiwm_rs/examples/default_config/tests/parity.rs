@@ -86,7 +86,8 @@ fn session(tiled: bool) -> Session {
     ));
     std::fs::create_dir_all(&dir).expect("runtime dir should be created");
     let host = RuntimeHost::detached();
-    let launcher = ConfigBuilder::new(setup).asset_root(concat!(
+    // Log only: a slow parity test must never abort the whole test binary.
+    let launcher = ConfigBuilder::new(setup).hang_watchdog(HangWatchdog::log_only()).asset_root(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../packages/config"
     ));
