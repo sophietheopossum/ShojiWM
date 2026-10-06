@@ -224,9 +224,33 @@ impl EnvController {
 /// `COMPOSITOR.cursor`.
 pub struct CursorController;
 
+/// The largest cursor size the compositor loads.
+const MAX_CURSOR_SIZE: u32 = 512;
+
 impl CursorController {
+    /// The compositor's cursor, also exported as XCURSOR_THEME and
+    /// XCURSOR_SIZE to the processes it starts afterwards and to the D-Bus
+    /// and systemd activation environments, so clients that draw their own
+    /// cursor (XWayland apps among them) draw the same one.
+    ///
+    /// The theme is trimmed. An empty theme, one with a NUL (no environment
+    /// can hold it) or a size outside 1 to 512 is ignored with a warning, and
+    /// the cursor already set stays.
     pub fn configure(&self, theme: &str, size: u32) {
+        let theme = theme.trim();
+        if theme.is_empty() || theme.contains('\0') || !(1..=MAX_CURSOR_SIZE).contains(&size) {
+            tracing::warn!(theme, size, "ignoring invalid cursor");
+            return;
+        }
         with_registry(|registry| {
+            for (key, value) in [("XCURSOR_THEME", theme.to_owned()), ("XCURSOR_SIZE", size.to_string())] {
+                registry.env.insert(key.to_owned(), value.clone());
+                registry.pending.env_operations.push(RuntimeEnvOperation {
+                    key: key.to_owned(),
+                    value: Some(value),
+                });
+                registry.pending.env_publish.insert(key.to_owned());
+            }
             registry.pending.cursor = Some(RuntimeCursorConfigUpdate {
                 theme: theme.to_owned(),
                 size,

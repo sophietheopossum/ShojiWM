@@ -614,3 +614,78 @@ fn an_evaluation_asks_no_tick_for_its_own_window() {
     let tick = runtime.scheduler_tick(4.0).unwrap();
     assert!(tick.dirty_managed_window_ids.is_empty(), "{:?}", tick.dirty_managed_window_ids);
 }
+
+/// Clients that draw their own cursor read it from the environment.
+#[test]
+fn the_cursor_is_exported_to_started_processes_and_the_session() {
+    let host = RuntimeHost::detached();
+    let args = CommonArgs::parse(&[], &[]);
+    let mut runtime = RuntimeBoot::new(
+        Box::new(config(|| COMPOSITOR.cursor.configure("Bibata-Modern-Ice", 32))),
+        &args,
+    )
+    .launch(host.clone());
+    runtime.preload().unwrap();
+    runtime.enable().unwrap();
+    let messages: Vec<HostMessage> = std::iter::from_fn(|| host.pop()).collect();
+    let env = messages
+        .iter()
+        .find_map(|message| match message {
+            HostMessage::Env(updates) => Some(updates),
+            _ => None,
+        })
+        .expect("the cursor's environment is published");
+    let set: Vec<(&str, Option<&str>)> = env
+        .operations
+        .iter()
+        .map(|operation| (operation.key.as_str(), operation.value.as_deref()))
+        .collect();
+    assert_eq!(set, [("XCURSOR_THEME", Some("Bibata-Modern-Ice")), ("XCURSOR_SIZE", Some("32"))]);
+    assert_eq!(env.publish, ["XCURSOR_SIZE", "XCURSOR_THEME"]);
+    assert!(messages.iter().any(|message| matches!(message, HostMessage::Cursor(cursor) if cursor.size == 32)));
+}
+
+/// A theme no environment can hold (a NUL would panic in `set_var`) or a
+/// size the compositor will not load leaves the cursor as it was.
+#[test]
+fn an_invalid_cursor_is_ignored() {
+    let host = RuntimeHost::detached();
+    let args = CommonArgs::parse(&[], &[]);
+    let mut runtime = RuntimeBoot::new(
+        Box::new(config(|| {
+            COMPOSITOR.cursor.configure(" Bibata-Modern-Ice ", 24);
+            COMPOSITOR.cursor.configure("Bibata\0x", 24);
+            COMPOSITOR.cursor.configure("  ", 24);
+            COMPOSITOR.cursor.configure("Adwaita", 0);
+            COMPOSITOR.cursor.configure("Adwaita", 513);
+        })),
+        &args,
+    )
+    .launch(host.clone());
+    runtime.preload().unwrap();
+    runtime.enable().unwrap();
+    let messages: Vec<HostMessage> = std::iter::from_fn(|| host.pop()).collect();
+    let set: Vec<(String, Option<String>)> = messages
+        .iter()
+        .flat_map(|message| match message {
+            HostMessage::Env(updates) => updates.operations.clone(),
+            _ => Vec::new(),
+        })
+        .map(|operation| (operation.key, operation.value))
+        .collect();
+    assert_eq!(
+        set,
+        [
+            ("XCURSOR_THEME".to_owned(), Some("Bibata-Modern-Ice".to_owned())),
+            ("XCURSOR_SIZE".to_owned(), Some("24".to_owned())),
+        ]
+    );
+    let cursors: Vec<(&str, u32)> = messages
+        .iter()
+        .filter_map(|message| match message {
+            HostMessage::Cursor(cursor) => Some((cursor.theme.as_str(), cursor.size)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cursors, [("Bibata-Modern-Ice", 24)]);
+}
