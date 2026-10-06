@@ -1,3 +1,8 @@
+// V8 fast calls take only scalars, so a few ShojiRuntimeBridge ops take >7 args. deno_ops
+// copies their signatures into a `trait Callable` without the allow it puts on the impl, and
+// #[op2] rejects #[allow] on its methods and drops it from the impl block.
+#![allow(clippy::too_many_arguments)]
+
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
