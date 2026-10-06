@@ -7,6 +7,7 @@
     "jsxImportSource": "shoji_wm",
     "strict": true,
     "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
     "noEmit": true,
     "types": [],
     "baseUrl": ".",
@@ -18,5 +19,6 @@
         "packages/shoji_wm/src/*"
       ]
     }
-  }
+  },
+  "exclude": ["node_modules", "target", "docs", "tests/*.test.ts"]
 }
