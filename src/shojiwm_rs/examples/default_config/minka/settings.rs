@@ -26,11 +26,26 @@ const MINKA_CONFIG_REVISION: u32 = 5;
 
 thread_local! {
     static ACTIVE: RefCell<Option<Value>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static TEST_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
 fn settings_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_PATH.with(|path| path.borrow().clone()) {
+        return path;
+    }
     let home = std::env::var_os("HOME").unwrap_or_default();
     PathBuf::from(home).join(".config/minka-settings.json")
+}
+
+/// Tests read a file of their own, never Sophie's settings: a missing one
+/// gives the defaults. Call on the thread that starts the config, before it
+/// starts; the next read loads from `path`.
+#[cfg(test)]
+pub fn read_from_for_tests(path: PathBuf) {
+    TEST_PATH.with(|test| *test.borrow_mut() = Some(path));
+    ACTIVE.with(|active| *active.borrow_mut() = None);
 }
 
 /// 8/7/2026 defaults per Sophie: adaptive accel, natural scroll off.

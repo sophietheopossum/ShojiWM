@@ -40,6 +40,8 @@ struct Session {
     dir: PathBuf,
     /// Where the config's IPC server listens.
     socket: PathBuf,
+    /// The minka-settings.json the config reads.
+    settings: PathBuf,
 }
 
 impl Deref for Session {
@@ -75,16 +77,26 @@ pub(super) fn lock_environment() -> MutexGuard<'static, ()> {
     ENVIRONMENT.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A freshly enabled config. `tiled` tiles the empty workspace first, where
-/// the TypeScript tests restore a tiled workspace from persisted state: this
-/// runtime has none to restore.
+/// A freshly enabled config, on the default settings (desktops on). `tiled`
+/// tiles the empty workspace first, where the TypeScript tests restore a
+/// tiled workspace from persisted state: this runtime has none to restore.
 fn session(tiled: bool) -> Session {
+    session_with(tiled, None)
+}
+
+/// [`session`], reading `settings` as its minka-settings.json.
+fn session_with(tiled: bool, settings: Option<&Value>) -> Session {
     let dir = std::env::temp_dir().join(format!(
         "shojiwm-parity-{}-{}",
         std::process::id(),
         SESSIONS.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("runtime dir should be created");
+    let settings_path = dir.join("minka-settings.json");
+    if let Some(settings) = settings {
+        std::fs::write(&settings_path, settings.to_string()).expect("settings should be written");
+    }
+    crate::minka::settings::read_from_for_tests(settings_path.clone());
     let host = RuntimeHost::detached();
     // Log only: a slow parity test must never abort the whole test binary.
     let launcher = ConfigBuilder::new(setup)
@@ -112,6 +124,7 @@ fn session(tiled: bool) -> Session {
         runtime,
         host,
         socket: dir.join("shojiwm-parity.sock"),
+        settings: settings_path,
         dir,
     };
     if tiled {
@@ -1240,28 +1253,12 @@ fn real_config_sends_window_rects_only_to_lease_holders() {
     );
 }
 
-// Reads $HOME/.config/minka-settings.json through the config, so it needs a
-// scratch HOME. Build with `cargo test --no-run`, then run the test binary
-// directly:
-//   env -u WAYLAND_DISPLAY HOME=<scratch>/home \
-//     <test binary> real_config_virtual_desktops_off --ignored --test-threads=1
+/// The TypeScript test needs a scratch HOME; every session here reads a
+/// settings file of its own.
 #[test]
-#[ignore = "needs a scratch HOME; run alone with --ignored"]
 fn real_config_virtual_desktops_off_folds_and_releases_keys() {
-    let home = PathBuf::from(std::env::var("HOME").expect("HOME should be set"));
-    let settings_path = home.join(".config/minka-settings.json");
-    // Never overwrite a real settings file, only this test's own fixture.
-    if let Ok(existing) = std::fs::read_to_string(&settings_path)
-        && !existing.contains("__shojiTestFixture")
-    {
-        eprintln!("skipping: {settings_path:?} is not a test fixture");
-        return;
-    }
-    std::fs::create_dir_all(settings_path.parent().expect("settings dir"))
-        .expect("settings dir should be created");
     let fixture = |enabled: bool| {
         json!({
-            "__shojiTestFixture": true,
             "input": {
                 "pointerAccel": 0.4, "accelProfile": "adaptive", "naturalScroll": false,
                 "touchpad": {
@@ -1274,7 +1271,6 @@ fn real_config_virtual_desktops_off_folds_and_releases_keys() {
             "workspaces": { "enabled": enabled }
         })
     };
-    std::fs::write(&settings_path, fixture(true).to_string()).expect("fixture should be written");
     const DESKTOP_KEYS: [&str; 4] = [
         "window-move-workspace-prev",
         "window-move-workspace-next",
@@ -1327,7 +1323,7 @@ fn real_config_virtual_desktops_off_folds_and_releases_keys() {
     };
 
     // Desktops on: a window on desktop 1 and one on desktop 2.
-    let mut s = session(false);
+    let mut s = session_with(false, Some(&fixture(true)));
     assert!(has_desktop_keys(&bound(s.published_key_bindings())));
     open(&mut s, "0xa", 100);
     assert!(
@@ -1347,7 +1343,7 @@ fn real_config_virtual_desktops_off_folds_and_releases_keys() {
 
     // Off, live, as MinkaConf does it (save, then apply): one desktop
     // holding both windows, and the keys released.
-    std::fs::write(&settings_path, fixture(false).to_string()).expect("fixture should be written");
+    std::fs::write(&s.settings, fixture(false).to_string()).expect("fixture should be written");
     assert_eq!(
         ipc.request(&mut s, "settings.apply", fixture(false)),
         json!({ "ok": true })
@@ -1382,22 +1378,18 @@ fn real_config_virtual_desktops_off_folds_and_releases_keys() {
     // this runtime persists nothing.)
     drop(ipc);
     drop(s);
-    let mut s = session(false);
+    let mut s = session_with(false, Some(&fixture(false)));
     assert!(no_desktop_keys(&bound(s.published_key_bindings())));
 
     // On again, live: the keys come back.
     let mut ipc = Client::connect(&s.socket);
-    std::fs::write(&settings_path, fixture(true).to_string()).expect("fixture should be written");
+    std::fs::write(&s.settings, fixture(true).to_string()).expect("fixture should be written");
     assert_eq!(
         ipc.request(&mut s, "settings.apply", fixture(true)),
         json!({ "ok": true })
     );
     s.scheduler_tick(600.0).expect("tick should succeed");
     assert!(has_desktop_keys(&bound(s.published_key_bindings())));
-
-    drop(ipc);
-    drop(s);
-    let _ = std::fs::remove_file(&settings_path);
 }
 
 /// The table keybinds.ts registers, in order, with virtual desktops on.
@@ -1438,8 +1430,8 @@ const TYPESCRIPT_KEY_BINDINGS: [(&str, &str); 34] = [
     ("profile", "Super+Shift+T"),
 ];
 
-/// Reads the real minka-settings.json, like every session here: with
-/// desktops switched off there, the four desktop keys are absent.
+/// With desktops off, the four desktop keys are absent instead (see
+/// real_config_virtual_desktops_off_folds_and_releases_keys).
 #[test]
 fn key_bindings_match_the_typescript_config() {
     use shojiwm_rs::runtime_key_binding::RuntimeKeyBindingPhase;
@@ -1448,14 +1440,7 @@ fn key_bindings_match_the_typescript_config() {
     let bindings = s
         .published_key_bindings()
         .expect("the runtime should have published the binding set");
-    let desktop_keys = &TYPESCRIPT_KEY_BINDINGS[28..32];
-    let expected: Vec<(&str, &str)> = TYPESCRIPT_KEY_BINDINGS
-        .iter()
-        .copied()
-        .filter(|binding| {
-            crate::minka::settings::workspaces_enabled() || !desktop_keys.contains(binding)
-        })
-        .collect();
+    let expected = TYPESCRIPT_KEY_BINDINGS.to_vec();
     let table: Vec<(&str, &str)> = bindings
         .entries
         .iter()
@@ -1563,10 +1548,6 @@ fn a_desktop_swipe_survives_its_output_going_away() {
         ("TEST-1".to_owned(), test_output()),
         ("TEST-2".to_owned(), tv),
     ]));
-    // Desktop switching is only built while desktops are on.
-    if !crate::minka::settings::workspaces_enabled() {
-        return;
-    }
     let vertical = |phase, total_y: f64, timestamp: u64| GestureSwipeEventSnapshot {
         total_y,
         delta_y: total_y,

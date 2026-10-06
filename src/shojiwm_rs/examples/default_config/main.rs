@@ -158,6 +158,8 @@ mod tests {
             std::env::set_var("XDG_RUNTIME_DIR", &dir);
             std::env::set_var("WAYLAND_DISPLAY", "test-display");
         }
+        // Never written: the default settings, desktops on.
+        settings::read_from_for_tests(dir.join("minka-settings.json"));
         let args = CommonArgs::parse(&[], &[]);
         let launcher = ConfigBuilder::new(setup)
             .hang_watchdog(HangWatchdog::log_only())
