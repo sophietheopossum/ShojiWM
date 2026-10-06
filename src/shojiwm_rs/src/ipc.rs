@@ -199,6 +199,7 @@ impl IpcServer {
             let handlers = self.handlers.clone();
             COMPOSITOR.channel(move |request: Request| {
                 let handler = handlers.borrow().get(&request.method).cloned();
+                let _noted = crate::watchdog::note(&format!("ipc {}", request.method));
                 let response = match handler {
                     Some(handler) => match handler(&request.params, &IpcClient(request.client.clone())) {
                         Ok(Some(result)) => json!({ "result": result }),

@@ -74,16 +74,18 @@ pub mod reactive;
 mod runtime;
 pub mod style;
 pub mod view;
+pub mod watchdog;
 pub mod window;
 pub mod window_stack;
 
 pub use adapter::{ConfigBuilder, ReactiveRuntime, run_config};
 pub use compositor::COMPOSITOR;
+pub use watchdog::{HangReport, HangWatchdog, OnHang};
 
 /// Everything a reactive config usually needs.
 pub mod prelude {
     pub use crate::{
-        COMPOSITOR, ConfigBuilder, run_config,
+        COMPOSITOR, ConfigBuilder, HangWatchdog, OnHang, run_config,
         animation::{
             Animation, AnimationOptions, Easing, Repeat, TimerHandle, cubic_bezier, now_ms,
             set_interval, set_timeout,
@@ -133,6 +135,7 @@ pub use shojiwm_lib::{
 pub struct RustLauncher<F> {
     name: &'static str,
     factory: F,
+    hang_watchdog: Option<HangWatchdog>,
 }
 
 impl<F, R> RustLauncher<F>
@@ -146,12 +149,20 @@ where
         Self {
             name: "rust",
             factory,
+            hang_watchdog: Some(HangWatchdog::log_only()),
         }
     }
 
     /// Name shown in logs and `--help` (default `"rust"`).
     pub fn with_name(mut self, name: &'static str) -> Self {
         self.name = name;
+        self
+    }
+
+    /// Watch every call into the config, the factory included (see
+    /// [`HangWatchdog`]). Logs only by default; `None` turns it off.
+    pub fn with_hang_watchdog(mut self, watchdog: impl Into<Option<HangWatchdog>>) -> Self {
+        self.hang_watchdog = watchdog.into();
         self
     }
 }
@@ -166,7 +177,7 @@ where
     }
 
     fn launch(&self, context: LaunchContext) -> Box<dyn ConfigRuntime> {
-        Box::new((self.factory)(context))
+        watchdog::launch(self.hang_watchdog.clone(), || (self.factory)(context))
     }
 }
 
@@ -203,7 +214,8 @@ mod tests {
 
     #[test]
     fn rust_runtime_answers_in_place_and_falls_back_otherwise() {
-        let launcher = RustLauncher::new(|context| BindOnEnable { host: context.host });
+        let launcher = RustLauncher::new(|context| BindOnEnable { host: context.host })
+            .with_hang_watchdog(HangWatchdog::log_only());
         let args = cli::CommonArgs::parse(&[], launcher.extra_args());
         let host = RuntimeHost::detached();
         let mut runtime = RuntimeBoot::new(Box::new(launcher), &args).launch(host.clone());

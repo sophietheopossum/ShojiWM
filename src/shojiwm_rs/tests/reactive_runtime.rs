@@ -11,6 +11,11 @@ use shojiwm_rs::{
     },
 };
 
+/// The hang watchdog only logs here: a test must never abort the test binary.
+fn config(setup: impl Fn() + 'static) -> ConfigBuilder {
+    ConfigBuilder::new(setup).hang_watchdog(HangWatchdog::log_only())
+}
+
 static WIDTH: WindowStateKey<f64> = WindowStateKey::new("width", |_| 400.0);
 
 fn snapshot(id: &str, title: &str, focused: bool) -> WaylandWindowSnapshot {
@@ -104,7 +109,7 @@ fn start() -> (RuntimeHandle, RuntimeHost) {
     let host = RuntimeHost::detached();
     let args = CommonArgs::parse(&[], &[]);
     let mut runtime =
-        RuntimeBoot::new(Box::new(ConfigBuilder::new(setup)), &args).launch(host.clone());
+        RuntimeBoot::new(Box::new(config(setup)), &args).launch(host.clone());
     runtime.preload().unwrap();
     runtime.enable().unwrap();
     (runtime, host)
@@ -230,7 +235,7 @@ fn timers_and_animations_drive_the_scheduler() {
     let host = RuntimeHost::detached();
     let args = CommonArgs::parse(&[], &[]);
     let mut runtime = RuntimeBoot::new(
-        Box::new(ConfigBuilder::new(|| {
+        Box::new(config(|| {
             let progress = Scope::root().run(|| Animation::new(0.0));
             COMPOSITOR.key.bind("animate", "Super+A", move || {
                 progress.start(AnimationOptions::to(1.0, 100.0));
@@ -262,7 +267,7 @@ fn hovering_a_button_opens_its_popup() {
     let host = RuntimeHost::detached();
     let args = CommonArgs::parse(&[], &[]);
     let mut runtime = RuntimeBoot::new(
-        Box::new(ConfigBuilder::new(|| {
+        Box::new(config(|| {
             COMPOSITOR.window.composition(|_| {
                 let hover = signal(false);
                 ManagedWindow::new().child(
@@ -320,7 +325,7 @@ fn popup_triggers_follow_compositor_events() {
     let host = RuntimeHost::detached();
     let args = CommonArgs::parse(&[], &[]);
     let mut runtime = RuntimeBoot::new(
-        Box::new(ConfigBuilder::new(|| {
+        Box::new(config(|| {
             COMPOSITOR.window.composition(|_| {
                 ManagedWindow::new().child(
                     Flex::column()
