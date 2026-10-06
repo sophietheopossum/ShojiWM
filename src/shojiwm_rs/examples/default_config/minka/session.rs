@@ -52,10 +52,27 @@ pub fn apply_cursor_settings() {
         let cursor = &settings["cursor"];
         let theme = cursor["theme"]
             .as_str()
-            .filter(|theme| !theme.is_empty())?
-            .to_owned();
-        let size = cursor["size"].as_f64().map_or(24, |size| size as u32);
-        Some((theme, size))
+            .map(str::trim)
+            .filter(|theme| !theme.is_empty())?;
+        // A hand edit can leave any JSON here. The TypeScript SDK threw on a
+        // size that is not a whole number from 1 to 512 and on a NUL in the
+        // theme; the Rust one ignores those with a warning. Either way the
+        // cursor already set stays, and this checks the size before it
+        // becomes a u32.
+        let size = match &cursor["size"] {
+            serde_json::Value::Null => Some(24),
+            size => size
+                .as_f64()
+                .filter(|size| size.fract() == 0.0 && (1.0..=512.0).contains(size))
+                .map(|size| size as u32),
+        };
+        match size {
+            Some(size) => Some((theme.to_owned(), size)),
+            None => {
+                tracing::warn!("minka-settings: ignoring cursor size {}", cursor["size"]);
+                None
+            }
+        }
     });
     if let Some((theme, size)) = cursor {
         COMPOSITOR.cursor.configure(&theme, size);
