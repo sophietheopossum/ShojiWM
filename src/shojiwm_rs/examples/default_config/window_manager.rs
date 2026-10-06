@@ -292,8 +292,10 @@ pub struct WindowView {
 
 impl WindowView {
     pub fn to_json(&self) -> serde_json::Value {
-        let mut view = serde_json::json!({
+        serde_json::json!({
             "id": self.id,
+            // null while unknown, as the TypeScript view sends it.
+            "appId": self.app_id,
             "title": self.title,
             "focused": self.focused,
             "maximized": self.maximized,
@@ -307,12 +309,7 @@ impl WindowView {
                 "width": self.rect.width,
                 "height": self.rect.height,
             },
-        });
-        // Left out rather than null while unknown, as in the TypeScript view.
-        if let Some(app_id) = &self.app_id {
-            view["appId"] = app_id.as_str().into();
-        }
-        view
+        })
     }
 }
 
@@ -829,6 +826,16 @@ impl HybridWindowManager {
 
         if !live.contains(&self.current_monitor) {
             self.current_monitor = fallback;
+        }
+        // A swipe across a workspace that was just dropped ends here; its
+        // mode stays, so the rest of its updates are ignored.
+        let dropped = |id: u64| !self.workspaces.iter().any(|workspace| workspace.id == id);
+        if self
+            .workspace_gesture
+            .as_ref()
+            .is_some_and(|gesture| dropped(gesture.from) || gesture.to.is_some_and(dropped))
+        {
+            self.workspace_gesture = None;
         }
         self.sync_workspaces();
         self.refresh_usable_area_layouts();
@@ -1891,6 +1898,12 @@ impl HybridWindowManager {
                     }
                 }
                 self.workspaces.retain(|workspace| workspace.id != source);
+                // A drag on the folded desktop carries on on its new one.
+                for drag in [&mut self.tile_drag, &mut self.floating_drag].into_iter().flatten() {
+                    if drag.workspace == source {
+                        drag.workspace = target;
+                    }
+                }
             }
             for window in self.workspace_by_id(target).expect("live").list_windows() {
                 cancel_workspace_visual_animation(window);
@@ -2299,7 +2312,7 @@ impl HybridWindowManager {
         }
     }
 
-    fn sync_workspaces(&mut self) {
+    pub fn sync_workspaces(&mut self) {
         let outputs = output_list();
         for monitor in &outputs {
             let index = self.active_index(monitor);
@@ -2563,28 +2576,30 @@ impl HybridWindowManager {
                 (gesture.current_index as i64 + gesture.direction as i64) as u32,
             );
             self.current_monitor = gesture.monitor.clone();
-            self.ws(gesture.from).animate_workspace_transition(WorkspaceTransition {
+            self.animate_live_workspace(gesture.from, WorkspaceTransition {
                 from_offset_y: gesture.from_offset_y,
                 to_offset_y: -direction * gesture.distance,
                 from_opacity: gesture.from_opacity,
                 to_opacity: 0.0,
                 visible_after: false,
             });
-            self.ws(to).animate_workspace_transition(WorkspaceTransition {
+            self.animate_live_workspace(to, WorkspaceTransition {
                 from_offset_y: gesture.to_offset_y,
                 to_offset_y: 0.0,
                 from_opacity: gesture.to_opacity,
                 to_opacity: 1.0,
                 visible_after: true,
             });
-            self.ws(to).focus_active_window();
+            if let Some(ws) = self.workspace_by_id(to) {
+                ws.focus_active_window();
+            }
             self.apply_workspace_stack_policy(Some(gesture.from));
             self.apply_workspace_stack_policy(Some(to));
             self.outbox.workspaces_changed = true;
             return;
         }
 
-        self.ws(gesture.from).animate_workspace_transition(WorkspaceTransition {
+        self.animate_live_workspace(gesture.from, WorkspaceTransition {
             from_offset_y: gesture.from_offset_y,
             to_offset_y: 0.0,
             from_opacity: gesture.from_opacity,
@@ -2592,7 +2607,7 @@ impl HybridWindowManager {
             visible_after: true,
         });
         if let Some(to) = gesture.to {
-            self.ws(to).animate_workspace_transition(WorkspaceTransition {
+            self.animate_live_workspace(to, WorkspaceTransition {
                 from_offset_y: gesture.to_offset_y,
                 to_offset_y: direction * gesture.distance,
                 from_opacity: gesture.to_opacity,
@@ -2601,6 +2616,14 @@ impl HybridWindowManager {
             });
         }
         self.apply_workspace_stack_policy(Some(gesture.from));
+    }
+
+    /// A swipe holds workspace ids, and an output going away can drop one
+    /// before the fingers lift; that one simply has nothing to animate.
+    fn animate_live_workspace(&mut self, id: u64, transition: WorkspaceTransition) {
+        if let Some(ws) = self.workspace_by_id_mut(id) {
+            ws.animate_workspace_transition(transition);
+        }
     }
 
     fn focus_window_at_pointer_target(&mut self, target: &PointerHitTargetSnapshot, monitor_hint: Option<&str>) {

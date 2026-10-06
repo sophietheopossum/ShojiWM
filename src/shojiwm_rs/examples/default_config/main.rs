@@ -300,5 +300,46 @@ mod tests {
         runtime.invoke_handler("w1", &strips[2].false_handler, 1020).unwrap();
         let left = runtime.evaluate_window(&snapshot, 1030).unwrap();
         assert_eq!(tabs(&left.node), [false; 4], "leaving the strip hides the tab");
+
+        // A recompose (here the app id changing) keeps the hover: the
+        // compositor sends no new hover-enter for a strip never left.
+        runtime.invoke_handler("w1", &strips[0].true_handler, 1040).unwrap();
+        let renamed = WaylandWindowSnapshot {
+            app_id: Some("org.example.Renamed".into()),
+            ..snapshot.clone()
+        };
+        let recomposed = runtime.evaluate_window(&renamed, 1050).unwrap();
+        assert_eq!(tabs(&recomposed.node), [true, false, false, false], "the top tab stays");
+
+        // A branch without the halo drops it, so it does not come back with it.
+        let maximized = WaylandWindowSnapshot {
+            is_maximized: true,
+            ..renamed.clone()
+        };
+        runtime
+            .window_maximize_request(
+                &maximized,
+                &shojiwm_rs::ssd::WindowMaximizeRequestEventSnapshot {
+                    maximized: true,
+                    source: shojiwm_rs::ssd::WindowStateRequestSourceSnapshot::ClientCsd,
+                    timestamp: 1060,
+                },
+                1060,
+            )
+            .unwrap();
+        runtime.evaluate_window(&maximized, 1070).unwrap();
+        runtime
+            .window_maximize_request(
+                &renamed,
+                &shojiwm_rs::ssd::WindowMaximizeRequestEventSnapshot {
+                    maximized: false,
+                    source: shojiwm_rs::ssd::WindowStateRequestSourceSnapshot::ClientCsd,
+                    timestamp: 1080,
+                },
+                1080,
+            )
+            .unwrap();
+        let restored = runtime.evaluate_window(&renamed, 1090).unwrap();
+        assert_eq!(tabs(&restored.node), [false; 4], "no stale tab after maximize");
     }
 }

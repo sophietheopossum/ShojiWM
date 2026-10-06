@@ -87,10 +87,12 @@ fn session(tiled: bool) -> Session {
     std::fs::create_dir_all(&dir).expect("runtime dir should be created");
     let host = RuntimeHost::detached();
     // Log only: a slow parity test must never abort the whole test binary.
-    let launcher = ConfigBuilder::new(setup).hang_watchdog(HangWatchdog::log_only()).asset_root(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../packages/config"
-    ));
+    let launcher = ConfigBuilder::new(setup)
+        .hang_watchdog(HangWatchdog::log_only())
+        .asset_root(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packages/config"
+        ));
     let runtime = {
         let _environment = lock_environment();
         // SAFETY: every session sets these under the lock, and the socket is
@@ -1530,4 +1532,52 @@ fn dock_proximity_has_hysteresis() {
         inside_after(&mut s, 1065.0).is_empty(),
         "the reveal needs the bottom 10px again"
     );
+}
+
+/// A window that never set an app id is listed with `"appId": null`, as
+/// the TypeScript view sends it.
+#[test]
+fn a_window_without_an_app_id_has_a_null_app_id() {
+    let mut s = session(false);
+    let mut window = named_window("0xa", "unused", true, false);
+    window.app_id = None;
+    s.evaluate_window(&window, 1)
+        .expect("window should evaluate");
+    let mut client = Client::connect(&s.socket);
+    let view = client.request(&mut s, "workspaces.get", json!({}));
+    let listed = &view["monitors"][0]["workspaces"][0]["windows"][0];
+    assert_eq!(listed["id"], "0xa", "{view}");
+    assert_eq!(listed.get("appId"), Some(&Value::Null), "{listed}");
+}
+
+/// A three-finger vertical swipe still in progress when its output goes
+/// away ends quietly; it used to reach a dropped workspace and panic.
+#[test]
+fn a_desktop_swipe_survives_its_output_going_away() {
+    use GestureSwipePhaseSnapshot::{Begin, End, Update};
+
+    let mut s = session(false);
+    let mut tv = output("TEST-2", 1920);
+    tv.connector = None;
+    s.sync_display_state(BTreeMap::from([
+        ("TEST-1".to_owned(), test_output()),
+        ("TEST-2".to_owned(), tv),
+    ]));
+    // Desktop switching is only built while desktops are on.
+    if !crate::minka::settings::workspaces_enabled() {
+        return;
+    }
+    let vertical = |phase, total_y: f64, timestamp: u64| GestureSwipeEventSnapshot {
+        total_y,
+        delta_y: total_y,
+        output_name: Some("TEST-2".into()),
+        ..swipe(phase, 0.0, 0.0, timestamp)
+    };
+    s.gesture_swipe(&vertical(Begin, 0.0, 10), 10)
+        .expect("begin");
+    s.gesture_swipe(&vertical(Update, -300.0, 20), 20)
+        .expect("update");
+    s.sync_display_state(BTreeMap::from([("TEST-1".to_owned(), test_output())]));
+    s.gesture_swipe(&vertical(End, -300.0, 30), 30)
+        .expect("ending the swipe after its output went away");
 }

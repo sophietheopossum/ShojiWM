@@ -36,6 +36,13 @@ enum Edge {
     Right,
 }
 
+/// The halo edge the pointer is on. Window state, so it outlives a
+/// recompose (an app id or decoration change) like the TypeScript
+/// composition's `useState`: the compositor sends no fresh hover-enter for a
+/// strip the pointer never left.
+static DRAG_HOVER_EDGE: WindowStateKey<Option<Edge>> =
+    WindowStateKey::new("dragHoverEdge", |_| None);
+
 /// The managed rect around a client: the client plus the drag halo and
 /// border on every side. The window manager is constructed with this.
 pub fn natural_root_rect(window: Window) -> Rect {
@@ -100,7 +107,12 @@ pub fn create_window_composition(
         let force_rect_size =
             memo(move || window.is_resizable().get() && !window.is_transient().get());
 
-        let stack_z_index = wm.window_z_index(window);
+        // Read fallibly: a window's stack slot is dropped as it closes, and a
+        // last recompute can still come in the same turn.
+        let stack_z_index = {
+            let slot = wm.window_z_index(window);
+            memo(move || slot.try_with(|z_index| *z_index).unwrap_or(0))
+        };
         let workspace_tiled = window.state(&WINDOW_STATE_WORKSPACE_TILED);
         let window_tiled = window.state(&WINDOW_STATE_TILED);
         let reordering = window.state(&WINDOW_STATE_TILE_REORDERING);
@@ -174,12 +186,15 @@ pub fn create_window_composition(
 
         // The branches without the halo never get its hover-leave, so they
         // drop a stale hover themselves. Otherwise pointer motion would stay
-        // signalled (every motion re-evaluating every window again), MinkaMon
-        // would keep a ghost drag tab, and the old tab would come back with
-        // the halo.
+        // signalled, MinkaMon would keep a ghost drag tab, and the old tab
+        // would come back with the halo.
+        let hovered = window.state(&DRAG_HOVER_EDGE);
         let leave_halo = || {
             pointer.set_edge_hovered(&id, false);
             ipc.publish_drag_tab(&id, || None);
+            if hovered.get_untracked().is_some() {
+                hovered.set(None);
+            }
         };
 
         // Fullscreen: no chrome at all; the client fills its managed rect
@@ -263,7 +278,6 @@ pub fn create_window_composition(
         // plain chrome, so grabbing it drags too. Chrome can't render above
         // the client surface, which is why the tab lives outside the window
         // instead of overlapping it.
-        let hovered: Signal<Option<Edge>> = signal(None);
         let edge_hover = |edge: Edge| {
             let (pointer, id) = (pointer.clone(), id.clone());
             move |inside: bool| {

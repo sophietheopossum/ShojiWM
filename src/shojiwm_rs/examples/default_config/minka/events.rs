@@ -15,9 +15,11 @@ use shojiwm_rs::{
 use super::{dock::create_dock_proximity, workspace_ipc::WorkspaceIpc};
 use crate::window_manager::WindowManager;
 
-/// The global pointer position for the decoration's drag tabs. Writing a
-/// signal that no composition reads would re-evaluate every window, so
-/// pointer motion is only signalled while some window has a hovered edge.
+/// The global pointer position for the decoration's drag tabs. `moves` is
+/// bumped only while some window has a hovered edge, as the TypeScript
+/// config does (its runtime re-evaluates every window when a signal nothing
+/// reads is written). Here a write only reaches the signal's own readers,
+/// so the gate just skips an empty flush.
 #[derive(Clone)]
 pub struct PointerTracking {
     /// Always current, so a tab whose hover just started reads where the

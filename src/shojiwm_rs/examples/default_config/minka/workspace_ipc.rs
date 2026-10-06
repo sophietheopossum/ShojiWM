@@ -122,6 +122,12 @@ impl WorkspaceIpc {
     /// The workspaces view as clients see it: the window manager's, plus
     /// the live drag tabs.
     pub fn view(&self) -> Value {
+        // As the TypeScript view does: a current monitor that is no longer
+        // an output (an activation naming one just unplugged) is put back
+        // on a live one before anyone reads it.
+        if !self.wm.is_busy() {
+            self.wm.with(|wm| wm.sync_workspaces());
+        }
         let mut view = self.wm.read(|wm| wm.view_for_ipc()).to_json();
         let mut live = HashSet::new();
         let drag_tabs = self.state.drag_tabs.borrow().clone();
