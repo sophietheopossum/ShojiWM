@@ -234,15 +234,15 @@ impl TextRasterizer {
             .map(|rect| rect.height)
             .unwrap_or(spec.rect.height as f32)
             .max(0.0);
-        let full_width = (logical_width * raster_scale as f32).round().max(1.0) as i32;
-        let full_height = (logical_height * raster_scale as f32).round().max(1.0) as i32;
+        let full_width = (logical_width * raster_scale).round().max(1.0) as i32;
+        let full_height = (logical_height * raster_scale).round().max(1.0) as i32;
         // A blurred label is rasterized with room around it for the blur.
         let pad = (crate::backend::blur::padding(spec.blur) as f32 * raster_scale).round() as i32;
         let target_width = (full_width - 2 * pad).max(1);
         let target_height = (full_height - 2 * pad).max(1);
-        let font_size = spec.font_size.max(1.0) * raster_scale as f32;
+        let font_size = spec.font_size.max(1.0) * raster_scale;
         let line_height =
-            spec.line_height.unwrap_or(spec.font_size.max(1.0) + 4.0) * raster_scale as f32;
+            spec.line_height.unwrap_or(spec.font_size.max(1.0) + 4.0) * raster_scale;
         let metrics = Metrics::new(font_size, line_height.max(1.0));
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
