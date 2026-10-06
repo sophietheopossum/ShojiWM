@@ -45,6 +45,8 @@ const WINDOW_SWITCHER_STYLE: WindowSwitcherStyle = WindowSwitcherStyle::Flip3D;
 fn main() -> std::process::ExitCode {
     ConfigBuilder::new(setup)
         .name("minka")
+        // Ends a frozen session; the SDK's default only logs.
+        .hang_watchdog(HangWatchdog::default())
         .asset_root(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/config"))
         .run()
 }
@@ -81,6 +83,7 @@ fn setup() {
 
     let ipc = workspace_ipc::create_workspace_ipc(&wm);
     session::start_session_apps();
+    session::report_previous_hangs();
     let desktop_keys = keybinds::bind_keys(&wm, &ipc, &switcher);
 
     // settings.apply from MinkaConf: re-run everything the settings feed.
@@ -201,6 +204,7 @@ mod tests {
         }
         let args = CommonArgs::parse(&[], &[]);
         let launcher = ConfigBuilder::new(setup)
+            .hang_watchdog(HangWatchdog::log_only())
             .asset_root(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/config"));
         let mut runtime = RuntimeBoot::new(Box::new(launcher), &args).launch(RuntimeHost::detached());
         runtime.preload().unwrap();
