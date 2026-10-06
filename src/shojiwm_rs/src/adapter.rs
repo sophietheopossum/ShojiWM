@@ -703,28 +703,42 @@ fn effects_observer(key: &str) -> Observer {
     })
 }
 
-fn sync_layers(output_name: &str, layers: &[WaylandLayerSnapshot]) {
+/// Whether a change to a layer moves the usable area. Only those are
+/// `update_layer` events, as in the TypeScript runtime: listeners re-lay
+/// windows out on them, and doing that for every resize or keyboard
+/// interactivity flip cuts window animations short. `layer.state()` still
+/// sees every change.
+fn layer_usable_area_changed(old: &WaylandLayerSnapshot, new: &WaylandLayerSnapshot) -> bool {
+    old.output_name != new.output_name
+        || old.exclusive_edge != new.exclusive_edge
+        || old.exclusive_zone != new.exclusive_zone
+        || old.anchor != new.anchor
+}
+
+/// The compositor sends every output's layers with each request, so the
+/// table is rebuilt from them: a layer gone from any output is dropped (and
+/// reported) now, not when its own output is next evaluated.
+fn sync_layers(layers: &[WaylandLayerSnapshot]) {
     let global = runtime::global();
     let previous = global.layers.get_untracked();
-    let mut next = previous.clone();
-    next.retain(|_, layer| layer.output_name != output_name);
-    for layer in layers {
-        next.insert(layer.id.clone(), layer.clone());
-    }
+    let next: BTreeMap<String, WaylandLayerSnapshot> = layers
+        .iter()
+        .map(|layer| (layer.id.clone(), layer.clone()))
+        .collect();
     if next == previous {
         return;
     }
     batch(|| {
         global.layers.set(next.clone());
         for (id, layer) in &previous {
-            if layer.output_name == output_name && !next.contains_key(id) {
+            if !next.contains_key(id) {
                 emit(|listeners| listeners.destroy_layer.clone(), |listener| listener(layer));
             }
         }
         for layer in layers {
             match previous.get(&layer.id) {
                 None => emit(|listeners| listeners.create_layer.clone(), |listener| listener(layer)),
-                Some(old) if old != layer => {
+                Some(old) if layer_usable_area_changed(old, layer) => {
                     emit(|listeners| listeners.update_layer.clone(), |listener| listener(layer))
                 }
                 Some(_) => false,
@@ -734,7 +748,7 @@ fn sync_layers(output_name: &str, layers: &[WaylandLayerSnapshot]) {
 }
 
 fn layer_effects(output_name: &str, layers: &[WaylandLayerSnapshot]) -> LayerEffectEvaluationResult {
-    sync_layers(output_name, layers);
+    sync_layers(layers);
     let Some(effect) = with_registry(|registry| registry.layer_effect.clone()) else {
         return LayerEffectEvaluationResult::default();
     };
@@ -742,6 +756,11 @@ fn layer_effects(output_name: &str, layers: &[WaylandLayerSnapshot]) -> LayerEff
     let effects = observer.track(|| {
         layers
             .iter()
+            // Only this output's layers, as in the TypeScript runtime. The
+            // compositor clears just this output's entries but inserts every
+            // assignment it gets, so another output's would be replaced out
+            // of turn, past that output's own evaluation.
+            .filter(|layer| layer.output_name == output_name)
             .map(|layer| RuntimeLayerEffectAssignment {
                 layer_id: layer.id.clone(),
                 effects: match validate_layer_effect_config(effect(layer).compile()) {

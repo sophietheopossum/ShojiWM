@@ -385,3 +385,104 @@ fn popup_triggers_follow_compositor_events() {
         .unwrap();
     assert_eq!(open_after(&mut runtime, 1700), Some(false));
 }
+
+fn layer(id: &str, output: &str, exclusive: u32) -> shojiwm_rs::ssd::WaylandLayerSnapshot {
+    use shojiwm_rs::ssd::{
+        LayerKindSnapshot, LayerPositionSnapshot,
+        window_model::{
+            KeyboardInteractivitySnapshot, LayerAnchorSnapshot, LayerExclusiveZoneSnapshot,
+            LayerMarginSnapshot,
+        },
+    };
+    shojiwm_rs::ssd::WaylandLayerSnapshot {
+        id: id.into(),
+        namespace: Some("bar".into()),
+        layer: LayerKindSnapshot::Top,
+        output_name: output.into(),
+        position: LayerPositionSnapshot {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: exclusive as i32,
+        },
+        anchor: LayerAnchorSnapshot {
+            top: true,
+            bottom: false,
+            left: true,
+            right: true,
+        },
+        exclusive_zone: LayerExclusiveZoneSnapshot::Exclusive { size: exclusive },
+        exclusive_edge: None,
+        margin: LayerMarginSnapshot {
+            top: 0,
+            right: 0,
+            bottom: 0,
+            left: 0,
+        },
+        keyboard_interactivity: KeyboardInteractivitySnapshot::None,
+        desired_size: Default::default(),
+    }
+}
+
+/// Layer events report what moves the usable area, from every output's
+/// layers at once; `layer.state()` still sees every change.
+#[test]
+fn layer_events_follow_the_usable_area_across_outputs() {
+    use std::{cell::RefCell, rc::Rc};
+
+    use shojiwm_rs::ssd::window_model::KeyboardInteractivitySnapshot;
+
+    let events: Rc<RefCell<Vec<String>>> = Rc::default();
+    let recorded = events.clone();
+    let host = RuntimeHost::detached();
+    let args = CommonArgs::parse(&[], &[]);
+    let mut runtime = RuntimeBoot::new(
+        Box::new(config(move || {
+            let log = |what: &'static str| {
+                let recorded = recorded.clone();
+                move |layer: &shojiwm_rs::ssd::WaylandLayerSnapshot| {
+                    recorded.borrow_mut().push(format!("{what} {}", layer.id))
+                }
+            };
+            COMPOSITOR.event.on_create_layer(log("create"));
+            COMPOSITOR.event.on_update_layer(log("update"));
+            COMPOSITOR.event.on_destroy_layer(log("destroy"));
+        })),
+        &args,
+    )
+    .launch(host);
+    runtime.preload().unwrap();
+    runtime.enable().unwrap();
+    let take = || std::mem::take(&mut *events.borrow_mut());
+
+    let bar = layer("bar", "DP-1", 30);
+    let tv_bar = layer("tv-bar", "HDMI-A-1", 40);
+    runtime
+        .evaluate_layer_effects("DP-1", &[bar.clone(), tv_bar.clone()], 0)
+        .unwrap();
+    assert_eq!(take(), ["create bar", "create tv-bar"]);
+
+    // A popover opening resizes the bar and takes the keyboard: the usable
+    // area is the same, so no update, but the state follows.
+    let mut resized = bar.clone();
+    resized.position.width = 1200;
+    resized.keyboard_interactivity = KeyboardInteractivitySnapshot::OnDemand;
+    runtime
+        .evaluate_layer_effects("DP-1", &[resized.clone(), tv_bar.clone()], 0)
+        .unwrap();
+    assert_eq!(take(), Vec::<String>::new());
+    assert_eq!(COMPOSITOR.layer.list().iter().find(|layer| layer.id == "bar").unwrap().position.width, 1200);
+
+    // A taller exclusive zone moves the usable area.
+    runtime
+        .evaluate_layer_effects("DP-1", &[layer("bar", "DP-1", 48), tv_bar.clone()], 0)
+        .unwrap();
+    assert_eq!(take(), ["update bar"]);
+
+    // The TV goes away: its bar is gone from a DP-1 request too.
+    runtime
+        .evaluate_layer_effects("DP-1", &[layer("bar", "DP-1", 48)], 0)
+        .unwrap();
+    assert_eq!(take(), ["destroy tv-bar"]);
+    assert_eq!(COMPOSITOR.layer.list().len(), 1);
+}
