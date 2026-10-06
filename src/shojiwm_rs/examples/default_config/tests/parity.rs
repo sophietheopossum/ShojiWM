@@ -1748,3 +1748,32 @@ fn identify_names_listed_windows_and_survives_a_reseed() {
         [("0xa".to_owned(), json!("minkamon.cpu")), ("0xb".to_owned(), json!("minkamon.gpu"))]
     );
 }
+
+/// The dock follows a window's title after the compositor re-seeds it
+/// (reported closed when its output went away, then brought back without
+/// an open).
+#[test]
+fn a_reseeded_window_still_reports_title_changes() {
+    let mut s = session(false);
+    let mut window = named_window("0xa", "kitty", true, false);
+    s.evaluate_window_preview(&window, 10)
+        .expect("preview should evaluate");
+    s.evaluate_window(&window, 20)
+        .expect("window should evaluate");
+    s.window_closed("0xa").expect("close should evaluate");
+    s.evaluate_cached_window("0xa", Some(&window), 30, true)
+        .expect("re-seed should evaluate");
+    let mut client = Client::connect(&s.socket);
+    client.request(&mut s, "workspaces.get", json!({}));
+    client.drain(&mut s);
+
+    window.title = "renamed".into();
+    s.evaluate_cached_window("0xa", Some(&window), 40, true)
+        .expect("title change should evaluate");
+    let lines = client.drain(&mut s);
+    assert!(
+        lines.iter().any(|line| line["event"] == "workspaces.changed"
+            && line.to_string().contains("\"renamed\"")),
+        "{lines:?}"
+    );
+}
