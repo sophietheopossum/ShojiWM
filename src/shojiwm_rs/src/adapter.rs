@@ -760,23 +760,31 @@ fn effects_observer(key: &str) -> Observer {
     })
 }
 
-fn sync_layers(output_name: &str, layers: &[WaylandLayerSnapshot]) {
+/// Whether a change to a layer moves the usable area. Only those are
+/// `update_layer` events, as in the TypeScript runtime: listeners re-lay
+/// windows out on them, and doing that for every resize or keyboard
+/// interactivity flip cuts window animations short. `layer.state()` still
+/// sees every change.
+fn layer_usable_area_changed(old: &WaylandLayerSnapshot, new: &WaylandLayerSnapshot) -> bool {
+    old.output_name != new.output_name
+        || old.exclusive_edge != new.exclusive_edge
+        || old.exclusive_zone != new.exclusive_zone
+        || old.anchor != new.anchor
+}
+
+/// The compositor sends every output's layers with each request, so the
+/// table is rebuilt from them: a layer gone from any output is dropped (and
+/// reported) now, not when its own output is next evaluated.
+fn sync_layers(layers: &[WaylandLayerSnapshot]) {
     let global = runtime::global();
     let previous = global.layers.get_untracked();
-    let mut next = previous.clone();
-    next.retain(|_, layer| layer.output_name != output_name);
-    for layer in layers {
-        next.insert(layer.id.clone(), layer.clone());
-    }
-    let mut order = global.layer_order.get_untracked();
-    // The core hands one output's evaluation the layers of every output.
-    order.retain(|id| {
-        !layers.iter().any(|layer| layer.id == *id)
-            && previous
-                .get(id)
-                .is_some_and(|layer| layer.output_name != output_name)
-    });
-    order.extend(layers.iter().map(|layer| layer.id.clone()));
+    let next: BTreeMap<String, WaylandLayerSnapshot> = layers
+        .iter()
+        .map(|layer| (layer.id.clone(), layer.clone()))
+        .collect();
+    // In the order the core stacks them, which `LayerController::stacked`
+    // follows; set even when no layer's snapshot changed (a restack).
+    let order: Vec<String> = layers.iter().map(|layer| layer.id.clone()).collect();
     if order != global.layer_order.get_untracked() {
         global.layer_order.set(order);
     }
@@ -786,7 +794,7 @@ fn sync_layers(output_name: &str, layers: &[WaylandLayerSnapshot]) {
     batch(|| {
         global.layers.set(next.clone());
         for (id, layer) in &previous {
-            if layer.output_name == output_name && !next.contains_key(id) {
+            if !next.contains_key(id) {
                 emit(
                     |listeners| listeners.destroy_layer.clone(),
                     |listener| listener(layer),
@@ -799,7 +807,7 @@ fn sync_layers(output_name: &str, layers: &[WaylandLayerSnapshot]) {
                     |listeners| listeners.create_layer.clone(),
                     |listener| listener(layer),
                 ),
-                Some(old) if old != layer => emit(
+                Some(old) if layer_usable_area_changed(old, layer) => emit(
                     |listeners| listeners.update_layer.clone(),
                     |listener| listener(layer),
                 ),
@@ -813,7 +821,7 @@ fn layer_effects(
     output_name: &str,
     layers: &[WaylandLayerSnapshot],
 ) -> LayerEffectEvaluationResult {
-    sync_layers(output_name, layers);
+    sync_layers(layers);
     let Some(effect) = with_registry(|registry| registry.layer_effect.clone()) else {
         return LayerEffectEvaluationResult::default();
     };
@@ -821,6 +829,11 @@ fn layer_effects(
     let effects = observer.track(|| {
         layers
             .iter()
+            // Only this output's layers, as in the TypeScript runtime. The
+            // compositor clears just this output's entries but inserts every
+            // assignment it gets, so another output's would be replaced out
+            // of turn, past that output's own evaluation.
+            .filter(|layer| layer.output_name == output_name)
             .map(|layer| RuntimeLayerEffectAssignment {
                 layer_id: layer.id.clone(),
                 effects: match validate_layer_effect_config(effect(layer).compile()) {
@@ -911,10 +924,26 @@ fn set_display_state(state: BTreeMap<String, shojiwm_lib::ssd::WaylandOutputSnap
         current: state.clone(),
     };
     batch(|| {
-        // Layers are synced per output when its effects are evaluated, which
-        // a removed output never is again.
-        for output in &event.removed {
-            sync_layers(&output.name, &[]);
+        // Layers are synced when an output's effects are evaluated; drop a
+        // removed output's now, before the listeners below run.
+        if !event.removed.is_empty() {
+            let remaining: Vec<WaylandLayerSnapshot> = {
+                let layers = global.layers.get_untracked();
+                global
+                    .layer_order
+                    .get_untracked()
+                    .iter()
+                    .filter_map(|id| layers.get(id))
+                    .filter(|layer| {
+                        !event
+                            .removed
+                            .iter()
+                            .any(|output| output.name == layer.output_name)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            sync_layers(&remaining);
         }
         global.outputs.set(state);
         animation::sync_output_poll_groups();
