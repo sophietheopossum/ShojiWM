@@ -242,7 +242,7 @@ fn init_logging(
         .truncate(true)
         .open(&latest_log)?;
     let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,shojiwm_lib=info,shoji_wm=info,xwayland_satellite=info"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,shojiwm_lib=info,shoji_wm=info,shojiwm_rs=info,xwayland_satellite=info"));
 
     // The compositor runs a single-threaded event loop, so a synchronous
     // writer here puts a filesystem write directly in the path of input and
