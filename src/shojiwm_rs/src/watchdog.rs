@@ -34,8 +34,7 @@ use shojiwm_lib::{
     runtime_api::{
         ConfigRuntime, DecorationRequest as D, EffectRequest as E, InputRequest as I,
         ReloadPreparation, RuntimeError, RuntimeEvent as Ev, RuntimeReply, RuntimeRequest as R,
-        SchedulerTickRequest,
-        WindowRequest as W, WorkspaceRequest,
+        SchedulerTickRequest, WindowRequest as W, WorkspaceRequest,
     },
     ssd::WaylandWindowSnapshot,
 };
