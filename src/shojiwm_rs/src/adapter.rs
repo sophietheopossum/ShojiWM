@@ -427,6 +427,7 @@ struct Refresh {
 /// Bring the window's tree, managed state and effects up to date.
 fn refresh(entry: &Rc<WindowEntry>, force_full: bool) -> Refresh {
     let dirty = std::mem::take(&mut *entry.context.dirty.borrow_mut());
+    runtime::clear_window_dirty(&entry.id);
     let first = entry.view.borrow().is_none();
     if first || dirty.recompose {
         compose(entry);
@@ -566,7 +567,9 @@ fn evaluate_cached(
         dirty_node_ids: refresh.dirty_node_ids,
         managed_window_only: refresh.managed_only,
         next_poll_in_ms: next_poll(),
-        actions: Vec::new(),
+        // Everything queued, as `evaluate` does: an `on_focus` handler fired
+        // by this evaluation may have acted on any window.
+        actions: runtime::drain_actions(),
     })))
 }
 
@@ -902,6 +905,18 @@ fn publish() {
     runtime::publish_pending();
 }
 
+/// Ask for a tick when a request left changes that its reply did not carry:
+/// windows marked dirty, or actions queued, while another window was being
+/// evaluated (an `on_focus` handler scrolling the other tiles). Ticks and
+/// mutation replies carry both, so this never keeps itself going.
+fn wake_if_unreported() {
+    if runtime::has_unreported_changes()
+        && let Some(host) = runtime::host()
+    {
+        host.wake();
+    }
+}
+
 /// Ask for a tick when windows went dirty outside of a request.
 fn wake_if_dirty() {
     let dirty = runtime::WINDOWS.with(|windows| {
@@ -1115,6 +1130,7 @@ impl ConfigRuntime for ReactiveRuntime {
             })
         });
         publish();
+        wake_if_unreported();
         reply
     }
 
