@@ -224,6 +224,20 @@ pub(crate) fn mark_window_dirty(window_id: &str) {
     });
 }
 
+/// The window's changes are being taken into its own reply. A later mark
+/// finds its set empty and lists it again.
+pub(crate) fn clear_window_dirty(window_id: &str) {
+    DIRTY_WINDOWS.with(|dirty| {
+        dirty.borrow_mut().remove(window_id);
+    });
+}
+
+/// Whether windows were marked dirty, or actions queued, since a reply last
+/// carried them to the compositor.
+pub(crate) fn has_unreported_changes() -> bool {
+    DIRTY_WINDOWS.with(|dirty| !dirty.borrow().is_empty()) || has_pending_actions()
+}
+
 pub(crate) fn take_dirty_windows() -> BTreeSet<String> {
     DIRTY_WINDOWS.with(|dirty| std::mem::take(&mut *dirty.borrow_mut()))
 }

@@ -527,3 +527,90 @@ fn a_reseeded_window_is_not_opened_again() {
     runtime.evaluate_cached_window("w1", Some(&window), 2, true).unwrap();
     assert_eq!(take(), ["focus w1 false", "first-commit w1"]);
 }
+
+/// What an evaluation's own listeners do reaches the compositor: actions in
+/// the reply, and other windows' changes through a tick it asks for.
+#[test]
+fn changes_made_while_evaluating_are_not_stranded() {
+    let host = RuntimeHost::detached();
+    let args = CommonArgs::parse(&[], &[]);
+    let mut runtime = RuntimeBoot::new(
+        Box::new(config(|| {
+            COMPOSITOR.event.on_focus(|window, focused| {
+                if !focused {
+                    return;
+                }
+                window.focus();
+                for other in COMPOSITOR.window.list() {
+                    if other != window {
+                        other.state(&WIDTH).update(|width| *width += 10.0);
+                    }
+                }
+            });
+            COMPOSITOR.window.composition(|window| {
+                let width = window.state(&WIDTH);
+                ManagedWindow::new()
+                    .rect(derive(move || Rect::new(0.0, 0.0, width.get(), 300.0)))
+                    .child(ClientWindow::new())
+            });
+        })),
+        &args,
+    )
+    .launch(host.clone());
+    runtime.preload().unwrap();
+    runtime.enable().unwrap();
+    runtime.evaluate_window(&snapshot("w1", "a", false), 1).unwrap();
+    runtime.evaluate_window(&snapshot("w2", "b", false), 2).unwrap();
+    runtime.scheduler_tick(3.0).unwrap();
+    host.take_wake_request();
+
+    // The compositor's cached re-evaluation of w1 gaining focus.
+    let cached = runtime
+        .evaluate_cached_window("w1", Some(&snapshot("w1", "a", true)), 4, true)
+        .unwrap();
+    assert!(
+        cached
+            .actions
+            .iter()
+            .any(|action| action.window_id == "w1" && action.action == WaylandWindowAction::Focus),
+        "{:?}",
+        cached.actions
+    );
+    assert!(host.take_wake_request(), "w2 changed, and no reply said so");
+
+    let tick = runtime.scheduler_tick(5.0).unwrap();
+    assert_eq!(tick.dirty_managed_window_ids, ["w2"]);
+    assert!(!host.take_wake_request(), "the tick carried it all");
+}
+
+/// A window's own changes go out in its evaluation's reply, so they ask for
+/// no tick.
+#[test]
+fn an_evaluation_asks_no_tick_for_its_own_window() {
+    let host = RuntimeHost::detached();
+    let args = CommonArgs::parse(&[], &[]);
+    let mut runtime = RuntimeBoot::new(
+        Box::new(config(|| {
+            COMPOSITOR.window.composition(|window| {
+                let focused = window.is_focused();
+                ManagedWindow::new()
+                    .rect(derive(move || {
+                        Rect::new(0.0, 0.0, if focused.get() { 400.0 } else { 300.0 }, 300.0)
+                    }))
+                    .child(ClientWindow::new())
+            });
+        })),
+        &args,
+    )
+    .launch(host.clone());
+    runtime.preload().unwrap();
+    runtime.enable().unwrap();
+    runtime.evaluate_window(&snapshot("w1", "a", false), 1).unwrap();
+    runtime.scheduler_tick(2.0).unwrap();
+    host.take_wake_request();
+
+    runtime.evaluate_cached_window("w1", Some(&snapshot("w1", "a", true)), 3, true).unwrap();
+    assert!(!host.take_wake_request(), "the reply carried w1's change");
+    let tick = runtime.scheduler_tick(4.0).unwrap();
+    assert!(tick.dirty_managed_window_ids.is_empty(), "{:?}", tick.dirty_managed_window_ids);
+}
