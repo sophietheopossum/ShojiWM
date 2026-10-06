@@ -1651,3 +1651,52 @@ fn a_desktop_swipe_ends_with_its_output() {
     assert!(!has_action(&end.actions, "0xb", WaylandWindowAction::Focus), "{:?}", end.actions);
     assert!(showing_0xa(&mut s), "{:?}", desktops(&mut s));
 }
+
+/// windows.setRect on a maximized window leaves it at that rect: the
+/// unmaximize the compositor sends back must not re-centre it. (The
+/// TypeScript re-centres it, and still answers ok.)
+#[test]
+fn set_rect_on_a_maximized_window_keeps_the_rect() {
+    let mut s = session(false);
+    let window = named_window("0xa", "kitty", true, false);
+    s.evaluate_window_preview(&window, 10)
+        .expect("preview should evaluate");
+    s.evaluate_window(&window, 20)
+        .expect("window should evaluate");
+    let request = |maximized, source, timestamp| WindowMaximizeRequestEventSnapshot {
+        maximized,
+        source,
+        timestamp,
+    };
+    s.window_maximize_request(&window, &request(true, WindowStateRequestSourceSnapshot::Keybind, 30), 30)
+        .expect("maximize request should evaluate");
+    let mut now = 30;
+    s.tick_for(&mut now, 40, 16);
+    assert!(
+        s.evaluate_cached_window("0xa", None, now, true)
+            .expect("window should evaluate")
+            .managed_window
+            .rect
+            .is_some_and(|rect| rect.width > 1800.0),
+        "the window should be maximized first"
+    );
+
+    let mut client = Client::connect(&s.socket);
+    let reply = client.request(
+        &mut s,
+        "windows.setRect",
+        json!({ "windowId": "0xa", "x": 100, "y": 80, "width": 640, "height": 480 }),
+    );
+    assert_eq!(reply, json!({ "ok": true }));
+    // The compositor runs the unmaximize action as a request of its own.
+    s.window_maximize_request(&window, &request(false, WindowStateRequestSourceSnapshot::Api, now), now)
+        .expect("unmaximize request should evaluate");
+    s.tick_for(&mut now, 40, 16);
+    let rect = s
+        .evaluate_cached_window("0xa", None, now, true)
+        .expect("window should evaluate")
+        .managed_window
+        .rect
+        .expect("managed rect");
+    assert_eq!((rect.x, rect.y, rect.width, rect.height), (100.0, 80.0, 640.0, 480.0));
+}

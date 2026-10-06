@@ -2212,9 +2212,9 @@ impl HybridWindowManager {
         {
             return false;
         }
-        if get(window, &WINDOW_STATE_MAXIMIZED) {
-            window.unmaximize();
-        }
+        // Silently, as a drag does: the unmaximize the compositor sends back
+        // would otherwise re-centre the window over this rect.
+        self.begin_interactive_unmaximize(window);
         stop_rect_animation(window, &WINDOW_STATE_RECT);
         set(window, &WINDOW_STATE_RECT, rect);
         if let Some(id) = workspace {
