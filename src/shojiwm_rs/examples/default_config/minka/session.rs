@@ -79,10 +79,39 @@ pub fn apply_cursor_settings() {
     }
 }
 
+/// Whether this compositor runs inside another session (`--dev` in a
+/// window, or a test) rather than on a tty of its own, as the session entry
+/// starts it. `MINKA_NESTED=1` or `=0` overrides that either way.
+pub fn nested() -> bool {
+    match std::env::var("MINKA_NESTED").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => !std::env::args().any(|arg| arg == "--tty"),
+    }
+}
+
+/// Ends a frozen session, so the display manager comes back. A nested run
+/// keeps its reports in a directory of its own: the real session's marker
+/// is what the next login reads, and a test instance must neither use it up
+/// nor add to it.
+pub fn hang_watchdog() -> HangWatchdog {
+    let watchdog = HangWatchdog::default();
+    match std::env::var_os("HOME") {
+        Some(home) if nested() => {
+            watchdog.report_dir(std::path::Path::new(&home).join("shoji_wm/logs/nested"))
+        }
+        _ => watchdog,
+    }
+}
+
 /// A session that ended because the config hung leaves only a marker line
 /// and a core dump, and the next one starts like any other: say so once the
-/// shell can show it.
+/// shell can show it. Not from a nested run, whose notifications would land
+/// on the real desktop.
 pub fn report_previous_hangs() {
+    if nested() {
+        return;
+    }
     for hang in shojiwm_rs::watchdog::previous_hangs() {
         COMPOSITOR.process.spawn(Command::exec([
             "sh",
@@ -96,12 +125,12 @@ pub fn report_previous_hangs() {
 
 /// The rest of the desktop: shell, Minka apps and session daemons.
 ///
-/// Skipped when `MINKA_NESTED=1`: a nested instance for testing must not
-/// start a second MinkaShell (which would truncate `/tmp/minkashell.log`) or
-/// a second set of clipboard watchers. Once-per-session is per compositor
+/// Skipped when [`nested`]: a nested instance for testing must not start a
+/// second MinkaShell (which would truncate `/tmp/minkashell.log`) or a
+/// second set of clipboard watchers. Once-per-session is per compositor
 /// process, so nothing else stops it.
 pub fn start_session_apps() {
-    if std::env::var_os("MINKA_NESTED").is_some_and(|value| value == "1") {
+    if nested() {
         return;
     }
     // MinkaShell (Quickshell-based) is the session shell; shoji-bar-2 is
