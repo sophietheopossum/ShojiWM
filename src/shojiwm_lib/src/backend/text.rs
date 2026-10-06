@@ -196,11 +196,11 @@ impl TextRasterizer {
             .map(|rect| rect.height)
             .unwrap_or(spec.rect.height as f32)
             .max(0.0);
-        let target_width = (logical_width * raster_scale as f32).round().max(1.0) as i32;
-        let target_height = (logical_height * raster_scale as f32).round().max(1.0) as i32;
-        let font_size = spec.font_size.max(1.0) * raster_scale as f32;
+        let target_width = (logical_width * raster_scale).round().max(1.0) as i32;
+        let target_height = (logical_height * raster_scale).round().max(1.0) as i32;
+        let font_size = spec.font_size.max(1.0) * raster_scale;
         let line_height =
-            spec.line_height.unwrap_or(spec.font_size.max(1.0) + 4.0) * raster_scale as f32;
+            spec.line_height.unwrap_or(spec.font_size.max(1.0) + 4.0) * raster_scale;
         let metrics = Metrics::new(font_size, line_height.max(1.0));
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 

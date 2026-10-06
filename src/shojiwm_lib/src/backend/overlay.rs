@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(overlays.slots[&key].control.id, second);
         assert!(!get(&owner, failed).unwrap().alive());
         get(&owner, second).unwrap().dispose();
-        overlays.tick(&[output.clone()], false);
+        overlays.tick(std::slice::from_ref(&output), false);
 
         let mut live = snapshot_effect();
         live.input = EffectInput::Backdrop;
@@ -491,8 +491,8 @@ mod tests {
         let mut scene = vec![element(&renderer, &red, 0.5)];
         overlays.render(&mut renderer, &output, size, scale, &mut scene, 0, |e| e);
         assert_eq!(overlays.slots[&key].cached.as_ref().unwrap().0, cached_id, "an idle live source must reuse its result");
-        overlays.tick(&[output.clone()], false); // drain the creation wake
-        assert!(!overlays.tick(&[output.clone()], false), "idle persistent effects must not request animation frames");
+        overlays.tick(std::slice::from_ref(&output), false); // drain the creation wake
+        assert!(!overlays.tick(std::slice::from_ref(&output), false), "idle persistent effects must not request animation frames");
 
         let other = Output::new("overlay-gpu-other".into(), smithay::output::PhysicalProperties {
             size: (0, 0).into(), subpixel: smithay::output::Subpixel::Unknown,
@@ -511,7 +511,7 @@ mod tests {
         assert!(!live_control.alive());
         assert!(!overlays.slots.contains_key(&key));
         assert!(other_control.alive(), "changing one output must not disable the other");
-        overlays.tick(&[output.clone()], false);
+        overlays.tick(std::slice::from_ref(&output), false);
         assert!(!other_control.alive());
         assert!(!overlays.slots.contains_key(&other_key), "removing an output releases its GPU slot");
         let mut live = snapshot_effect();
@@ -520,7 +520,7 @@ mod tests {
         let locked_control = get(&owner, locked_id).unwrap();
         let mut scene = vec![element(&renderer, &red, 1.0)];
         overlays.render(&mut renderer, &output, size, scale, &mut scene, 0, |e| e);
-        overlays.tick(&[output.clone()], true);
+        overlays.tick(std::slice::from_ref(&output), true);
         assert!(!locked_control.alive());
         assert!(overlays.slots.is_empty(), "locking releases the live GPU slots");
         overlays.tick(&[], false); // drain cleanup damage

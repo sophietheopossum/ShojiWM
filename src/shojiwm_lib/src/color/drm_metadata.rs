@@ -288,6 +288,7 @@ impl HdmiLinkCapability {
 /// distinguished by their IEEE OUI stored least-significant byte first:
 ///   * `00-0C-03` — the HDMI 1.4b VSDB, whose byte 7 is Max_TMDS_Clock.
 ///   * `C4-5D-D8` — the HDMI Forum VSDB (HDMI 2.1), carrying Max_FRL_Rate.
+///
 /// A 2.1 sink normally publishes both, so both are collected.
 pub fn parse_edid_hdmi_link(edid: &[u8]) -> Option<HdmiLinkCapability> {
     if edid.len() < 128 {
