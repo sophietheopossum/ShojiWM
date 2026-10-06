@@ -39,6 +39,7 @@ use crate::{
     reactive::{Observer, Scope, batch, untrack},
     runtime::{self, ComposedView, WindowEntry, emit, with_registry},
     view::{Child, Composition, DirtySet, Flex, MountedNode, ViewContext, ViewTree},
+    watchdog::{self, HangWatchdog},
     window::{Window, WindowSignals},
 };
 
@@ -50,6 +51,7 @@ pub struct ConfigBuilder {
     setup: Rc<dyn Fn()>,
     asset_root: Option<PathBuf>,
     start_locked: bool,
+    hang_watchdog: Option<HangWatchdog>,
 }
 
 impl ConfigBuilder {
@@ -59,6 +61,7 @@ impl ConfigBuilder {
             setup: Rc::new(setup),
             asset_root: None,
             start_locked: false,
+            hang_watchdog: Some(HangWatchdog::log_only()),
         }
     }
 
@@ -82,6 +85,16 @@ impl ConfigBuilder {
         self
     }
 
+    /// The config runs on the compositor thread, so a call into it that
+    /// never returns freezes the session for good. The watchdog notices and
+    /// logs it (see [`HangWatchdog`]); [`HangWatchdog::default()`] ends the
+    /// process instead, with a core dump of the stuck code. Logs only by
+    /// default; `None` turns it off.
+    pub fn hang_watchdog(mut self, watchdog: impl Into<Option<HangWatchdog>>) -> Self {
+        self.hang_watchdog = watchdog.into();
+        self
+    }
+
     /// Run the compositor with this config. This is the whole `main`.
     pub fn run(self) -> std::process::ExitCode {
         shojiwm_lib::run(self)
@@ -94,11 +107,10 @@ impl RuntimeLauncher for ConfigBuilder {
     }
 
     fn launch(&self, context: LaunchContext) -> Box<dyn ConfigRuntime> {
-        Box::new(ReactiveRuntime::start(
-            self.setup.clone(),
-            self.asset_root.clone(),
-            context,
-        ))
+        let (setup, asset_root) = (self.setup.clone(), self.asset_root.clone());
+        watchdog::launch(self.hang_watchdog.clone(), move || {
+            ReactiveRuntime::start(setup, asset_root, context)
+        })
     }
 
     fn start_locked(&self) -> bool {
