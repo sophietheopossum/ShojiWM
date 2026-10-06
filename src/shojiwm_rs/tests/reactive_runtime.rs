@@ -486,3 +486,44 @@ fn layer_events_follow_the_usable_area_across_outputs() {
     assert_eq!(take(), ["destroy tv-bar"]);
     assert_eq!(COMPOSITOR.layer.list().len(), 1);
 }
+
+/// A window the compositor re-seeds after a spurious close (outputs going
+/// away) comes back without `on_open`, which a window manager answers by
+/// raising and focusing it.
+#[test]
+fn a_reseeded_window_is_not_opened_again() {
+    use std::{cell::RefCell, rc::Rc};
+
+    let events: Rc<RefCell<Vec<String>>> = Rc::default();
+    let recorded = events.clone();
+    let host = RuntimeHost::detached();
+    let args = CommonArgs::parse(&[], &[]);
+    let mut runtime = RuntimeBoot::new(
+        Box::new(config(move || {
+            let log = |what: &'static str| {
+                let recorded = recorded.clone();
+                move |window: Window| recorded.borrow_mut().push(format!("{what} {}", window.id()))
+            };
+            COMPOSITOR.event.on_open(log("open"));
+            COMPOSITOR.event.on_first_commit(log("first-commit"));
+            let recorded = recorded.clone();
+            COMPOSITOR.event.on_focus(move |window, focused| {
+                recorded.borrow_mut().push(format!("focus {} {focused}", window.id()))
+            });
+            COMPOSITOR.window.composition(|_| ManagedWindow::new().child(ClientWindow::new()));
+        })),
+        &args,
+    )
+    .launch(host);
+    runtime.preload().unwrap();
+    runtime.enable().unwrap();
+    let take = || std::mem::take(&mut *events.borrow_mut());
+
+    let window = snapshot("w1", "a", false);
+    runtime.evaluate_window(&window, 1).unwrap();
+    assert_eq!(take(), ["open w1", "focus w1 false", "first-commit w1"]);
+
+    runtime.window_closed("w1").unwrap();
+    runtime.evaluate_cached_window("w1", Some(&window), 2, true).unwrap();
+    assert_eq!(take(), ["focus w1 false", "first-commit w1"]);
+}

@@ -524,8 +524,17 @@ fn evaluate_cached(
             entry
         }
         (Some(entry), None) => entry,
+        // The compositor re-seeding a window it still has after the config
+        // forgot it (a spurious close while outputs go away). The config saw
+        // it open already: no `on_open`, whose handlers raise and focus a
+        // new window; it comes back through focus and first commit.
         (None, Some(snapshot)) => {
-            let (entry, _) = ensure_window(snapshot);
+            let entry = create_window(snapshot);
+            entry.opened.set(true);
+            let window = entry.handle;
+            batch(|| {
+                emit(|listeners| listeners.focus.clone(), |listener| listener(window, snapshot.is_focused))
+            });
             mark_first_commit(&entry);
             entry
         }
