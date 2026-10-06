@@ -562,8 +562,8 @@ pub struct HybridWindowManager {
     outbox: Outbox,
     /// MRU focus time per window, for the dock.
     last_focused_at: HashMap<String, f64>,
-    /// Window id -> client-declared role. Never pruned on close: ids are not
-    /// reused within a session.
+    /// Window id -> client-declared role, for listed windows only (see
+    /// [`Self::set_window_role`]).
     window_roles: HashMap<String, String>,
     /// Virtual desktops on/off (minka-settings workspaces.enabled). Off means
     /// one desktop per monitor: every path that could create or show a
@@ -2152,12 +2152,24 @@ impl HybridWindowManager {
 
     /// Attach a client-declared semantic role to a window (the Arcan/SHMIF
     /// "typed segment" idea), so consumers match on role rather than title.
-    /// An empty or missing role revokes the claim.
-    pub fn set_window_role(&mut self, id: &str, role: Option<&str>) {
-        match role.filter(|role| !role.is_empty()) {
-            Some(role) => self.window_roles.insert(id.to_owned(), role.to_owned()),
-            None => self.window_roles.remove(id),
+    /// An empty or missing role revokes the claim. A window that is not
+    /// listed gets none, and roles of windows that are gone are dropped
+    /// here rather than on close: the compositor reports a window closed
+    /// when its output goes away, then brings it back under the same id.
+    /// Returns whether anything changed.
+    pub fn set_window_role(&mut self, id: &str, role: Option<&str>) -> bool {
+        let listed: HashSet<String> = self.list_windows().iter().map(Window::id).collect();
+        let before = self.window_roles.len();
+        self.window_roles.retain(|id, _| listed.contains(id));
+        let pruned = self.window_roles.len() != before;
+        let changed = match role.filter(|role| !role.is_empty()) {
+            Some(role) if listed.contains(id) => {
+                self.window_roles.insert(id.to_owned(), role.to_owned()).as_deref() != Some(role)
+            }
+            Some(_) => false,
+            None => self.window_roles.remove(id).is_some(),
         };
+        pruned || changed
     }
 
     fn track_pending_initial_focus(&mut self, window: Window) {

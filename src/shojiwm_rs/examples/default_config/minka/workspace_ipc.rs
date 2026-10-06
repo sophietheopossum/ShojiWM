@@ -433,10 +433,11 @@ fn serve_workspaces(ipc: &WorkspaceIpc, wm: &WindowManager) {
     {
         let handle = ipc.clone();
         ipc.command("windows.identify", move |params| {
-            if let Some(id) = params["windowId"].as_str() {
-                handle
+            if let Some(id) = params["windowId"].as_str()
+                && handle
                     .wm
-                    .with(|wm| wm.set_window_role(id, params["role"].as_str()));
+                    .with(|wm| wm.set_window_role(id, params["role"].as_str()))
+            {
                 handle.schedule_workspace_broadcast();
             }
         });

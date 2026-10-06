@@ -1700,3 +1700,51 @@ fn set_rect_on_a_maximized_window_keeps_the_rect() {
         .expect("managed rect");
     assert_eq!((rect.x, rect.y, rect.width, rect.height), (100.0, 80.0, 640.0, 480.0));
 }
+
+/// windows.identify names listed windows only, so a role claimed for an id
+/// before its window exists is not handed to it. A window the compositor
+/// reports closed and then re-seeds (its output went away) keeps its role.
+#[test]
+fn identify_names_listed_windows_and_survives_a_reseed() {
+    let mut s = session(false);
+    let open = |s: &mut Session, id: &str, now: u64| {
+        let window = named_window(id, "minkamon", true, false);
+        s.evaluate_window_preview(&window, now)
+            .expect("preview should evaluate");
+        s.evaluate_window(&window, now + 10)
+            .expect("window should evaluate");
+        window
+    };
+    let roles = |s: &mut Session| -> Vec<(String, Value)> {
+        let mut client = Client::connect(&s.socket);
+        let view = client.request(s, "workspaces.get", json!({}));
+        let mut roles: Vec<(String, Value)> = view["monitors"]
+            .as_array()
+            .expect("monitors")
+            .iter()
+            .flat_map(|monitor| monitor["workspaces"].as_array().expect("workspaces"))
+            .flat_map(|workspace| workspace["windows"].as_array().expect("windows"))
+            .map(|window| (window["id"].as_str().expect("id").to_owned(), window["role"].clone()))
+            .collect();
+        roles.sort_by(|a, b| a.0.cmp(&b.0));
+        roles
+    };
+    let mut client = Client::connect(&s.socket);
+    let window = open(&mut s, "0xa", 10);
+    client.request(&mut s, "windows.identify", json!({ "windowId": "0xa", "role": "minkamon.cpu" }));
+    client.request(&mut s, "windows.identify", json!({ "windowId": "0xb", "role": "minkamon.gpu" }));
+    open(&mut s, "0xb", 40);
+    assert_eq!(
+        roles(&mut s),
+        [("0xa".to_owned(), json!("minkamon.cpu")), ("0xb".to_owned(), Value::Null)]
+    );
+
+    s.window_closed("0xa").expect("close should evaluate");
+    s.evaluate_cached_window("0xa", Some(&window), 60, true)
+        .expect("re-seed should evaluate");
+    client.request(&mut s, "windows.identify", json!({ "windowId": "0xb", "role": "minkamon.gpu" }));
+    assert_eq!(
+        roles(&mut s),
+        [("0xa".to_owned(), json!("minkamon.cpu")), ("0xb".to_owned(), json!("minkamon.gpu"))]
+    );
+}
