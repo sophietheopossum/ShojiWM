@@ -582,6 +582,9 @@ pub struct HybridWindowManager {
     maximized_move_drag: Option<MaximizedMoveDrag>,
     workspace_gesture: Option<WorkspaceGesture>,
     workspace_gesture_mode: Option<GestureMode>,
+    /// The vertical swipe's output went away: the rest of it is ignored
+    /// until the fingers lift.
+    workspace_gesture_abandoned: bool,
     workspace_scroll_gesture_rect_animations_cancelled: bool,
     workspace_scroll_snap_latch: Option<ScrollSnapLatch>,
     /// EMA of the active gesture's scroll speed (logical px/s).
@@ -630,6 +633,7 @@ impl HybridWindowManager {
             maximized_move_drag: None,
             workspace_gesture: None,
             workspace_gesture_mode: None,
+            workspace_gesture_abandoned: false,
             workspace_scroll_gesture_rect_animations_cancelled: false,
             workspace_scroll_snap_latch: None,
             workspace_scroll_gesture_speed: None,
@@ -725,6 +729,7 @@ impl HybridWindowManager {
             GestureSwipePhaseSnapshot::Begin => {
                 self.workspace_gesture = None;
                 self.workspace_gesture_mode = None;
+                self.workspace_gesture_abandoned = false;
                 self.workspace_scroll_gesture_rect_animations_cancelled = false;
                 self.workspace_scroll_snap_latch = None;
                 self.workspace_scroll_gesture_speed = None;
@@ -735,7 +740,9 @@ impl HybridWindowManager {
                     self.workspace_gesture = None;
                     self.update_workspace_scroll_gesture(event);
                 }
-                Some(GestureMode::WorkspaceSwitch) if self.workspaces_enabled => {
+                Some(GestureMode::WorkspaceSwitch)
+                    if self.workspaces_enabled && !self.workspace_gesture_abandoned =>
+                {
                     self.update_workspace_gesture(event)
                 }
                 _ => {}
@@ -827,15 +834,18 @@ impl HybridWindowManager {
         if !live.contains(&self.current_monitor) {
             self.current_monitor = fallback;
         }
-        // A swipe across a workspace that was just dropped ends here; its
-        // mode stays, so the rest of its updates are ignored.
-        let dropped = |id: u64| !self.workspaces.iter().any(|workspace| workspace.id == id);
+        // A swipe on an output that just went away ends here, with nothing
+        // committed: its desktops were dropped, or re-homed and reset above.
+        // The rest of it is ignored rather than restarted on the output that
+        // remains. (The TypeScript keeps the swipe, and its end switches
+        // desktops on the monitor that is gone.)
         if self
             .workspace_gesture
             .as_ref()
-            .is_some_and(|gesture| dropped(gesture.from) || gesture.to.is_some_and(dropped))
+            .is_some_and(|gesture| !live.contains(&gesture.monitor))
         {
             self.workspace_gesture = None;
+            self.workspace_gesture_abandoned = true;
         }
         self.sync_workspaces();
         self.refresh_usable_area_layouts();

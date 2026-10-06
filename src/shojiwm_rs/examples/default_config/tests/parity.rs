@@ -1536,29 +1536,118 @@ fn a_window_without_an_app_id_has_a_null_app_id() {
 }
 
 /// A three-finger vertical swipe still in progress when its output goes
-/// away ends quietly; it used to reach a dropped workspace and panic.
+/// away ends there, with nothing switched. The desktops it was moving are
+/// re-homed onto the output that remains, and neither the swipe's end nor
+/// its later updates may switch them there. (A swipe across a dropped
+/// desktop used to panic.)
 #[test]
-fn a_desktop_swipe_survives_its_output_going_away() {
-    use GestureSwipePhaseSnapshot::{Begin, End, Update};
+fn a_desktop_swipe_ends_with_its_output() {
+    use GestureSwipePhaseSnapshot::{Begin, Cancel, End, Update};
 
-    let mut s = session(false);
-    let mut tv = output("TEST-2", 1920);
-    tv.connector = None;
-    s.sync_display_state(BTreeMap::from([
-        ("TEST-1".to_owned(), test_output()),
-        ("TEST-2".to_owned(), tv),
-    ]));
     let vertical = |phase, total_y: f64, timestamp: u64| GestureSwipeEventSnapshot {
         total_y,
         delta_y: total_y,
         output_name: Some("TEST-2".into()),
         ..swipe(phase, 0.0, 0.0, timestamp)
     };
-    s.gesture_swipe(&vertical(Begin, 0.0, 10), 10)
-        .expect("begin");
-    s.gesture_swipe(&vertical(Update, -300.0, 20), 20)
-        .expect("update");
-    s.sync_display_state(BTreeMap::from([("TEST-1".to_owned(), test_output())]));
-    s.gesture_swipe(&vertical(End, -300.0, 30), 30)
+    let open = |s: &mut Session, id: &str, now: u64| {
+        s.evaluate_window_preview(&named_window(id, "kitty", false, false), now)
+            .expect("preview should evaluate");
+        s.evaluate_window(&named_window(id, "kitty", true, false), now + 10)
+            .expect("window should evaluate");
+    };
+    /// Each monitor's (name, active index, [(index, window ids)]).
+    type Desktops = Vec<(String, u64, Vec<(u64, Vec<String>)>)>;
+    let desktops = |s: &mut Session| -> Desktops {
+        let mut client = Client::connect(&s.socket);
+        let view = client.request(s, "workspaces.get", json!({}));
+        view["monitors"]
+            .as_array()
+            .expect("monitors")
+            .iter()
+            .map(|monitor| {
+                let workspaces = monitor["workspaces"]
+                    .as_array()
+                    .expect("workspaces")
+                    .iter()
+                    .filter(|workspace| !workspace["windows"].as_array().expect("windows").is_empty())
+                    .map(|workspace| {
+                        let ids = workspace["windows"]
+                            .as_array()
+                            .expect("windows")
+                            .iter()
+                            .map(|window| window["id"].as_str().expect("id").to_owned())
+                            .collect();
+                        (workspace["index"].as_u64().expect("index"), ids)
+                    })
+                    .collect();
+                let name = monitor["name"].as_str().expect("name").to_owned();
+                (name, monitor["active"].as_u64().expect("active"), workspaces)
+            })
+            .collect()
+    };
+    let only_test_1 = || BTreeMap::from([("TEST-1".to_owned(), test_output())]);
+
+    // TEST-2 shows 0xa on desktop 1, with 0xb on desktop 2, and a swipe
+    // from 1 toward 2 is under way.
+    let start = || {
+        let mut s = session(false);
+        let mut tv = output("TEST-2", 1920);
+        tv.connector = None;
+        s.sync_display_state(BTreeMap::from([
+            ("TEST-1".to_owned(), test_output()),
+            ("TEST-2".to_owned(), tv),
+        ]));
+        // A swipe makes its output the current one, where windows open.
+        s.gesture_swipe(&vertical(Begin, 0.0, 10), 10).expect("begin");
+        s.gesture_swipe(&vertical(Cancel, 0.0, 11), 11).expect("cancel");
+        open(&mut s, "0xa", 20);
+        assert!(s.invoke_key_binding("workspace-next", 40).expect("desktop key").invoked);
+        open(&mut s, "0xb", 60);
+        assert!(s.invoke_key_binding("workspace-prev", 80).expect("desktop key").invoked);
+        let before = desktops(&mut s);
+        assert!(
+            before.iter().any(|(name, active, workspaces)| name == "TEST-2"
+                && *active == 1
+                && workspaces == &[(1, vec!["0xa".to_owned()]), (2, vec!["0xb".to_owned()])]),
+            "{before:?}"
+        );
+        s.gesture_swipe(&vertical(Begin, 0.0, 100), 100).expect("begin");
+        s.gesture_swipe(&vertical(Update, -300.0, 110), 110).expect("update");
+        s
+    };
+    // Where 0xa's desktop is the one showing.
+    let showing_0xa = |s: &mut Session| {
+        let after = desktops(s);
+        after.iter().any(|(_, active, workspaces)| {
+            workspaces
+                .iter()
+                .any(|(index, ids)| index == active && ids == &["0xa"])
+        })
+    };
+
+    // The control: left in place, this swipe's end switches to 0xb.
+    let mut s = start();
+    let end = s.gesture_swipe(&vertical(End, -1000.0, 120), 120).expect("end");
+    assert!(has_action(&end.actions, "0xb", WaylandWindowAction::Focus), "{:?}", end.actions);
+    assert!(!showing_0xa(&mut s), "{:?}", desktops(&mut s));
+    drop(s);
+
+    // Its output goes; then it ends.
+    let mut s = start();
+    s.sync_display_state(only_test_1());
+    let end = s
+        .gesture_swipe(&vertical(End, -1000.0, 120), 120)
         .expect("ending the swipe after its output went away");
+    assert!(!has_action(&end.actions, "0xb", WaylandWindowAction::Focus), "{:?}", end.actions);
+    assert!(showing_0xa(&mut s), "{:?}", desktops(&mut s));
+    drop(s);
+
+    // Its output goes; it carries on, then ends.
+    let mut s = start();
+    s.sync_display_state(only_test_1());
+    s.gesture_swipe(&vertical(Update, -1000.0, 115), 115).expect("update");
+    let end = s.gesture_swipe(&vertical(End, -1000.0, 120), 120).expect("end");
+    assert!(!has_action(&end.actions, "0xb", WaylandWindowAction::Focus), "{:?}", end.actions);
+    assert!(showing_0xa(&mut s), "{:?}", desktops(&mut s));
 }
