@@ -20,5 +20,5 @@
       ]
     }
   },
-  "exclude": ["node_modules", "target", "docs", "tests/*.test.ts"]
+  "exclude": ["node_modules", "target", "docs", "tests/*.test.ts", "tests/node-test.d.ts"]
 }
