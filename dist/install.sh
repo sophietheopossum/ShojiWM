@@ -7,10 +7,11 @@
 # ShojiWM xdg-desktop-portal backend unless --no-portal is passed.
 #
 # With --rust-config the compositor is Minka's Rust config
-# (src/shojiwm_rs/examples/default_config) instead of the TypeScript build;
-# everything else is installed the same way. The binary it replaces is kept as
-# /usr/lib/shojiwm/shoji_wm.previous. From a tty, when the new one will not
-# start:
+# (src/shojiwm_rs/examples/default_config) instead of the TypeScript build.
+# Everything else is installed the same way, except that only the runtime
+# files under /usr/lib/shojiwm are replaced. The compositor the running session
+# booted is kept as /usr/lib/shojiwm/shoji_wm.previous; with no session (a tty)
+# the one already there is kept. From a tty, when the new one will not start:
 #   sudo install -m755 /usr/lib/shojiwm/shoji_wm.previous /usr/bin/shoji_wm
 # The Rust config reads its shaders and icons from this checkout's
 # packages/config, found through the path it was built at, so keep the
@@ -99,11 +100,15 @@ fi
 
 SHOJI_BIN="$REPO_ROOT/target/$PROFILE_DIR/shoji_wm"
 SHOJI_BUILD="cargo build $PROFILE_FLAG -p shoji_wm"
-if [[ $RUST_CONFIG -eq 1 ]]; then
-    SHOJI_BIN="$REPO_ROOT/target/$PROFILE_DIR/examples/default_config"
-    SHOJI_BUILD="cargo build $PROFILE_FLAG -p shojiwm_rs --example default_config"
-fi
 PORTAL_BIN="$REPO_ROOT/target/$PROFILE_DIR/xdg-desktop-portal-shojiwm"
+if [[ $RUST_CONFIG -eq 1 ]]; then
+    # Cargo builds under CARGO_TARGET_DIR when it is set; a stale build left
+    # in target/ must not be installed instead.
+    TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+    SHOJI_BIN="$TARGET_DIR/$PROFILE_DIR/examples/default_config"
+    SHOJI_BUILD="cargo build $PROFILE_FLAG -p shojiwm_rs --example default_config"
+    PORTAL_BIN="$TARGET_DIR/$PROFILE_DIR/xdg-desktop-portal-shojiwm"
+fi
 
 if [[ ! -x "$SHOJI_BIN" ]]; then
     echo "binary not found: $SHOJI_BIN" >&2
@@ -129,18 +134,7 @@ if [[ $INSTALL_PORTAL -eq 1 && ! -x "$PORTAL_BIN" ]]; then
 fi
 
 STAGE="$(mktemp -d)"
-# The previous compositor binary waits outside /usr/lib/shojiwm while that
-# directory is replaced. If anything fails before it is moved in, it is still
-# put in place rather than lost.
-PREVIOUS=""
-cleanup() {
-    rm -rf "$STAGE"
-    if [[ -n "$PREVIOUS" ]]; then
-        sudo mkdir -p /usr/lib/shojiwm
-        sudo mv -f "$PREVIOUS" /usr/lib/shojiwm/shoji_wm.previous
-    fi
-}
-trap cleanup EXIT
+trap 'rm -rf "$STAGE"' EXIT
 
 RUNTIME_STAGE="$STAGE/shojiwm-runtime"
 mkdir -p "$RUNTIME_STAGE/packages" "$RUNTIME_STAGE/tools"
@@ -150,33 +144,52 @@ cp "$REPO_ROOT/tools/decoration-runtime.ts" "$RUNTIME_STAGE/tools/"
 
 echo ">> installing compositor files (sudo)"
 if [[ $RUST_CONFIG -eq 1 ]]; then
-    if [[ -x /usr/bin/shoji_wm ]]; then
-        PREVIOUS="/usr/lib/.shoji_wm.previous.$$"
-        sudo install -m755 /usr/bin/shoji_wm "$PREVIOUS"
+    # The fallback is the compositor this session booted: a session running
+    # /usr/bin/shoji_wm proves it starts, even after a reinstall replaced the
+    # file ("(deleted)"), and its /proc exe stays readable. With no session
+    # (a tty, perhaps after the new build failed to start) the fallback
+    # already in place is kept; /usr/bin/shoji_wm is used only when there is
+    # none.
+    PREVIOUS_SRC=""
+    for pid in $(pgrep -x shoji_wm || true); do
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+        if [[ "${exe%" (deleted)"}" == /usr/bin/shoji_wm ]]; then
+            PREVIOUS_SRC="/proc/$pid/exe"
+            break
+        fi
+    done
+    if [[ -z "$PREVIOUS_SRC" && ! -e /usr/lib/shojiwm/shoji_wm.previous && -x /usr/bin/shoji_wm ]]; then
+        PREVIOUS_SRC=/usr/bin/shoji_wm
+    fi
+    sudo mkdir -p /usr/lib/shojiwm
+    if [[ -n "$PREVIOUS_SRC" ]]; then
+        sudo install -m755 "$PREVIOUS_SRC" /usr/lib/shojiwm/.shoji_wm.previous.new
     fi
     # Staged beside the target and renamed over it, so an interrupted copy (a
     # full disk, a closed terminal) leaves the old binary in place. The
-    # running session keeps its own copy either way. This happens before the
-    # runtime files are replaced: a TypeScript binary left in place by a
-    # failed copy still needs them.
-    STAGED="/usr/bin/.shoji_wm.new.$$"
-    if ! sudo install -m755 "$SHOJI_BIN" "$STAGED"; then
-        sudo rm -f "$STAGED"
+    # running session keeps its own copy either way. The staging names are
+    # fixed, so a run that dies here leaves nothing the next one does not
+    # overwrite.
+    if ! sudo install -m755 "$SHOJI_BIN" /usr/bin/.shoji_wm.new; then
+        sudo rm -f /usr/bin/.shoji_wm.new /usr/lib/shojiwm/.shoji_wm.previous.new
         echo "install failed; /usr/bin/shoji_wm left as it was" >&2
         exit 1
     fi
-    sudo mv -f "$STAGED" /usr/bin/shoji_wm
-    sudo rm -rf /usr/lib/shojiwm
+    sudo mv -f /usr/bin/.shoji_wm.new /usr/bin/shoji_wm
+    # The fallback changes only once the new binary is in place.
+    if [[ -n "$PREVIOUS_SRC" ]]; then
+        sudo mv -f /usr/lib/shojiwm/.shoji_wm.previous.new /usr/lib/shojiwm/shoji_wm.previous
+    fi
+    # Only the runtime files are replaced: the Rust config never reads them,
+    # and the fallbacks beside them (shoji_wm.previous, and a
+    # shoji_wm.typescript kept by older installs) have to survive.
+    sudo rm -rf /usr/lib/shojiwm/packages /usr/lib/shojiwm/tools
 else
     sudo rm -rf /usr/lib/shojiwm
     sudo install -Dm755 "$SHOJI_BIN" /usr/bin/shoji_wm
 fi
 sudo mkdir -p /usr/lib/shojiwm
 sudo cp -a "$RUNTIME_STAGE/." /usr/lib/shojiwm/
-if [[ -n "$PREVIOUS" ]]; then
-    sudo mv -f "$PREVIOUS" /usr/lib/shojiwm/shoji_wm.previous
-    PREVIOUS=""
-fi
 sudo install -Dm644 "$REPO_ROOT/dist/shojiwm.desktop" \
     /usr/share/wayland-sessions/shojiwm.desktop
 
@@ -260,7 +273,8 @@ echo "done."
 if [[ $RUST_CONFIG -eq 1 ]]; then
     echo "Installed the Rust config: log out and back in to run it."
     if [[ -x /usr/lib/shojiwm/shoji_wm.previous ]]; then
-        echo "The binary it replaced is /usr/lib/shojiwm/shoji_wm.previous."
+        echo "If it will not start, from a tty:"
+        echo "  sudo install -m755 /usr/lib/shojiwm/shoji_wm.previous /usr/bin/shoji_wm"
     fi
 else
     echo "Development run: cargo run --profile release-fast -p shoji_wm -- --dev"
