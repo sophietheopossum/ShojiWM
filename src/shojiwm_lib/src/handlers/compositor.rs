@@ -294,6 +294,29 @@ impl CommittedGeometryOrigin {
     }
 }
 
+/// The window geometry and bounding box a toplevel had at its last commit, kept in the window's
+/// user data.
+#[derive(Default)]
+struct CommittedExtent(Mutex<Option<(Rectangle<i32, Logical>, Rectangle<i32, Logical>)>>);
+
+impl CommittedExtent {
+    /// Records this commit's geometry and bounding box, and returns whether either differs from
+    /// the previous commit's. A window's first commit counts as a change.
+    fn replace(&self, geometry: Rectangle<i32, Logical>, bbox: Rectangle<i32, Logical>) -> bool {
+        let extent = (geometry, bbox);
+        self.0.lock().unwrap().replace(extent) != Some(extent)
+    }
+}
+
+/// Whether the commit just applied to `window` moved or resized its geometry or bounding box.
+fn committed_extent_changed(window: &smithay::desktop::Window) -> bool {
+    window.user_data().insert_if_missing(CommittedExtent::default);
+    window
+        .user_data()
+        .get::<CommittedExtent>()
+        .is_none_or(|committed| committed.replace(window.geometry(), window.bbox()))
+}
+
 /// The `Space` location that keeps a window's client rect still when its geometry origin moves.
 ///
 /// ShojiWM stores a window's location as its surface origin, which is the client rect's origin
@@ -575,6 +598,7 @@ impl CompositorHandler for ShojiWM {
             window.on_commit();
             // Before the snapshot below, which derives the window position from the location.
             self.keep_client_origin_across_geometry_change(&window);
+            let extent_changed = committed_extent_changed(&window);
             // Title / app_id may have changed via xdg_toplevel set_title /
             // set_app_id between commits. sync_foreign_toplevel short-circuits
             // when nothing changed so this is cheap.
@@ -690,7 +714,17 @@ impl CompositorHandler for ShojiWM {
                                 rect,
                             }),
                     );
-                if let Some(decoration) = self.window_decorations.get(&window) {
+                // Repaint the decoration rect only when this commit moved or resized the window.
+                // Content needs no help: client surfaces, raw or clipped, report their own damage
+                // to smithay, and chrome elements bump their commit counters when their layout
+                // changes. Pushing the rect on every commit made each commit of any window, even
+                // one fully hidden behind another, a DamageOnly element above the whole scene.
+                // That cost a GL frame on its output and knocked a maximized window off direct
+                // scanout for a frame or two, the same effect tty.rs describes for the fullscreen
+                // fast path.
+                if extent_changed
+                    && let Some(decoration) = self.window_decorations.get(&window)
+                {
                     self.pending_decoration_damage
                         .push(decoration.layout.root.rect);
                 }
@@ -968,6 +1002,31 @@ mod tests {
         assert_eq!(committed.replace(point(0, 0)), Some(point(26, 23)));
         assert_eq!(committed.replace(point(0, 0)), None);
         assert_eq!(committed.replace(point(26, 23)), Some(point(0, 0)));
+    }
+
+    #[test]
+    fn committed_extent_reports_only_moves_and_resizes() {
+        let extent = |x, y, w, h| Rectangle::<i32, Logical>::new(point(x, y), (w, h).into());
+        let committed = CommittedExtent::default();
+        let maximised = extent(0, 0, 1536, 864);
+        assert!(
+            committed.replace(maximised, maximised),
+            "the first commit counts as a change"
+        );
+        assert!(
+            !committed.replace(maximised, maximised),
+            "a content-only commit leaves the decoration alone"
+        );
+        let floating = extent(0, 0, 1200, 800);
+        assert!(committed.replace(floating, floating), "a resize is a change");
+        let shadowed = extent(-26, -23, 1252, 846);
+        assert!(
+            committed.replace(floating, shadowed),
+            "a bounding box grown by a shadow or subsurface is a change"
+        );
+        let moved = extent(26, 23, 1200, 800);
+        assert!(committed.replace(moved, shadowed), "a geometry origin move is a change");
+        assert!(!committed.replace(moved, shadowed));
     }
 
     #[test]
