@@ -294,10 +294,13 @@ impl CommittedGeometryOrigin {
     }
 }
 
+/// A toplevel's window geometry and bounding box, in that order.
+type Extent = (Rectangle<i32, Logical>, Rectangle<i32, Logical>);
+
 /// The window geometry and bounding box a toplevel had at its last commit, kept in the window's
 /// user data.
 #[derive(Default)]
-struct CommittedExtent(Mutex<Option<(Rectangle<i32, Logical>, Rectangle<i32, Logical>)>>);
+struct CommittedExtent(Mutex<Option<Extent>>);
 
 impl CommittedExtent {
     /// Records this commit's geometry and bounding box, and returns whether either differs from
