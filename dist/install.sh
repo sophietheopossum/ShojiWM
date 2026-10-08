@@ -8,10 +8,12 @@
 #
 # With --rust-config the compositor is Minka's Rust config
 # (src/shojiwm_rs/examples/default_config) instead of the TypeScript build.
-# Everything else is installed the same way, except that only the runtime
-# files under /usr/lib/shojiwm are replaced. The compositor the running session
-# booted is kept as /usr/lib/shojiwm/shoji_wm.previous; with no session (a tty)
-# the one already there is kept. From a tty, when the new one will not start:
+# Everything else is installed the same way, except the TypeScript runtime
+# files under /usr/lib/shojiwm: the Rust config never reads them, so they stay
+# paired with the TypeScript binaries kept there. The compositor serving the
+# session the install runs in (the one listening on $WAYLAND_DISPLAY) is kept
+# as /usr/lib/shojiwm/shoji_wm.previous; from a tty the one already there is
+# kept. From a tty, when the new one will not start:
 #   sudo install -m755 /usr/lib/shojiwm/shoji_wm.previous /usr/bin/shoji_wm
 # The Rust config reads its shaders and icons from this checkout's
 # packages/config, found through the path it was built at, so keep the
@@ -56,6 +58,15 @@ for arg in "$@"; do
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
+
+if [[ $RUST_CONFIG -eq 1 ]]; then
+    # One --rust-config install at a time: its staging names are fixed.
+    exec 9<"$REPO_ROOT/dist/install.sh"
+    if ! flock -n 9; then
+        echo "another dist/install.sh --rust-config is running" >&2
+        exit 1
+    fi
+fi
 
 # --dev selects the release-fast profile; binaries land in a different
 # target subdirectory, so resolve it here for the build and install steps.
@@ -102,9 +113,12 @@ SHOJI_BIN="$REPO_ROOT/target/$PROFILE_DIR/shoji_wm"
 SHOJI_BUILD="cargo build $PROFILE_FLAG -p shoji_wm"
 PORTAL_BIN="$REPO_ROOT/target/$PROFILE_DIR/xdg-desktop-portal-shojiwm"
 if [[ $RUST_CONFIG -eq 1 ]]; then
-    # Cargo builds under CARGO_TARGET_DIR when it is set; a stale build left
-    # in target/ must not be installed instead.
-    TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+    # Install from wherever cargo builds: CARGO_TARGET_DIR or a
+    # build.target-dir setting moves it, and a stale build left in target/
+    # must not be installed instead.
+    TARGET_DIR="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+        | grep -o '"target_directory":"[^"]*"' | head -n1 | cut -d'"' -f4 || true)"
+    : "${TARGET_DIR:=${CARGO_TARGET_DIR:-$REPO_ROOT/target}}"
     SHOJI_BIN="$TARGET_DIR/$PROFILE_DIR/examples/default_config"
     SHOJI_BUILD="cargo build $PROFILE_FLAG -p shojiwm_rs --example default_config"
     PORTAL_BIN="$TARGET_DIR/$PROFILE_DIR/xdg-desktop-portal-shojiwm"
@@ -122,7 +136,11 @@ if [[ $RUST_CONFIG -eq 1 ]]; then
     version="$(timeout 5 "$SHOJI_BIN" --version 2>/dev/null || true)"
     if [[ "$version" != *"(minka)" ]]; then
         echo "$SHOJI_BIN is not the Minka config (--version: ${version:-nothing})" >&2
-        echo "run without --no-build" >&2
+        if [[ $BUILD -eq 0 ]]; then
+            echo "run without --no-build" >&2
+        else
+            echo "this checkout builds a different default_config; is the Minka branch checked out?" >&2
+        fi
         exit 1
     fi
 fi
@@ -144,32 +162,42 @@ cp "$REPO_ROOT/tools/decoration-runtime.ts" "$RUNTIME_STAGE/tools/"
 
 echo ">> installing compositor files (sudo)"
 if [[ $RUST_CONFIG -eq 1 ]]; then
-    # The fallback is the compositor this session booted: a session running
-    # /usr/bin/shoji_wm proves it starts, even after a reinstall replaced the
-    # file ("(deleted)"), and its /proc exe stays readable. With no session
-    # (a tty, perhaps after the new build failed to start) the fallback
-    # already in place is kept; /usr/bin/shoji_wm is used only when there is
-    # none.
+    # The fallback is the compositor serving the session this install runs in:
+    # the process listening on $WAYLAND_DISPLAY. Serving it proves it starts,
+    # even after a reinstall replaced /usr/bin/shoji_wm ("(deleted)"), and its
+    # /proc exe stays readable. Any other shoji_wm (a nested test run, a hung
+    # session on another VT) proves nothing. From a tty, with no
+    # WAYLAND_DISPLAY, the fallback already in place is kept;
+    # /usr/bin/shoji_wm is copied only when there is none.
     PREVIOUS_SRC=""
-    for pid in $(pgrep -x shoji_wm || true); do
-        exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+        socket="$WAYLAND_DISPLAY"
+        [[ "$socket" == /* ]] || socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$socket"
+        pid="$(ss -xlpn 2>/dev/null | awk -v s="$socket" '$5 == s { print; exit }' \
+            | grep -o 'pid=[0-9]*' | head -n1 | cut -d= -f2 || true)"
+        exe=""
+        if [[ -n "$pid" ]]; then
+            exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+        fi
         if [[ "${exe%" (deleted)"}" == /usr/bin/shoji_wm ]]; then
             PREVIOUS_SRC="/proc/$pid/exe"
-            break
         fi
-    done
+    fi
     if [[ -z "$PREVIOUS_SRC" && ! -e /usr/lib/shojiwm/shoji_wm.previous && -x /usr/bin/shoji_wm ]]; then
         PREVIOUS_SRC=/usr/bin/shoji_wm
     fi
     sudo mkdir -p /usr/lib/shojiwm
-    if [[ -n "$PREVIOUS_SRC" ]]; then
-        sudo install -m755 "$PREVIOUS_SRC" /usr/lib/shojiwm/.shoji_wm.previous.new
+    # The staging names are fixed: clear whatever a killed run left.
+    sudo rm -f /usr/bin/.shoji_wm.new /usr/lib/shojiwm/.shoji_wm.previous.new
+    if [[ -n "$PREVIOUS_SRC" ]] \
+        && ! sudo install -m755 "$PREVIOUS_SRC" /usr/lib/shojiwm/.shoji_wm.previous.new; then
+        sudo rm -f /usr/lib/shojiwm/.shoji_wm.previous.new
+        echo "could not copy the fallback from $PREVIOUS_SRC; nothing was changed" >&2
+        exit 1
     fi
     # Staged beside the target and renamed over it, so an interrupted copy (a
     # full disk, a closed terminal) leaves the old binary in place. The
-    # running session keeps its own copy either way. The staging names are
-    # fixed, so a run that dies here leaves nothing the next one does not
-    # overwrite.
+    # running session keeps its own copy either way.
     if ! sudo install -m755 "$SHOJI_BIN" /usr/bin/.shoji_wm.new; then
         sudo rm -f /usr/bin/.shoji_wm.new /usr/lib/shojiwm/.shoji_wm.previous.new
         echo "install failed; /usr/bin/shoji_wm left as it was" >&2
@@ -177,19 +205,21 @@ if [[ $RUST_CONFIG -eq 1 ]]; then
     fi
     sudo mv -f /usr/bin/.shoji_wm.new /usr/bin/shoji_wm
     # The fallback changes only once the new binary is in place.
-    if [[ -n "$PREVIOUS_SRC" ]]; then
-        sudo mv -f /usr/lib/shojiwm/.shoji_wm.previous.new /usr/lib/shojiwm/shoji_wm.previous
+    if [[ -n "$PREVIOUS_SRC" ]] \
+        && ! sudo mv -f /usr/lib/shojiwm/.shoji_wm.previous.new /usr/lib/shojiwm/shoji_wm.previous; then
+        echo "the new compositor is installed, but its fallback is still" >&2
+        echo "/usr/lib/shojiwm/.shoji_wm.previous.new" >&2
+        exit 1
     fi
-    # Only the runtime files are replaced: the Rust config never reads them,
-    # and the fallbacks beside them (shoji_wm.previous, and a
-    # shoji_wm.typescript kept by older installs) have to survive.
-    sudo rm -rf /usr/lib/shojiwm/packages /usr/lib/shojiwm/tools
+    # The TypeScript runtime files are left alone: the Rust config never reads
+    # them, and they belong to the TypeScript binaries kept beside them
+    # (shoji_wm.typescript, or a TypeScript shoji_wm.previous).
 else
     sudo rm -rf /usr/lib/shojiwm
     sudo install -Dm755 "$SHOJI_BIN" /usr/bin/shoji_wm
+    sudo mkdir -p /usr/lib/shojiwm
+    sudo cp -a "$RUNTIME_STAGE/." /usr/lib/shojiwm/
 fi
-sudo mkdir -p /usr/lib/shojiwm
-sudo cp -a "$RUNTIME_STAGE/." /usr/lib/shojiwm/
 sudo install -Dm644 "$REPO_ROOT/dist/shojiwm.desktop" \
     /usr/share/wayland-sessions/shojiwm.desktop
 
