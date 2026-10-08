@@ -59,8 +59,21 @@ export function configureRendering(): void {
     ],
   });
 
+  // A blur behind a layer costs a backdrop capture and a 2-pass blur on every
+  // commit of that layer, so skip it where nothing can show through: the
+  // Background layer, which has only the clear colour behind it, and surfaces
+  // that cover a whole output (the wallpaper, MenuBackdrop's click catcher, the
+  // start menu's 0.96 sheet, MinkaMon's opaque pad, the leader-line and capture
+  // overlays). MinkaFX keeps it: its snap preview is a translucent fill that is
+  // meant to frost what it covers, and it only reaches here while it is shown,
+  // since it sinks to the Background layer when idle.
   COMPOSITOR.effect.layer = (layer) => {
-    if (layer.namespace() === "no_blur") {
+    if (layer.namespace() === "no_blur" || layer.layer() === "background") {
+      return {};
+    }
+    const anchor = layer.anchor();
+    const coversOutput = anchor.top && anchor.bottom && anchor.left && anchor.right;
+    if (coversOutput && layer.namespace() !== "minka-fx") {
       return {};
     }
 
