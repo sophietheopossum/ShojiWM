@@ -2,7 +2,9 @@
 //! such as duplicate `workspace_enter` for a workspace already in the group
 //! (the way external bars end up rendering duplicated workspace buttons).
 //!
+//! ```text
 //!   WAYLAND_DISPLAY=wayland-2 ext-workspace-monitor [seconds]
+//! ```
 //!
 //! Exits non-zero if any duplicate enter was observed.
 

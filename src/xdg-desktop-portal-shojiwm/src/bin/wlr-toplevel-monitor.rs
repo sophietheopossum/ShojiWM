@@ -4,8 +4,10 @@
 //! Optionally sends `set_minimized` / `unset_minimized` to a toplevel by
 //! app_id after a delay, the way a taskbar click would.
 //!
+//! ```text
 //!   WAYLAND_DISPLAY=wayland-2 wlr-toplevel-monitor [seconds] \
 //!       [--minimize <app_id> [--after <seconds>]] [--unminimize <app_id>]
+//! ```
 //!
 //! Flags "!!! NO OUTPUTS" when a toplevel that once entered an output ends a
 //! `done` batch with no outputs — the condition under which per-output
