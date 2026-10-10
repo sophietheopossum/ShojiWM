@@ -10,13 +10,12 @@
     "allowImportingTsExtensions": true,
     "noEmit": true,
     "types": [],
-    "baseUrl": ".",
     "paths": {
       "shoji_wm": [
-        "packages/shoji_wm/src/index.ts"
+        "./packages/shoji_wm/src/index.ts"
       ],
       "shoji_wm/*": [
-        "packages/shoji_wm/src/*"
+        "./packages/shoji_wm/src/*"
       ]
     }
   },
