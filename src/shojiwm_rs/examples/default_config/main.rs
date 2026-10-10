@@ -1,14 +1,14 @@
 //! Minka's ShojiWM config (`packages/config/src/index.tsx` and its `minka/`
 //! modules on Sophie's branches), ported to Rust on top of `shojiwm_rs`'s
 //! reactive API. The window manager is upstream's port of
-//! `window-manager.ts` with Minka's changes; the rest lives in [`minka`].
+//! `window-manager.ts` with Minka's changes; the rest lives in `minka`.
 //!
 //! ```sh
 //! SHOJI_PUBLISH_ACTIVATION_ENV=0 cargo run -p shojiwm_rs --example default_config -- --dev   # nested
 //! cargo run -p shojiwm_rs --example default_config --release -- --tty
 //! ```
 //!
-//! A run without `--tty` counts as nested (see [`session::nested`]): it
+//! A run without `--tty` counts as nested (see `session::nested`): it
 //! starts none of the desktop's apps and keeps its hang reports out of the
 //! real session's. `SHOJI_PUBLISH_ACTIVATION_ENV=0` stops the compositor
 //! pointing the session's systemd and D-Bus activation at the nested

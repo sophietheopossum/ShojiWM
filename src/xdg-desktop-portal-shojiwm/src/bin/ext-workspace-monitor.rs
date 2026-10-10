@@ -2,7 +2,9 @@
 //! such as duplicate `workspace_enter` for a workspace already in the group
 //! (the way external bars end up rendering duplicated workspace buttons).
 //!
+//! ```text
 //!   WAYLAND_DISPLAY=wayland-2 ext-workspace-monitor [seconds] [--create NAME]
+//! ```
 //!
 //! With `--create`, after the first `done` it asks the first group that
 //! advertises `create_workspace` for a workspace named NAME, then activates

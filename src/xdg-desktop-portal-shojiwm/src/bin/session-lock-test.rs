@@ -1,7 +1,9 @@
 //! Debug helper: lock the session via ext-session-lock-v1 for a few seconds
 //! and then unlock, the way swaylock/hyprlock do (minus the password).
 //!
+//! ```text
 //!   WAYLAND_DISPLAY=wayland-2 session-lock-test [seconds] [--unlock-anyway]
+//! ```
 //!
 //! `--unlock-anyway` sends `unlock_and_destroy` even when the compositor
 //! refused the lock (`finished`), the way a hostile client would try to
