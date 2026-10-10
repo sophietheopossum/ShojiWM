@@ -1,7 +1,9 @@
 //! Debug helper: lock the session via ext-session-lock-v1 for a few seconds
 //! and then unlock, the way swaylock/hyprlock do (minus the password).
 //!
+//! ```text
 //!   WAYLAND_DISPLAY=wayland-2 session-lock-test [seconds]
+//! ```
 //!
 //! One lock surface (a blank shm buffer) is created per wl_output so the
 //! compositor goes through its normal lock-surface focus path.

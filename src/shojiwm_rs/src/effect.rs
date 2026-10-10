@@ -400,7 +400,7 @@ pub fn noise(amount: f32) -> Stage {
     Stage::Noise(amount.clamp(0.0, 1.0))
 }
 
-/// Keep the current texture under `name` for [`get`].
+/// Keep the current texture under `name` for [`saved`].
 pub fn save(name: &str) -> Stage {
     Stage::Save(name.to_owned())
 }

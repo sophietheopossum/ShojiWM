@@ -6,6 +6,9 @@
 //! [`ShojiWM::image_copy_capture_pending`] alongside enough context to route
 //! it to the right output (or, in Phase 5b-iii, the right toplevel). The
 //! backend drains its share of the queue once per render pass.
+//!
+//! [`ImageCopyCaptureHandler::frame`]: smithay::wayland::image_copy_capture::ImageCopyCaptureHandler::frame
+//! [`ShojiWM::image_copy_capture_pending`]: crate::state::ShojiWM::image_copy_capture_pending
 
 use std::ptr;
 use std::time::Duration;

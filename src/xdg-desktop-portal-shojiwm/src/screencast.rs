@@ -1,6 +1,6 @@
 //! org.freedesktop.impl.portal.ScreenCast backend implementation.
 //!
-//! See: https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.impl.portal.ScreenCast.html
+//! See: <https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.impl.portal.ScreenCast.html>
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

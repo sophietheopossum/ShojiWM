@@ -2480,7 +2480,7 @@ fn cursor_commit_margin_override() -> Option<Duration> {
 }
 
 /// Starting cursor commit margin. The margin adapts upward from here when
-/// misses are *systematic* (see [`CURSOR_MARGIN_MISS_SCORE_BUMP`]); it never
+/// misses are *systematic* (see [`CURSOR_MARGIN_WINDOW_COMMITS`]); it never
 /// decays, so the steady state does not probe the miss boundary and stutter
 /// periodically. A refresh-rate change resets it, since the driver's commit
 /// cutoff is rate/panel-state dependent (measured: ~5ms needed at 60Hz with

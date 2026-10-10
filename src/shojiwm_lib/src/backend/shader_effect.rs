@@ -361,7 +361,7 @@ fn stale_variant_backdrop_key<'a>(key: &'a str, current_backdrop_key: &str) -> O
 
 /// Drops the cached effect state a layer left behind for effect rects it no
 /// longer has: previous sizes, previous stack positions, and the other layer kind.
-/// The most recently used other variant is kept (see [`most_recent_variant`]).
+/// The most recently used other variant is kept (see `most_recent_variant`).
 ///
 /// Both caches have to go together. The texture in `layer_backdrop_cache` is a
 /// clone of the shared pipeline's finish target (a `GlesTexture` is an `Arc`), so
@@ -6142,8 +6142,8 @@ pub fn preblur_backdrop_texture(
 /// - `pyramid[0]` — output texture, same size as `source`
 /// - `pyramid[1..=passes]` — progressively halved intermediates
 ///
-/// Each render: source → pyramid[1] → … → pyramid[passes] (down) →
-/// pyramid[passes-1] → … → pyramid[0] (up).
+/// Each render: source → `pyramid[1]` → … → `pyramid[passes]` (down) →
+/// `pyramid[passes-1]` → … → `pyramid[0]` (up).
 fn preblur_using_pyramid(
     renderer: &mut GlesRenderer,
     source: GlesTexture,
