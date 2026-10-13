@@ -7,20 +7,17 @@
 # ShojiWM xdg-desktop-portal backend unless --no-portal is passed.
 #
 # With --rust-config the compositor is the Rust config example
-# (src/shojiwm_rs/examples/default_config) instead of the TypeScript build.
-# The rest is installed the same way, except that the TypeScript runtime files
-# under /usr/lib/shojiwm are only installed when missing: a Rust compositor
-# never reads them, and existing ones belong to any TypeScript binary kept
-# beside them. Before /usr/bin/shoji_wm is replaced, a fallback is kept as
-# /usr/lib/shojiwm/shoji_wm.previous: the compositor serving the session the
-# install runs in (the one listening on $WAYLAND_DISPLAY) when it runs
-# /usr/bin/shoji_wm; otherwise the existing shoji_wm.previous, or a copy of
-# /usr/bin/shoji_wm when there is none. From a tty, when the new compositor
-# will not start:
+# (src/shojiwm_rs/examples/default_config) instead of the TypeScript build. It
+# reads its assets from this checkout, so keep the checkout where it is, and it
+# cannot reload in place: a config change needs this script again and takes
+# effect in the next session. The TypeScript runtime files (when missing) and
+# user config are still installed, for switching back; the Rust compositor
+# reads neither. A fallback is kept as /usr/lib/shojiwm/shoji_wm.previous: the
+# /usr/bin/shoji_wm serving the session you install from, else the fallback
+# already there, else the compositor being replaced.
+# If the new one will not start, from a tty:
 #   sudo install -m755 /usr/lib/shojiwm/shoji_wm.previous /usr/bin/shoji_wm
-# A Rust config reads its assets from the checkout it was built in, so keep the
-# checkout where it is. It cannot be reloaded in place: a change takes effect
-# in the next session.
+# An install without --rust-config removes the fallback.
 #
 # Usage:
 #   dist/install.sh
@@ -70,15 +67,30 @@ if [[ -n "$EXPECT_RUNTIME" && $RUST_CONFIG -eq 0 ]]; then
 fi
 
 if [[ $RUST_CONFIG -eq 1 ]]; then
-    # One --rust-config install at a time, whichever checkout it runs from:
-    # the staging names below are fixed. Long-lived children (a build server
-    # cargo starts, say) get the lock fd closed, so it ends with this script.
-    LOCK="${XDG_RUNTIME_DIR:-/tmp}/shojiwm-install-$(id -u).lock"
-    exec 9>>"$LOCK"
-    if ! flock -n 9; then
-        echo "another dist/install.sh --rust-config is running" >&2
+    # One --rust-config install per user at a time, whichever checkout it runs
+    # from: the staging names below are fixed.
+    LOCK_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if [[ ! -d "$LOCK_DIR" ]]; then
+        LOCK_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
+        mkdir -p "$LOCK_DIR"
+    fi
+    LOCK="${LOCK_DIR%/}/shojiwm-install-$(id -u).lock"
+    if ! exec 9>>"$LOCK"; then
+        echo "could not open the install lock $LOCK" >&2
         exit 1
     fi
+    flock -n 9 || {
+        RC=$?
+        if [[ $RC -eq 1 ]]; then
+            echo "another dist/install.sh --rust-config is running" >&2
+        else
+            echo "could not lock $LOCK (flock exited $RC)" >&2
+        fi
+        exit 1
+    }
+    # cargo can leave long-lived children (a build server, say): they must
+    # not inherit the lock, so that it ends with this script.
+    function cargo { command cargo "$@" 9<&-; }
 fi
 
 # --dev selects the release-fast profile; binaries land in a different
@@ -90,17 +102,32 @@ if [[ $DEV -eq 1 ]]; then
     PROFILE_FLAG="--profile release-fast"
 fi
 
+if [[ $RUST_CONFIG -eq 1 ]]; then
+    # Install from cargo's target directory: CARGO_TARGET_DIR or a
+    # build.target-dir setting moves it, and a stale build left in target/
+    # must not be installed instead. (The <triple>/ level that a build.target
+    # setting adds is not followed.) Asked before the build, so that a missing
+    # tool fails before a long compile rather than after it.
+    TARGET_DIR="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+        | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])' \
+            2>/dev/null || true)"
+    if [[ "$TARGET_DIR" != /* ]]; then
+        echo "could not ask cargo for its target directory" >&2
+        echo "this needs python3, and cargo metadata --format-version 1 --no-deps has to succeed" >&2
+        exit 1
+    fi
+fi
+
 if [[ $BUILD -eq 1 ]]; then
+    CARGO_ARGS=($PROFILE_FLAG -p shoji_wm)
+    if [[ $INSTALL_PORTAL -eq 1 ]]; then
+        CARGO_ARGS+=(-p xdg-desktop-portal-shojiwm)
+    fi
+    HEAP_DEBUG_FEATURE=shoji_wm/heap-debug
     if [[ $RUST_CONFIG -eq 1 ]]; then
         # The example is the compositor with the Rust config compiled in.
         CARGO_ARGS=($PROFILE_FLAG -p shojiwm_rs --example default_config)
         HEAP_DEBUG_FEATURE=shojiwm_lib/heap-debug
-    else
-        CARGO_ARGS=($PROFILE_FLAG -p shoji_wm)
-        HEAP_DEBUG_FEATURE=shoji_wm/heap-debug
-        if [[ $INSTALL_PORTAL -eq 1 ]]; then
-            CARGO_ARGS+=(-p xdg-desktop-portal-shojiwm)
-        fi
     fi
     if [[ $DEBUG -eq 1 ]]; then
         # Hardened mimalloc (guard pages, encoded free lists): heap
@@ -113,12 +140,12 @@ if [[ $BUILD -eq 1 ]]; then
         export CARGO_PROFILE_RELEASE_FAST_DEBUG=true
     fi
     echo ">> cargo build ${CARGO_ARGS[*]}"
-    cargo build "${CARGO_ARGS[@]}" 9<&-
+    cargo build "${CARGO_ARGS[@]}"
     if [[ $RUST_CONFIG -eq 1 && $INSTALL_PORTAL -eq 1 ]]; then
         # --example limits a build to example targets, so the portal's
         # binary needs a build of its own.
         echo ">> cargo build $PROFILE_FLAG -p xdg-desktop-portal-shojiwm"
-        cargo build $PROFILE_FLAG -p xdg-desktop-portal-shojiwm 9<&-
+        cargo build $PROFILE_FLAG -p xdg-desktop-portal-shojiwm
     fi
 fi
 
@@ -126,13 +153,6 @@ SHOJI_BIN="$REPO_ROOT/target/$PROFILE_DIR/shoji_wm"
 SHOJI_BUILD="cargo build $PROFILE_FLAG -p shoji_wm"
 PORTAL_BIN="$REPO_ROOT/target/$PROFILE_DIR/xdg-desktop-portal-shojiwm"
 if [[ $RUST_CONFIG -eq 1 ]]; then
-    # Install from wherever cargo builds: CARGO_TARGET_DIR or a
-    # build.target-dir setting moves it, and a stale build left in target/
-    # must not be installed instead.
-    TARGET_DIR="$(cargo metadata --format-version 1 --no-deps 2>/dev/null 9<&- \
-        | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])' \
-            2>/dev/null || true)"
-    : "${TARGET_DIR:=${CARGO_TARGET_DIR:-$REPO_ROOT/target}}"
     SHOJI_BIN="$TARGET_DIR/$PROFILE_DIR/examples/default_config"
     SHOJI_BUILD="cargo build $PROFILE_FLAG -p shojiwm_rs --example default_config"
     PORTAL_BIN="$TARGET_DIR/$PROFILE_DIR/xdg-desktop-portal-shojiwm"
@@ -144,43 +164,6 @@ if [[ ! -x "$SHOJI_BIN" ]]; then
     exit 1
 fi
 
-if [[ $RUST_CONFIG -eq 1 ]]; then
-    # --version prints "shoji_wm <version> (<runtime>)". A TypeScript build is
-    # not a Rust config; with --expect-runtime, neither is a Rust config of
-    # another name, such as another branch's build of the example.
-    VERSION_ERR="$(mktemp)"
-    version="$(timeout 5 "$SHOJI_BIN" --version 2>"$VERSION_ERR" 9<&- || true)"
-    version_err="$(head -c 2000 "$VERSION_ERR")"
-    rm -f "$VERSION_ERR"
-    RUNTIME=""
-    if [[ "$version" =~ ^shoji_wm\ [^\ ]+\ \(([^\)]+)\)$ ]]; then
-        RUNTIME="${BASH_REMATCH[1]}"
-    fi
-    if [[ -z "$RUNTIME" ]]; then
-        echo "$SHOJI_BIN did not answer --version with \"shoji_wm <version> (<runtime>)\"" >&2
-        if [[ -n "$version" ]]; then
-            echo "it printed: $version" >&2
-        fi
-        if [[ -n "$version_err" ]]; then
-            echo "its stderr: $version_err" >&2
-        fi
-        exit 1
-    fi
-    if [[ "$RUNTIME" == typescript ]]; then
-        echo "$SHOJI_BIN is the TypeScript build, not a Rust config" >&2
-        exit 1
-    fi
-    if [[ -n "$EXPECT_RUNTIME" && "$RUNTIME" != "$EXPECT_RUNTIME" ]]; then
-        echo "$SHOJI_BIN is the $RUNTIME config, not $EXPECT_RUNTIME" >&2
-        if [[ $BUILD -eq 0 ]]; then
-            echo "run without --no-build" >&2
-        else
-            echo "this checkout builds the $RUNTIME config; is the right branch checked out?" >&2
-        fi
-        exit 1
-    fi
-fi
-
 if [[ $INSTALL_PORTAL -eq 1 && ! -x "$PORTAL_BIN" ]]; then
     echo "binary not found: $PORTAL_BIN" >&2
     echo "run without --no-build, or run cargo build $PROFILE_FLAG -p xdg-desktop-portal-shojiwm first" >&2
@@ -189,6 +172,40 @@ fi
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
+
+if [[ $RUST_CONFIG -eq 1 ]]; then
+    # --version prints "shoji_wm <version> (<runtime>)"; --expect-runtime
+    # refuses a config of another name, such as another branch's build of the
+    # example. The probe's environment is PATH and a HOME and XDG_RUNTIME_DIR
+    # of its own, so a binary that ignores --version and starts a compositor
+    # cannot join this session, its D-Bus activation environment or its logs.
+    VERSION="$(env -i PATH="$PATH" HOME="$STAGE" XDG_RUNTIME_DIR="$STAGE" \
+        timeout -k 1 5 "$SHOJI_BIN" --version 2>"$STAGE/version.err" 9<&- || true)"
+    VERSION_ERR="$(head -c 2000 "$STAGE/version.err")"
+    RUNTIME=""
+    if [[ "$VERSION" =~ ^shoji_wm\ [^\ ]+\ \(([^\)]+)\)$ ]]; then
+        RUNTIME="${BASH_REMATCH[1]}"
+    fi
+    if [[ -z "$RUNTIME" ]]; then
+        echo "$SHOJI_BIN did not answer --version with \"shoji_wm <version> (<runtime>)\"" >&2
+        if [[ -n "$VERSION" ]]; then
+            echo "it printed: $VERSION" >&2
+        fi
+        if [[ -n "$VERSION_ERR" ]]; then
+            echo "its stderr: $VERSION_ERR" >&2
+        fi
+        exit 1
+    fi
+    if [[ -n "$EXPECT_RUNTIME" && "$RUNTIME" != "$EXPECT_RUNTIME" ]]; then
+        echo "$SHOJI_BIN is the Rust config \"$RUNTIME\", not \"$EXPECT_RUNTIME\"" >&2
+        if [[ $BUILD -eq 0 ]]; then
+            echo "run without --no-build" >&2
+        else
+            echo "this checkout builds \"$RUNTIME\"; is the right branch checked out?" >&2
+        fi
+        exit 1
+    fi
+fi
 
 RUNTIME_STAGE="$STAGE/shojiwm-runtime"
 mkdir -p "$RUNTIME_STAGE/packages" "$RUNTIME_STAGE/tools"
@@ -199,23 +216,23 @@ cp "$REPO_ROOT/tools/decoration-runtime.ts" "$RUNTIME_STAGE/tools/"
 echo ">> installing compositor files (sudo)"
 if [[ $RUST_CONFIG -eq 1 ]]; then
     # The fallback is the compositor serving the session this install runs in:
-    # the process listening on $WAYLAND_DISPLAY. Serving it proves it starts,
-    # even after a reinstall replaced /usr/bin/shoji_wm ("(deleted)"), and its
-    # /proc exe stays readable. Any other shoji_wm (a nested test run, a hung
-    # session on another VT) proves nothing. Every process holding the socket
-    # is checked, since a child can share it. From a tty, with no
-    # WAYLAND_DISPLAY, the fallback already in place is kept.
+    # the process listening on $WAYLAND_DISPLAY. It is known to start, and its
+    # /proc exe stays readable after a reinstall replaced /usr/bin/shoji_wm
+    # ("(deleted)"). Any other shoji_wm (a nested test run, a hung session on
+    # another VT) proves nothing. Every process holding the socket is checked,
+    # since a child can share it. From a tty, with no WAYLAND_DISPLAY, the
+    # fallback already in place is kept.
     PREVIOUS_SRC=""
     if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-        socket="$WAYLAND_DISPLAY"
-        if [[ "$socket" != /* ]]; then
-            runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-            socket="${runtime_dir%/}/$socket"
+        SOCKET="$WAYLAND_DISPLAY"
+        if [[ "$SOCKET" != /* ]]; then
+            SOCKET_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+            SOCKET="${SOCKET_DIR%/}/$SOCKET"
         fi
-        for pid in $(ss -xlpn 2>/dev/null | awk -v s="$socket" '$5 == s { print; exit }' \
+        for pid in $(ss -xlpn | awk -v s="$SOCKET" '$5 == s { print; exit }' \
                 | grep -o 'pid=[0-9]*' | cut -d= -f2 || true); do
-            exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
-            if [[ "${exe%" (deleted)"}" == /usr/bin/shoji_wm ]]; then
+            EXE="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+            if [[ "${EXE%" (deleted)"}" == /usr/bin/shoji_wm ]]; then
                 PREVIOUS_SRC="/proc/$pid/exe"
                 break
             fi
@@ -248,23 +265,22 @@ if [[ $RUST_CONFIG -eq 1 ]]; then
         echo "install failed; /usr/bin/shoji_wm left as it was" >&2
         exit 1
     fi
-    if ! sudo mv -f /usr/bin/.shoji_wm.new /usr/bin/shoji_wm; then
+    # The fallback goes first: a run that stops between the two renames has
+    # lost at most the old fallback, which a finished run replaces as well.
+    if [[ -n "$PREVIOUS_SRC" ]] \
+        && ! sudo mv -f /usr/lib/shojiwm/.shoji_wm.previous.new /usr/lib/shojiwm/shoji_wm.previous; then
         sudo rm -f /usr/bin/.shoji_wm.new /usr/lib/shojiwm/.shoji_wm.previous.new || true
+        echo "could not replace /usr/lib/shojiwm/shoji_wm.previous; nothing was changed" >&2
+        exit 1
+    fi
+    if ! sudo mv -f /usr/bin/.shoji_wm.new /usr/bin/shoji_wm; then
+        sudo rm -f /usr/bin/.shoji_wm.new || true
         echo "could not replace /usr/bin/shoji_wm; it was left as it was" >&2
         exit 1
     fi
-    # The fallback changes only once the new binary is in place.
-    if [[ -n "$PREVIOUS_SRC" ]] \
-        && ! sudo mv -f /usr/lib/shojiwm/.shoji_wm.previous.new /usr/lib/shojiwm/shoji_wm.previous; then
-        echo "the new compositor is installed, but its fallback is still" >&2
-        echo "/usr/lib/shojiwm/.shoji_wm.previous.new. Keep it before the next install, which clears it:" >&2
-        echo "  sudo mv /usr/lib/shojiwm/.shoji_wm.previous.new /usr/lib/shojiwm/shoji_wm.previous" >&2
-        exit 1
-    fi
     # The TypeScript runtime files are installed only when missing: a Rust
-    # compositor never reads them, and existing ones belong to the TypeScript
-    # binaries kept beside them (shoji_wm.typescript, or a TypeScript
-    # shoji_wm.previous). A user config created below links to them.
+    # compositor never reads them, and existing ones may belong to a
+    # TypeScript shoji_wm.previous. A user config created below links to them.
     if [[ ! -e /usr/lib/shojiwm/packages/shoji_wm ]]; then
         sudo cp -a "$RUNTIME_STAGE/." /usr/lib/shojiwm/
     fi
@@ -355,7 +371,9 @@ fi
 echo ""
 echo "done."
 if [[ $RUST_CONFIG -eq 1 ]]; then
-    echo "Installed the $RUNTIME Rust config: log out and back in to run it."
+    echo "Installed the Rust config ($RUNTIME)."
+    echo "Development run: cargo run -p shojiwm_rs --example default_config --profile release-fast"
+    echo "Installed run: select ShojiWM in your display manager (log out first if it is running), or run: shoji_wm --tty"
     if [[ -x /usr/lib/shojiwm/shoji_wm.previous ]]; then
         echo "If it will not start, from a tty:"
         echo "  sudo install -m755 /usr/lib/shojiwm/shoji_wm.previous /usr/bin/shoji_wm"
