@@ -71,7 +71,7 @@ fn mark_toplevel_metadata_dirty(
         .window_decorations
         .get(&window)
         .map(|cached| &cached.snapshot);
-    info!(
+    debug!(
         window_id = %snapshot.id,
         title = %snapshot.title,
         cached_title = ?cached_snapshot.map(|snapshot| snapshot.title.as_str()),
