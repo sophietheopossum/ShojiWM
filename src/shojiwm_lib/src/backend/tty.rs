@@ -288,6 +288,19 @@ fn ratchet_frame_target(
     }
 }
 
+/// The vblank time a flip event carries, when the driver gave one.
+///
+/// A zero timestamp is no timestamp: amdgpu reports one for the flip that follows a
+/// modeset (after another output was unplugged, say). Taken at face value it is a vblank
+/// at boot time. Every "did the driver timestamp this flip" decision goes through here,
+/// so the exact-target path, the grid input and the presentation flags cannot disagree.
+fn flip_timestamp(time: DrmEventTime) -> Option<Duration> {
+    match time {
+        DrmEventTime::Monotonic(tp) if !tp.is_zero() => Some(tp),
+        _ => None,
+    }
+}
+
 /// The vblank a flip observed at `observed` completed at, and the next frame's presentation
 /// time after it.
 ///
@@ -2291,8 +2304,8 @@ fn drivers_take_part_in_implicit_sync(drivers: &[Option<String>]) -> bool {
 #[cfg(test)]
 mod vblank_grid_tests {
     use super::{
-        VBLANK_GRID_HISTORY, next_frame_after_flip, ratchet_frame_target,
-        sanitize_next_frame_target, vblank_grid,
+        DrmEventTime, VBLANK_GRID_HISTORY, flip_timestamp, next_frame_after_flip,
+        ratchet_frame_target, sanitize_next_frame_target, vblank_grid,
     };
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -2419,6 +2432,22 @@ mod vblank_grid_tests {
         assert!(
             (predicted - expected).abs() < 1.0,
             "predicted {predicted} us"
+        );
+    }
+
+    /// amdgpu reports a zero timestamp for the flip after a modeset. It must count as
+    /// untimestamped (grid path), never as an exact vblank at boot time; only a nonzero
+    /// monotonic timestamp is the vblank itself.
+    #[test]
+    fn a_zero_driver_timestamp_is_no_timestamp() {
+        assert_eq!(flip_timestamp(DrmEventTime::Monotonic(Duration::ZERO)), None);
+        assert_eq!(
+            flip_timestamp(DrmEventTime::Realtime(std::time::SystemTime::UNIX_EPOCH)),
+            None
+        );
+        assert_eq!(
+            flip_timestamp(DrmEventTime::Monotonic(us(1_000_000.0))),
+            Some(us(1_000_000.0))
         );
     }
 }
@@ -2584,16 +2613,9 @@ fn frame_finish(
         .as_ref()
         .map(|metadata| metadata.sequence)
         .unwrap_or(0);
-    // A zero timestamp is no timestamp: amdgpu reports one for the flip that follows a
-    // modeset (after another output was unplugged, say). Taken at face value it is a vblank
-    // at boot time, and the grid below underflowed on it.
-    let presentation_clock = metadata
-        .as_ref()
-        .and_then(|metadata| match metadata.time {
-            DrmEventTime::Monotonic(tp) if !tp.is_zero() => Some(tp),
-            _ => None,
-        })
-        .unwrap_or_else(|| Duration::from(state.clock.now()));
+    let driver_timestamp = metadata.as_ref().and_then(|m| flip_timestamp(m.time));
+    let presentation_clock =
+        driver_timestamp.unwrap_or_else(|| Duration::from(state.clock.now()));
     // The next frame's presentation time. It is what frame callbacks report and what
     // frame-driven runtime work (kinetic scrolling) is stamped with, so it has to advance
     // by whole refresh periods. With a driver timestamp `presentation_clock` is the vblank
@@ -2601,9 +2623,7 @@ fn frame_finish(
     // dispatched — late by however long the main thread was busy. Stepping a glide by those
     // gaps (8, 12, 10.7, 10 ms while the display flipped every 8.33) was the judder in
     // kinetic scrolling, so there the target comes from the output's vblank grid instead.
-    let timestamped = metadata
-        .as_ref()
-        .is_some_and(|metadata| matches!(metadata.time, DrmEventTime::Monotonic(_)));
+    let timestamped = driver_timestamp.is_some();
     if !timestamped {
         if surface.vblank_observations.len() == VBLANK_GRID_HISTORY {
             surface.vblank_observations.pop_front();
@@ -2717,10 +2737,7 @@ fn frame_finish(
     if let Ok(user_data) = submit_result {
         let clock = presentation_clock;
         let sequence = present_sequence;
-        let flags = if metadata
-            .as_ref()
-            .is_some_and(|metadata| matches!(metadata.time, DrmEventTime::Monotonic(_)))
-        {
+        let flags = if timestamped {
             wp_presentation_feedback::Kind::Vsync
                 | wp_presentation_feedback::Kind::HwClock
                 | wp_presentation_feedback::Kind::HwCompletion
