@@ -9052,7 +9052,7 @@ COMPOSITOR.window.composition = () => <Label text="x" />;
             .expect("a stopped runtime should not error on key bindings");
         assert!(!quiet.invoked);
         let tick = evaluator
-            .scheduler_tick(4.0)
+            .scheduler_tick(4.0, None, &[])
             .expect("a stopped runtime should not error on ticks");
         assert!(!tick.dirty);
         assert!(started.elapsed() < Duration::from_millis(100));
@@ -9467,7 +9467,7 @@ import {{ createIpcServer }} from "shoji_wm/ipc";
 const ipc = createIpcServer({socket_literal});
 const steps: number[] = [];
 COMPOSITOR.key.bind("start", "Super+K", () => {{
-  createPoll(1000 / 120, (handle) => {{ steps.push(handle.nowMs); }});
+  createPoll(1000 / 120, (handle) => {{ steps.push(handle.nowMs); }}, {{ output: () => undefined }});
 }});
 COMPOSITOR.key.bind("noop", "Super+N", () => {{}});
 ipc.handle("steps", () => steps);
@@ -9485,7 +9485,9 @@ COMPOSITOR.window.composition = () => <Box />;
         for turn in turns {
             match *turn {
                 Turn::Tick(now_ms) => {
-                    evaluator.scheduler_tick(now_ms).expect("tick should succeed");
+                    evaluator
+                        .scheduler_tick(now_ms, None, &[])
+                        .expect("tick should succeed");
                 }
                 Turn::Request(now_ms) => {
                     evaluator
@@ -9552,8 +9554,10 @@ COMPOSITOR.window.composition = () => <Box />;
         let _fd_count = lock_process_fd_count();
         let frame = |k: f64| 1000.0 + k * FRAME_MS;
         // Frame 3 was missed: no tick for it. A wake lands at wall time
-        // 9 ms after the last stepped frame, then frame 4 ticks.
-        let wall_wake = frame(2.0) + 9.0;
+        // 11 ms after the last stepped frame, then frame 4 ticks. (Later
+        // than one floored interval plus the due tolerance before frame 4,
+        // so the wake's step still leaves the poll not due at frame 4.)
+        let wall_wake = frame(2.0) + 11.0;
         let steps = poll_steps_with_wake_ticks(
             "missed-frame-wall",
             &[
@@ -9768,7 +9772,9 @@ COMPOSITOR.window.composition = () => <Box />;
         let mut ids = folded[0].1.clone();
         ids.sort();
         assert_eq!(ids, ["0xa", "0xb"], "no window lost: {folded:?}");
-        evaluator.scheduler_tick(400.0).expect("tick should succeed");
+        evaluator
+            .scheduler_tick(400.0, None, &[])
+            .expect("tick should succeed");
         assert!(no_desktop_keys(&bound(&published_key_bindings(&evaluator))));
         assert!(
             !evaluator
@@ -9810,7 +9816,9 @@ COMPOSITOR.window.composition = () => <Box />;
             ipc.request("settings.apply", fixture(true)),
             serde_json::json!({ "ok": true })
         );
-        reloaded.scheduler_tick(600.0).expect("tick should succeed");
+        reloaded
+            .scheduler_tick(600.0, None, &[])
+            .expect("tick should succeed");
         assert!(has_desktop_keys(&bound(&published_key_bindings(&reloaded))));
 
         drop(ipc);
