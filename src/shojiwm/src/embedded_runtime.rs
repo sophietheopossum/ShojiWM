@@ -3260,6 +3260,8 @@ impl EmbeddedRuntime {
             NativeInteractionRequest::GestureSwipeAsync { .. } => "gestureSwipeAsync",
             NativeInteractionRequest::WindowMove { .. } => "windowMove",
             NativeInteractionRequest::WindowResize { .. } => "windowResize",
+            NativeInteractionRequest::PointerRegion { .. } => "pointerRegion",
+            NativeInteractionRequest::InputGrab { .. } => "inputGrab",
         });
         self.send(BridgeRequest::Interaction(request), kind, None)
     }
