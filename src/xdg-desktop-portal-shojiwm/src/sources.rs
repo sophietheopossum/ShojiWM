@@ -268,11 +268,10 @@ impl Dispatch<wl_output::WlOutput, ()> for AppData {
         match event {
             wl_output::Event::Name { name } => cur.name = name,
             wl_output::Event::Description { description } => cur.description = description,
-            wl_output::Event::Geometry { transform, .. } => {
-                if let WEnum::Value(transform) = transform {
-                    cur.transform = transform;
-                }
-            }
+            wl_output::Event::Geometry {
+                transform: WEnum::Value(transform),
+                ..
+            } => cur.transform = transform,
             wl_output::Event::Mode {
                 flags,
                 width,
