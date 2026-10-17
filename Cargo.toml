@@ -8,6 +8,11 @@ members = [
     "src/xdg-desktop-portal-shojiwm",
 ]
 
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
 # Iteration profile for the edit-test loop: same optimization level, but
 # parallel codegen, no LTO, and incremental rebuilds. Runtime perf is close
 # enough for testing; benchmark and tag releases with `release` only.
@@ -30,3 +35,12 @@ debug = "line-tables-only"
 # the fastest possible edit-rebuild loop.
 [profile.dev.package."*"]
 opt-level = 3
+
+# Build against the sibling smithay checkout (MinkaDE/smithay, i.e. `master`)
+# rather than the rev pinned in src/shojiwm/Cargo.toml. The pin is left alone so
+# this branch keeps matching the PR branches line for line; delete this section
+# to build a standalone checkout. dist/install.sh builds from the repo root, so
+# ../smithay resolves in the MinkaDE layout.
+[patch."https://github.com/sophietheopossum/smithay.git"]
+smithay = { path = "../smithay" }
+smithay-drm-extras = { path = "../smithay/smithay-drm-extras" }
