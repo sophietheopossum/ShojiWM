@@ -292,7 +292,7 @@ pub(crate) fn encode_pixel(premultiplied: [u8; 3], alpha: u8, params: &EncodePar
     let a = alpha as f32 / 255.0;
     let linear = premultiplied.map(|value| {
         let encoded = (value as f32 / 255.0 / a).min(1.0);
-        encoded.powf(params.sdr_gamma)
+        crate::backend::hdr_pipeline::sdr_eotf(encoded, params.sdr_gamma, params.black_k())
     });
     let m = &params.compositing_to_bt2020;
     let mut out = [0u8; 3];
@@ -337,6 +337,7 @@ mod tests {
         EncodeParams {
             sdr_nits: 203.0,
             sdr_gamma: 2.2,
+            sdr_black_nits: 0.1,
             peak_nits: 1000.0,
             compositing_to_bt2020: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         }
@@ -349,8 +350,11 @@ mod tests {
     }
 
     #[test]
-    fn black_and_transparent_stay_zero() {
-        assert_eq!(encode_pixel([0, 0, 0], 255, &params()), [0, 0, 0]);
+    fn black_lands_on_the_sdr_pedestal_and_transparent_stays_zero() {
+        // Code 0 is the authored SDR black, 0.1 cd/m² at the default:
+        // PQ(0.1) * 255 = 15.9. The cursor must match the composite it
+        // replaces, pedestal included.
+        assert_eq!(encode_pixel([0, 0, 0], 255, &params()), [16, 16, 16]);
         let memory = encode_pixels(&[0, 0, 0, 0], Fourcc::Argb8888, 1, 1, 4, &OutputEncoding::Pq(params())).unwrap();
         assert_eq!(&memory[..], &[0, 0, 0, 0]);
     }
@@ -369,7 +373,8 @@ mod tests {
         params.compositing_to_bt2020 = [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let memory = encode_pixels(&[255, 0, 0, 255], Fourcc::Abgr8888, 1, 1, 4, &OutputEncoding::Pq(params)).unwrap();
         assert_eq!(memory.format(), Fourcc::Argb8888);
-        assert_eq!(&memory[..], &[0, 148, 0, 255]);
+        // Blue carries only the source-black pedestal (PQ(0.1) * 255 = 15.9).
+        assert_eq!(&memory[..], &[16, 148, 0, 255]);
     }
 
     #[test]
@@ -377,6 +382,6 @@ mod tests {
         // Two 1-pixel rows with 4 bytes of padding each.
         let pixels = [255, 255, 255, 255, 9, 9, 9, 9, 0, 0, 0, 255, 9, 9, 9, 9];
         let memory = encode_pixels(&pixels, Fourcc::Argb8888, 1, 2, 8, &OutputEncoding::Pq(params())).unwrap();
-        assert_eq!(&memory[..], &[148, 148, 148, 255, 0, 0, 0, 255]);
+        assert_eq!(&memory[..], &[148, 148, 148, 255, 16, 16, 16, 255]);
     }
 }

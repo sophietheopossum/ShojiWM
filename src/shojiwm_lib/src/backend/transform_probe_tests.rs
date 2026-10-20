@@ -506,8 +506,9 @@ fn hdr_pipeline_keeps_the_direct_render_orientation() {
 }
 
 /// The HDR encode carries compositing-space values past SDR white up to the
-/// display's peak: 1.0 is SDR white, 2.0 a highlight (2^2.2 x SDR white), and
-/// anything brighter than the peak clamps to it rather than to SDR white.
+/// display's peak: 1.0 is SDR white, 2.0 a highlight (the SDR EOTF of 2.0 x
+/// SDR white), and anything brighter than the peak clamps to it rather than
+/// to SDR white.
 #[test]
 fn hdr_encode_extends_past_sdr_white_to_the_display_peak() {
     use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
@@ -588,10 +589,11 @@ fn hdr_encode_extends_past_sdr_white_to_the_display_peak() {
     // PQ levels apart (~0.58, ~0.75, ~0.75).
     let red_at = |x: i32| f32::from(bytes[(5 * 30 + x) as usize * 4]) / 255.0;
     let pq = |nits: f32| crate::color::colorimetry::pq_inverse_eotf(nits as f64) as f32;
-    let gamma = crate::backend::hdr_pipeline::sdr_reference_gamma();
+    let params = crate::backend::hdr_pipeline::EncodeParams::new(SDR_WHITE, PEAK, crate::color::primaries::SRGB);
+    let eotf = |c: f32| crate::backend::hdr_pipeline::sdr_eotf(c, params.sdr_gamma, params.black_k());
     let expected = [
-        pq(SDR_WHITE),
-        pq((2f32.powf(gamma) * SDR_WHITE).min(PEAK)),
+        pq(eotf(1.0) * SDR_WHITE),
+        pq((eotf(2.0) * SDR_WHITE).min(PEAK)),
         pq(PEAK),
     ];
     for (index, expected) in expected.into_iter().enumerate() {
@@ -705,7 +707,22 @@ fn hdr_encode_takes_compositing_primaries_into_bt2020() {
     };
     for primaries in [SRGB, native] {
         let matrix = chromaticity_conversion_matrix(primaries, BT2020);
-        let expected = [0, 1, 2].map(|row| pq_inverse_eotf(matrix[row][0].max(0.0) * 203.0) as f32);
+        // Green and blue decode from code 0, which is the source-black
+        // pedestal now, not zero — they contribute through the matrix too.
+        let params = crate::backend::hdr_pipeline::EncodeParams::new(203.0, 1000.0, primaries);
+        let linear = [1.0f32, 0.0, 0.0].map(|c| {
+            f64::from(crate::backend::hdr_pipeline::sdr_eotf(
+                c,
+                params.sdr_gamma,
+                params.black_k(),
+            ))
+        });
+        let expected = [0, 1, 2].map(|row| {
+            let nits = (0..3)
+                .map(|col| matrix[row][col] * linear[col])
+                .sum::<f64>();
+            pq_inverse_eotf(nits.max(0.0) * 203.0) as f32
+        });
         let got = encode_solid(&mut renderer, [1.0, 0.0, 0.0], primaries);
         for channel in 0..3 {
             assert!(
@@ -835,8 +852,20 @@ fn hdr_cursor_cpu_encode_matches_the_encode_pass() {
     };
     for primaries in [SRGB, native] {
         let params = crate::backend::hdr_pipeline::EncodeParams::new(203.0, 1000.0, primaries);
-        for pixel in [[255u8, 255, 255], [128, 128, 128], [200, 40, 90], [10, 230, 60]] {
-            let gpu = encode_solid(&mut renderer, pixel.map(|value| value as f32 / 255.0), primaries);
+        // [2, 1, 10] sits in the pedestal's bend, where GPU and CPU curves
+        // are most likely to drift apart.
+        for pixel in [
+            [255u8, 255, 255],
+            [128, 128, 128],
+            [200, 40, 90],
+            [10, 230, 60],
+            [2, 1, 10],
+        ] {
+            let gpu = encode_solid(
+                &mut renderer,
+                pixel.map(|value| value as f32 / 255.0),
+                primaries,
+            );
             let cpu = crate::backend::hdr_cursor::encode_pixel(pixel, 255, &params);
             for channel in 0..3 {
                 assert!(

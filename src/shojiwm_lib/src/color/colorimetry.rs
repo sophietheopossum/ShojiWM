@@ -264,12 +264,21 @@ mod tests {
     /// as separate transfer functions precisely because they are not the same
     /// curve.
     ///
+    /// The bare power law that replaced it still ran to true black, which no
+    /// SDR display does either: BT.1886 anchors code 0 at the source black
+    /// level, and without that pedestal near-black step *ratios* survive into
+    /// PQ at full strength — the dark-scene blocks at (2,1,10) and (0,1,16)
+    /// sat 2.5x apart in luminance against 1.11x over a laptop floor, subtle
+    /// there and plainly blocky on the TV (20/10/2026). The pedestal form
+    /// below is 1.14x. That ratio, not any single code's landing spot, is
+    /// what this test exists to hold.
+    ///
     /// Note this pins the default for UNTAGGED surfaces. A client that binds
     /// `wp_color_manager_v1` and declares TRANSFER_FUNCTION_SRGB must still be
     /// decoded piecewise — that is a different question from what an untagged
     /// 8-bit desktop buffer means.
     #[test]
-    fn sdr_eotf_is_pure_gamma_not_the_srgb_toe() {
+    fn sdr_eotf_is_bt1886_not_the_srgb_toe() {
         fn piecewise(c: f64) -> f64 {
             if c <= 0.04045 {
                 c / 12.92
@@ -281,41 +290,81 @@ mod tests {
             pq_inverse_eotf(eotf(encoded) * 203.0) * 1023.0
         }
 
-        let gamma = crate::backend::hdr_pipeline::sdr_reference_gamma() as f64;
+        let gamma = crate::backend::hdr_pipeline::sdr_reference_gamma();
         assert!(
             (gamma - 2.2).abs() < 1e-6,
             "default SDR gamma changed: {gamma}"
         );
+        // Pin the defaults the numbers below are computed against, so an
+        // env override in the test environment fails loudly here instead of
+        // producing a confusing mismatch further down. (They are OnceLock-
+        // cached; the values are the compiled-in defaults when unset.)
+        let black = crate::backend::hdr_pipeline::sdr_black_nits();
+        assert!(
+            (black - 0.1).abs() < 1e-6,
+            "default SDR black changed: {black}"
+        );
+        let k = crate::backend::hdr_pipeline::sdr_black_k(black, 203.0, gamma);
+        let bt1886 = |c: f64| crate::backend::hdr_pipeline::sdr_eotf(c as f32, gamma, k) as f64;
 
-        // Code 3 is where dark-scene artefacts live.
+        // Code 0 is the authored SDR black itself: PQ(0.1 cd/m2) = 63.8.
+        let code0 = to_pq10(0.0, bt1886);
+        assert!(
+            (code0 - 63.8).abs() < 1.0,
+            "sRGB code 0 should land on the 0.1 cd/m2 pedestal at PQ10 ~63.8, got {code0}"
+        );
+        assert!(
+            to_pq10(0.0, piecewise) < 0.01,
+            "sanity: the rejected piecewise toe still runs to true black"
+        );
+
+        // Code 3 is where dark-scene artefacts live. It sits just above the
+        // pedestal now (0.198 cd/m2), not at the bare power law's 23.6.
         let code3 = 3.0 / 255.0;
-        let with_gamma = to_pq10(code3, |c| c.powf(gamma));
-        let with_toe = to_pq10(code3, piecewise);
+        let with_1886 = to_pq10(code3, bt1886);
         assert!(
-            (with_gamma - 23.6).abs() < 1.0,
-            "sRGB code 3 should reach PQ10 ~23.6 under gamma {gamma}, got {with_gamma}"
-        );
-        assert!(
-            with_toe > 80.0,
-            "sanity: the rejected piecewise toe should still land above PQ10 80, got {with_toe}"
-        );
-        assert!(
-            with_toe / with_gamma > 3.0,
-            "the toe is the amplifier; ratio collapsed to {}",
-            with_toe / with_gamma
+            (with_1886 - 84.3).abs() < 1.0,
+            "sRGB code 3 should reach PQ10 ~84.3 under the BT.1886 form, got {with_1886}"
         );
 
-        // The two curves must still agree once out of the shadows, otherwise
-        // the change is not confined to near-black as claimed.
+        // The point of the pedestal: neighbouring compression blocks in a
+        // real dark frame stay close in luminance, as they do on the SDR
+        // panel they were authored on. The bare power law puts them 2.5x
+        // apart; over a 0.25 cd/m2 laptop floor they measure 1.11x.
+        let lum = |rgb: [u8; 3], eotf: &dyn Fn(f64) -> f64| {
+            [0.2126, 0.7152, 0.0722]
+                .into_iter()
+                .zip(rgb)
+                .map(|(w, c)| w * eotf(f64::from(c) / 255.0))
+                .sum::<f64>()
+                * 203.0
+        };
+        let gamma64 = f64::from(gamma);
+        let ratio_1886 = lum([0, 1, 16], &bt1886) / lum([2, 1, 10], &bt1886);
+        let ratio_bare =
+            lum([0, 1, 16], &|c: f64| c.powf(gamma64)) / lum([2, 1, 10], &|c: f64| c.powf(gamma64));
+        assert!(
+            ratio_bare > 2.4,
+            "sanity: the bare power law still separates the blocks, got {ratio_bare}"
+        );
+        assert!(
+            ratio_1886 < 1.25,
+            "pedestal stopped compressing near-black steps: ratio {ratio_1886}"
+        );
+
+        // Anchored at white: out of the shadows the form must not wander
+        // far from the curve it replaced (worst at mid-grey, ~8 PQ10 codes
+        // from the piecewise decode, nil at 255).
         for code in [128.0, 200.0, 255.0] {
             let encoded = code / 255.0;
-            let g = to_pq10(encoded, |c| c.powf(gamma));
+            let g = to_pq10(encoded, bt1886);
             let t = to_pq10(encoded, piecewise);
             assert!(
-                (g - t).abs() < 3.0,
-                "curves diverge at code {code}: gamma {g} vs piecewise {t}"
+                (g - t).abs() < 9.0,
+                "curves diverge at code {code}: BT.1886 {g} vs piecewise {t}"
             );
         }
+        assert!((to_pq10(1.0, bt1886) - to_pq10(1.0, piecewise)).abs() < 0.5);
     }
 
     #[test]
