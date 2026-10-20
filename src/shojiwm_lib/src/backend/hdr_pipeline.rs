@@ -7,8 +7,9 @@
 //! screencopy, so damage semantics are identical.
 //!
 //! Stage 2 hands the DRM pass a single [`HdrEncodeElement`] that draws the
-//! intermediate through `output_encode.frag`: SDR EOTF decode (pure gamma,
-//! not the piecewise sRGB curve — see the shader) →
+//! intermediate through `output_encode.frag`: SDR EOTF decode (BT.1886 form:
+//! a power law over a source-black pedestal, not the piecewise sRGB curve —
+//! see the shader) →
 //! BT.709→BT.2020 gamut matrix → scale to `sdr_nits` absolute luminance →
 //! ST 2084 (PQ) encode, straight into the 10-bit scanout buffer. The element
 //! carries stage 1's damage, so only what changed is re-encoded.
@@ -80,9 +81,10 @@ pub(crate) fn sdr_reference_nits() -> f32 {
 /// `SHOJI_SDR_GAMMA`, default 2.2.
 ///
 /// 2.2 is sRGB's nominal display gamma. 2.4 is the BT.1886 figure for a dim
-/// viewing environment and is the broadcast convention for television, so it is
-/// worth trying on a TV — it takes the first code off black from PQ 6.6 down to
-/// 3.5, against 51.8 under the piecewise sRGB curve this replaced.
+/// viewing environment and is the broadcast convention for television, so it
+/// is worth trying on a TV: it darkens the shadows overall, though with the
+/// source-black pedestal below it barely changes step ratios down there —
+/// the pedestal is what sets those.
 ///
 /// Clamped to a sane range: below about 1.8 shadows lift again, and above 3.0
 /// they crush to nothing.
@@ -97,6 +99,49 @@ pub(crate) fn sdr_reference_gamma() -> f32 {
     })
 }
 
+/// Black level of the SDR display the content was authored on (cd/m²), from
+/// `SHOJI_SDR_BLACK_NITS`, default 0.1. See [`sdr_eotf`]. 0 restores the old
+/// pure power law to true black.
+pub(crate) fn sdr_black_nits() -> f32 {
+    static BLACK: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *BLACK.get_or_init(|| {
+        std::env::var("SHOJI_SDR_BLACK_NITS")
+            .ok()
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|nits| (0.0..=2.0).contains(nits))
+            .unwrap_or(0.1)
+    })
+}
+
+/// The `k` in the BT.1886-form decode `(k + (1 - k) * c)^gamma`:
+/// `(L_b / L_w)^(1/gamma)`, so code 0 lands on `L_b` and code 1.0 on `L_w`.
+/// 0 when there is no pedestal. Clamped so a black level at or above the
+/// (possibly backlight-dimmed) white cannot degenerate the curve.
+pub fn sdr_black_k(black_nits: f32, white_nits: f32, gamma: f32) -> f32 {
+    if black_nits <= 0.0 || white_nits <= 0.0 {
+        return 0.0;
+    }
+    (black_nits / white_nits).clamp(0.0, 0.99).powf(1.0 / gamma)
+}
+
+/// SDR display EOTF in BT.1886 form: a power law over a source-black pedestal.
+///
+/// The one definition shared by the encode shader (which receives `black_k`
+/// as a uniform and evaluates the same expression), the hardware cursor's
+/// CPU encode, and the tests that pin the curve. `black_k` comes from
+/// [`sdr_black_k`]; passing 0 yields the plain signed power law.
+///
+/// Signed, like the shader: the HDR intermediate extends past [0, 1], with
+/// highlights above 1.0 and out-of-compositing-gamut colours below 0.0. For
+/// negative inputs the expression crosses zero slightly below code 0 and
+/// continues antisymmetrically-ish through it, which only has to stay
+/// monotonic and finite — the gamut matrix that follows decides what those
+/// colours become, and clamps.
+pub fn sdr_eotf(c: f32, gamma: f32, black_k: f32) -> f32 {
+    let x = black_k + (1.0 - black_k) * c;
+    x.signum() * x.abs().powf(gamma)
+}
+
 /// Everything the PQ encode depends on besides the intermediate's pixels.
 /// Shared by the encode pass and the hardware cursor (`hdr_cursor`), which
 /// has to reproduce the pass on the CPU.
@@ -104,6 +149,8 @@ pub(crate) fn sdr_reference_gamma() -> f32 {
 pub struct EncodeParams {
     pub sdr_nits: f32,
     pub sdr_gamma: f32,
+    /// Source SDR display black (cd/m²); see [`sdr_eotf`].
+    pub sdr_black_nits: f32,
     pub peak_nits: f32,
     /// Compositing primaries -> BT.2020, column-major.
     pub compositing_to_bt2020: [f32; 9],
@@ -118,6 +165,7 @@ impl EncodeParams {
         Self {
             sdr_nits: sdr_white_nits,
             sdr_gamma: sdr_reference_gamma(),
+            sdr_black_nits: sdr_black_nits(),
             peak_nits,
             compositing_to_bt2020: crate::color::colorimetry::to_gl_mat3(
                 &crate::color::colorimetry::chromaticity_conversion_matrix(
@@ -126,6 +174,11 @@ impl EncodeParams {
                 ),
             ),
         }
+    }
+
+    /// The pedestal coefficient for these parameters; see [`sdr_black_k`].
+    pub fn black_k(&self) -> f32 {
+        sdr_black_k(self.sdr_black_nits, self.sdr_nits, self.sdr_gamma)
     }
 }
 
@@ -190,6 +243,7 @@ fn ensure_encode_program(renderer: &mut GlesRenderer) -> Result<GlesTexProgram, 
             &[
                 UniformName::new("sdr_nits", UniformType::_1f),
                 UniformName::new("sdr_gamma", UniformType::_1f),
+                UniformName::new("sdr_black_k", UniformType::_1f),
                 UniformName::new("peak_nits", UniformType::_1f),
                 UniformName::new("compositing_to_bt2020", UniformType::Matrix3x3),
             ],
@@ -444,6 +498,7 @@ impl RenderElement<GlesRenderer> for HdrEncodeElement {
             OutputEncoding::Pq(params) => vec![
                 Uniform::new("sdr_nits", params.sdr_nits),
                 Uniform::new("sdr_gamma", params.sdr_gamma),
+                Uniform::new("sdr_black_k", params.black_k()),
                 Uniform::new("peak_nits", params.peak_nits),
                 Uniform::new(
                     "compositing_to_bt2020",
