@@ -20,13 +20,16 @@ uniform float sdr_nits;
 uniform float peak_nits;
 // Display gamma assumed for SDR content. See sdr_eotf below.
 uniform float sdr_gamma;
+// BT.1886 source-black pedestal coefficient: (black/white)^(1/gamma),
+// computed on the CPU (hdr_pipeline::sdr_black_k). See sdr_eotf below.
+uniform float sdr_black_k;
 varying vec2 v_coords;
 
 #if defined(DEBUG_FLAGS)
 uniform float tint;
 #endif
 
-// SDR display EOTF: a pure power law.
+// SDR display EOTF: a power law over a source-black pedestal (BT.1886 form).
 //
 // Deliberately NOT the piecewise IEC 61966-2-1 decode. That curve is the exact
 // inverse of the sRGB *encoding* function, whose linear segment near zero exists
@@ -54,6 +57,19 @@ uniform float tint;
 // colour-management protocol keeps `srgb` and `gamma22` as separate transfer
 // functions precisely because they are not the same curve.
 //
+// The pedestal is the other half of that display light. BT.1886 — the reference
+// SDR display EOTF — does not run its power law to zero either: it anchors code
+// 0 at the display's black level L_b, which compresses the first codes against
+// that floor exactly as a real panel's backlight leakage does. Without it, a
+// pure power law into PQ preserves near-black luminance *ratios* no SDR display
+// ever showed: in a real dark-scene frame the compression blocks at (2,1,10)
+// and (0,1,16) differ 2.5x in luminance through a bare gamma 2.2, against 1.11x
+// once a 0.25 cd/m2 laptop floor is added — which is why they were subtle on the
+// laptop and plainly blocky on the TV (20/10/2026). With L_b = 0.1 cd/m2 the
+// ratio is 1.14x. Code 0 now lands on L_b itself (PQ 63.8/1023 at the default),
+// so letterbox black is the authored SDR black, not the panel's true black;
+// that is the trade, and SHOJI_SDR_BLACK_NITS=0 restores the bare power law.
+//
 // IMPORTANT: this is the right default for UNTAGGED surfaces, which is
 // everything today — no client binds wp_color_manager_v1. A surface that DOES
 // declare TRANSFER_FUNCTION_SRGB must still be decoded piecewise, because then
@@ -61,15 +77,19 @@ uniform float tint;
 // question from what an untagged 8-bit desktop buffer means, and this uniform
 // must not be applied to it blindly once that path goes live.
 //
-// Overridable via SHOJI_SDR_GAMMA; 2.2 is sRGB's nominal display gamma, 2.4 is
-// the BT.1886 figure for a dim viewing environment and suits a television.
+// Overridable via SHOJI_SDR_GAMMA / SHOJI_SDR_BLACK_NITS; 2.2 is sRGB's nominal
+// display gamma, 2.4 is the BT.1886 figure for a dim viewing environment and
+// suits a television.
 //
 // The power is applied to the magnitude with the sign carried through: the
 // intermediate extends past [0, 1] on an HDR output (see `RenderColorTarget`),
 // with highlights above 1.0 and colors outside BT.709 below 0.0, and the same
-// signed curve is what tagged content was encoded with on the way in.
+// signed curve is what tagged content was encoded with on the way in. The
+// affine pedestal form crosses zero slightly below code 0 and stays monotonic
+// through it, which is all those out-of-range values need.
 vec3 sdr_eotf(vec3 c) {
-    return sign(c) * pow(abs(c), vec3(sdr_gamma));
+    vec3 x = vec3(sdr_black_k) + (1.0 - sdr_black_k) * c;
+    return sign(x) * pow(abs(x), vec3(sdr_gamma));
 }
 
 // Linear-light conversion from the compositing space's primaries to BT.2020,
