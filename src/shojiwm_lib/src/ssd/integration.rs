@@ -4922,6 +4922,7 @@ impl ShojiWM {
         self.async_asset_dirty = false;
         self.sync_taskbar_window_states();
         self.sync_popup_dismissals();
+        self.refresh_decoration_hover();
 
         Ok(())
     }
