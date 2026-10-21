@@ -1546,6 +1546,23 @@ impl ShojiWM {
                     return;
                 }
                 if self.runtime_input_grab.is_some() {
+                    // A decoration may open a runtime prompt on mouse-down.
+                    // Smithay already saw that press and installed its implicit
+                    // grab. Deliver its matching release even though the grab
+                    // now takes the button, otherwise later decoration clicks
+                    // remain trapped in the old grab after the prompt closes.
+                    if button_state == ButtonState::Released && pointer.is_grabbed() {
+                        pointer.button(
+                            self,
+                            &ButtonEvent {
+                                button,
+                                state: button_state,
+                                serial,
+                                time: event.time_msec(),
+                            },
+                        );
+                        pointer.frame(self);
+                    }
                     self.input_grab_pointer_button(button, button_state, event.time_msec());
                     return;
                 }
@@ -3358,7 +3375,12 @@ impl ShojiWM {
             return;
         };
         let pos = pointer.current_location();
-        if pointer.is_grabbed() || self.runtime_input_grab.as_ref().is_some_and(|grab| !grab.passes(pos.x, pos.y)) {
+        if pointer.is_grabbed()
+            || self
+                .runtime_input_grab
+                .as_ref()
+                .is_some_and(|grab| !grab.passes(pos.x, pos.y))
+        {
             return;
         }
         self.update_decoration_hover_target(pos);
