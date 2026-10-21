@@ -11,6 +11,7 @@
 //! - `rendering`: blur effects and surface policy
 //! - `events`: compositor events to the window manager; `dock`: proximity
 //! - `decoration`: window chrome and drag tabs
+//! - `wobbly`: wobbly windows while dragging (KWin via dcrey7's port)
 
 pub mod decoration;
 pub mod displays;
@@ -21,6 +22,7 @@ pub mod keybinds;
 pub mod rendering;
 pub mod session;
 pub mod settings;
+pub mod wobbly;
 pub mod workspace_ipc;
 
 use serde_json::{Value, json};

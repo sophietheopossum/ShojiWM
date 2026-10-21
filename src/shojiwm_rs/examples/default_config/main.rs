@@ -32,7 +32,7 @@ use shojiwm_rs::prelude::*;
 use crate::{
     drag_and_drop::install_drag_and_drop,
     flip_3d::create_flip_3d,
-    minka::{decoration, displays, events, input, keybinds, rendering, session, settings, workspace_ipc},
+    minka::{decoration, displays, events, input, keybinds, rendering, session, settings, wobbly, workspace_ipc},
     window_grid::create_window_grid,
     window_manager::WindowManager,
     window_switcher::WindowSwitcher,
@@ -111,6 +111,7 @@ fn setup() {
     displays::configure_displays();
     input::configure_input(&wm);
     rendering::configure_rendering(&switcher);
+    wobbly::configure_wobbly();
 
     let pointer = events::wire_window_events(&wm, &ipc);
     COMPOSITOR
