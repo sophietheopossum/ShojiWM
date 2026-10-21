@@ -3260,7 +3260,10 @@ mod vblank_grid_tests {
     /// monotonic timestamp is the vblank itself.
     #[test]
     fn a_zero_driver_timestamp_is_no_timestamp() {
-        assert_eq!(flip_timestamp(DrmEventTime::Monotonic(Duration::ZERO)), None);
+        assert_eq!(
+            flip_timestamp(DrmEventTime::Monotonic(Duration::ZERO)),
+            None
+        );
         assert_eq!(
             flip_timestamp(DrmEventTime::Realtime(std::time::SystemTime::UNIX_EPOCH)),
             None
@@ -3700,8 +3703,7 @@ fn frame_finish(
         .map(|metadata| metadata.sequence)
         .unwrap_or(0);
     let driver_timestamp = metadata.as_ref().and_then(|m| flip_timestamp(m.time));
-    let presentation_clock =
-        driver_timestamp.unwrap_or_else(|| Duration::from(state.clock.now()));
+    let presentation_clock = driver_timestamp.unwrap_or_else(|| Duration::from(state.clock.now()));
     // The next frame's presentation time. It is what frame callbacks report and what
     // frame-driven runtime work (kinetic scrolling) is stamped with, so it has to advance
     // by whole refresh periods. With a driver timestamp `presentation_clock` is the vblank
@@ -4661,57 +4663,58 @@ fn fast_cursor_move_inner(
     if allow_defer && surface.deferred_submit.is_none() {
         let now = Duration::from(clock.now());
         if let Some(deadline) = commit_deadline(surface, now)
-            && now < deadline {
-                if surface.cursor_commit_timer_armed {
-                    // Already scheduled; the timer reads the freshest pointer
-                    // position when it fires.
-                    return true;
-                }
-                let generation = surface.cursor_commit_timer_generation.wrapping_add(1);
-                surface.cursor_commit_timer_generation = generation;
-                surface.cursor_commit_timer_armed = true;
-                let callback_loop_handle = loop_handle.clone();
-                let armed = loop_handle
-                    .insert_source(Timer::from_duration(deadline - now), move |_, _, state| {
-                        let timer_is_current = {
-                            let Some(surface) = state
-                                .tty_backends
-                                .get_mut(&node)
-                                .and_then(|backend| backend.surfaces.get_mut(&crtc))
-                            else {
-                                return TimeoutAction::Drop;
-                            };
-                            if !surface.cursor_commit_timer_armed
-                                || surface.cursor_commit_timer_generation != generation
-                            {
-                                return TimeoutAction::Drop;
-                            }
-                            surface.cursor_commit_timer_armed = false;
-                            true
-                        };
-                        // Motion the config has yet to see may well lead to a redraw (it does
-                        // during a drag), which needs this flip more than the cursor does.
-                        if timer_is_current {
-                            state.flush_pointer_dispatch();
-                        }
-                        // A pending full redraw carries the cursor position by
-                        // itself; committing here as well would only occupy
-                        // the CRTC ahead of it.
-                        if timer_is_current
-                            && !state.needs_redraw
-                            && !fast_cursor_move_inner(state, &callback_loop_handle, false)
-                        {
-                            state.schedule_redraw();
-                        }
-                        TimeoutAction::Drop
-                    })
-                    .is_ok();
-                if !armed {
-                    surface.cursor_commit_timer_armed = false;
-                    return false;
-                }
+            && now < deadline
+        {
+            if surface.cursor_commit_timer_armed {
+                // Already scheduled; the timer reads the freshest pointer
+                // position when it fires.
                 return true;
             }
+            let generation = surface.cursor_commit_timer_generation.wrapping_add(1);
+            surface.cursor_commit_timer_generation = generation;
+            surface.cursor_commit_timer_armed = true;
+            let callback_loop_handle = loop_handle.clone();
+            let armed = loop_handle
+                .insert_source(Timer::from_duration(deadline - now), move |_, _, state| {
+                    let timer_is_current = {
+                        let Some(surface) = state
+                            .tty_backends
+                            .get_mut(&node)
+                            .and_then(|backend| backend.surfaces.get_mut(&crtc))
+                        else {
+                            return TimeoutAction::Drop;
+                        };
+                        if !surface.cursor_commit_timer_armed
+                            || surface.cursor_commit_timer_generation != generation
+                        {
+                            return TimeoutAction::Drop;
+                        }
+                        surface.cursor_commit_timer_armed = false;
+                        true
+                    };
+                    // Motion the config has yet to see may well lead to a redraw (it does
+                    // during a drag), which needs this flip more than the cursor does.
+                    if timer_is_current {
+                        state.flush_pointer_dispatch();
+                    }
+                    // A pending full redraw carries the cursor position by
+                    // itself; committing here as well would only occupy
+                    // the CRTC ahead of it.
+                    if timer_is_current
+                        && !state.needs_redraw
+                        && !fast_cursor_move_inner(state, &callback_loop_handle, false)
+                    {
+                        state.schedule_redraw();
+                    }
+                    TimeoutAction::Drop
+                })
+                .is_ok();
+            if !armed {
+                surface.cursor_commit_timer_armed = false;
+                return false;
+            }
+            return true;
+        }
     }
 
     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -14437,8 +14440,26 @@ fn connector_disconnected(
     let Some(surface) = backend.surfaces.remove(&crtc) else {
         return;
     };
-    if let Some(color_state) = state.output_color.remove(&output_name)
+    let output = surface.output;
+    unpublish_output(state, node, &output, &output_name);
+    info!(
+        ?node,
+        ?crtc,
+        output = %output_name,
+        "disconnected tty output"
+    );
+}
+
+/// Everything publishing an output to clients and the config, undone: the
+/// `wl_output` global, the space mapping, and the per-output state keyed by
+/// connector name. The caller has already removed (and thereby dropped) the
+/// CRTC's surface. Split out of `connector_disconnected` for the in-place
+/// surface reset's fallback, which reaches the same end state by a
+/// different route (see `reset_surface_after_commit_failure`).
+fn unpublish_output(state: &mut ShojiWM, node: DrmNode, output: &Output, output_name: &str) {
+    if let Some(color_state) = state.output_color.remove(output_name)
         && let Some(blob) = color_state.hdr_metadata_blob
+        && let Some(backend) = state.tty_backends.get(&node)
     {
         // The kernel only frees property blobs when the DRM fd closes,
         // and this device stays open across hotplugs — destroy explicitly
@@ -14448,13 +14469,7 @@ fn connector_disconnected(
             blob,
         );
     }
-    forget_output(state, &surface.output);
-    info!(
-        ?node,
-        ?crtc,
-        output = %output_name,
-        "disconnected tty output"
-    );
+    forget_output(state, output);
 }
 
 pub fn device_changed(
@@ -14535,12 +14550,171 @@ pub fn device_changed(
     Ok(())
 }
 
+/// Rebuild one CRTC's DRM surface in place: drop its `DrmOutput` and
+/// initialize a fresh one for the *same* smithay `Output`, so the
+/// `wl_output` global, the space mapping and the per-output state keyed by
+/// connector name (colour state, HDR pipeline, cursor cache) all survive.
+/// A mode change is published through the output as usual; clients see at
+/// most that, never a global removal.
+///
+/// This matters because the remove/re-add of a live output within a few
+/// hundred milliseconds — a pattern no physical unplug produces — kills
+/// clients whose output-removal handling is fragile. Measured 21/10/2026:
+/// a post-resume EBUSY flip on eDP-1 escalated to the old disconnect/
+/// reconnect reset, and Floorp, GitKraken and code-oss all segfaulted in
+/// the same second (Floorp inside GDK's Wayland dispatch).
+///
+/// On error, returns the still-published `Output` (when the reset got far
+/// enough to have removed the old surface) alongside the error, so the
+/// caller can fall back to unpublishing it and reconnecting from scratch.
+/// `None` means nothing was touched.
+fn reset_surface_in_place(
+    state: &mut ShojiWM,
+    node: DrmNode,
+    crtc: crtc::Handle,
+    connector: &connector::Info,
+) -> Result<(), (Option<Output>, Box<dyn std::error::Error>)> {
+    let Some(old) = state
+        .tty_backends
+        .get_mut(&node)
+        .and_then(|backend| backend.surfaces.remove(&crtc))
+    else {
+        return Err((None, "no tty surface to reset in place".into()));
+    };
+    // The old DrmOutput must drop before initialize_output runs for this
+    // CRTC (the output manager answers DuplicateCrtc otherwise). The rest
+    // of the surface state goes with it, exactly as a reconnect would
+    // rebuild it; what carries over is the output itself, the presentation
+    // sequence (clients on this wl_output must not see it run backwards)
+    // and the power state (a reset must not resurrect a powered-off panel).
+    let SurfaceData {
+        output,
+        target: old_target,
+        frame_callback_sequence,
+        powered_off,
+        power_cleared,
+        power_generation,
+        ..
+    } = old;
+    drop(old_target);
+
+    let attempt = (|| -> Result<SurfaceData, Box<dyn std::error::Error>> {
+        let mode = select_output_mode(connector, &state.display_config.default_mode);
+        let wl_mode = WlMode::from(mode);
+        let frame_duration = Duration::from_secs_f64(1_000f64 / wl_mode.refresh as f64);
+        output.set_preferred(wl_mode);
+        if output.current_mode() != Some(wl_mode) {
+            output.change_current_state(Some(wl_mode), None, None, None);
+        }
+        state.seed_xwayland_refresh_override_from_output(&output, "tty-surface-reset");
+
+        // Same cross-GPU lookup as connector_connected.
+        let cross_gpu_render = state
+            .tty_render_node
+            .filter(|render_node| *render_node != node)
+            .and_then(|render_node| {
+                state.tty_backends.get(&render_node).map(|render_backend| {
+                    (
+                        render_node,
+                        render_backend.gbm.clone(),
+                        render_backend.renderer.dmabuf_formats(),
+                    )
+                })
+            });
+
+        // Scoped and bound exactly as in connector_connected: the manager
+        // guard must drop before surface_dmabuf_feedback locks it again.
+        let (drm_output, dmabuf_feedback) = {
+            let backend = state.tty_backends.get_mut(&node).unwrap();
+            let initialize = backend
+                .drm_output_manager
+                .lock()
+                .initialize_output::<_, WaylandSurfaceRenderElement<GlesRenderer>>(
+                    crtc,
+                    mode,
+                    &[connector.handle()],
+                    &output,
+                    None,
+                    &mut backend.renderer,
+                    &DrmOutputRenderElements::default(),
+                );
+            let drm_output = initialize.map_err(Box::<dyn std::error::Error>::from)?;
+            let feedback = match &cross_gpu_render {
+                Some((render_node, _, render_formats)) => {
+                    DmabufFeedbackBuilder::new(render_node.dev_id(), render_formats.clone())
+                        .build()
+                        .map(|render| SurfaceDmabufFeedback {
+                            scanout: render.clone(),
+                            render,
+                        })
+                        .map_err(Into::into)
+                }
+                None => {
+                    surface_dmabuf_feedback(&drm_output, backend.renderer.dmabuf_formats(), node)
+                }
+            }?;
+            (drm_output, feedback)
+        };
+
+        let supports_async_flip = drm_output.supports_async_page_flip();
+        let cross_gpu = cross_gpu_render.and_then(|(render_node, gbm, _)| {
+            info!(
+                ?node,
+                ?render_node,
+                output = %output.name(),
+                "output is on another gpu than clients render with; rendering it there and copying"
+            );
+            let render_backend = state.tty_backends.get(&render_node)?;
+            Some(CrossGpuTarget::new(&gbm, &render_backend.renderer, &output))
+        });
+        let mut surface = SurfaceData::new(
+            output.clone(),
+            SurfaceTarget::Drm(drm_output),
+            connector.modes().to_vec(),
+            dmabuf_feedback,
+            frame_duration,
+            supports_async_flip,
+            cross_gpu,
+        );
+        surface.frame_callback_sequence = frame_callback_sequence;
+        surface.redraw_state = TtyRedrawState::Queued;
+        surface.powered_off = powered_off;
+        surface.power_cleared = power_cleared;
+        surface.power_generation = power_generation;
+        Ok(surface)
+    })();
+
+    match attempt {
+        Ok(surface) => {
+            let backend = state.tty_backends.get_mut(&node).unwrap();
+            backend.surfaces.insert(crtc, surface);
+            info!(
+                ?node,
+                ?crtc,
+                output = %output.name(),
+                "reset tty surface in place; wl_output kept"
+            );
+            // The output never left the space, so no announcement matches
+            // connector_connected's; re-applying the display configuration
+            // covers a mode the reset landed on that the config wants
+            // overridden, and the notify resyncs the config's output view.
+            state.apply_runtime_display_configuration();
+            state.notify_runtime_outputs_changed();
+            state.schedule_redraw();
+            Ok(())
+        }
+        Err(err) => Err((Some(output), err)),
+    }
+}
+
 /// Rebuild one CRTC's DRM surface after the kernel rejected its screen
 /// configuration (`DrmError::TestFailed` from a render/queue commit). This is
 /// the expected shape of the first post-resume frame when the connector
 /// topology changed during sleep: the stale surface carries state the new
-/// topology cannot satisfy, so tear it down and reconnect the output through
-/// the normal hotplug path instead of exiting the session.
+/// topology cannot satisfy, so rebuild it instead of exiting the session.
+/// The rebuild is in place where possible (see `reset_surface_in_place`);
+/// only if that fails does the output go through the full disconnect/
+/// reconnect hotplug path.
 ///
 /// Returns `Err` only when the same CRTC keeps failing in a tight window —
 /// the last-resort fatal path so a configuration the kernel
@@ -14600,16 +14774,38 @@ fn reset_surface_after_commit_failure(
         ),
         "resetting tty surface after failed atomic commit test"
     );
-    connector_disconnected(state, node, crtc, connector.clone());
-    if let Err(err) = connector_connected(state, node, crtc, connector) {
-        // Leave this output disconnected rather than killing the session:
-        // other outputs keep working, and a later hotplug event retries.
+    if let Err((published, err)) = reset_surface_in_place(state, node, crtc, &connector) {
         warn!(
             ?node,
             ?crtc,
             ?err,
-            "failed to reconnect output after surface reset",
+            "in-place surface reset failed; reconnecting output the heavyweight way",
         );
+        // Reproduce the old disconnect/reconnect reset. Which half of the
+        // disconnect still has work to do depends on how far the in-place
+        // reset got: a still-published output has no surface left in the
+        // map, so `connector_disconnected` would no-op on it — unpublish it
+        // directly. Nothing published means the surface is either still
+        // mapped (disconnect handles it) or never existed.
+        let output_name = format!(
+            "{}-{}",
+            connector.interface().as_str(),
+            connector.interface_id()
+        );
+        match published {
+            Some(output) => unpublish_output(state, node, &output, &output_name),
+            None => connector_disconnected(state, node, crtc, connector.clone()),
+        }
+        if let Err(err) = connector_connected(state, node, crtc, connector) {
+            // Leave this output disconnected rather than killing the session:
+            // other outputs keep working, and a later hotplug event retries.
+            warn!(
+                ?node,
+                ?crtc,
+                ?err,
+                "failed to reconnect output after surface reset",
+            );
+        }
     }
     state.request_full_damage();
     Ok(())
