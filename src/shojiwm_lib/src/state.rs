@@ -1765,6 +1765,8 @@ impl ShojiWM {
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
         let data_control_state =
             DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        // Both protocol generations share Smithay's seat selection. Modern
+        // clipboard clients (including Dux) use ext_data_control exclusively.
         let ext_data_control_state =
             ExtDataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
 
