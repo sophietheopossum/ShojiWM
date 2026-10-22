@@ -426,6 +426,7 @@ pub struct ShojiWM {
     /// Windows marked dirty while a decoration refresh pass runs (by a host
     /// message it drains, say): the pass must not clear them with the
     /// windows it processed earlier, or their changes are never refreshed.
+    /// Kept by the outermost pass when one runs inside another.
     pub runtime_dirty_marked_during_refresh: Option<std::collections::HashSet<String>>,
     pub runtime_managed_only_window_ids: std::collections::HashSet<String>,
     pub runtime_node_only_window_ids: std::collections::HashSet<String>,
