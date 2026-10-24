@@ -39,6 +39,7 @@ use smithay::{
                 },
             },
             gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture},
+            sync::SyncPoint,
             utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
         session::{Session, libseat::LibSeatSession},
@@ -48,7 +49,8 @@ use smithay::{
     output::{Mode as WlMode, Output, PhysicalProperties},
     reexports::{
         calloop::{
-            LoopHandle, RegistrationToken,
+            Interest, LoopHandle, Mode as PollMode, PostAction, RegistrationToken,
+            generic::Generic,
             timer::{TimeoutAction, Timer},
         },
         drm::control::{ModeTypeFlags, connector, crtc},
@@ -1103,6 +1105,9 @@ struct DeferredSubmit {
     latency_render_started_at: Option<Duration>,
     /// The vblank the frame was rendered for.
     frame_target: Duration,
+    /// The GPU's fence for the frame, while it may still be drawing it: the
+    /// commit waits for it (`submit_when_rendered`).
+    sync: Option<SyncPoint>,
 }
 
 /// A cross-GPU frame on its way from the render GPU to the output's (see
@@ -2040,6 +2045,8 @@ fn render_cross_gpu_frame<E: RenderElement<GlesRenderer>>(
             states: Default::default(),
         },
         cross_gpu_pending: None,
+        // Waited for in `stage_cross_gpu_frame`.
+        sync: None,
     };
     let prepared = prepare_cross_gpu_frame(
         target,
@@ -2627,6 +2634,9 @@ struct TtyRenderFrameResult {
     /// A cross-GPU frame the render GPU is still working on: rendered, but not staged in the
     /// `DrmCompositor` yet (see `CrossGpuFrame::Pending`).
     cross_gpu_pending: Option<smithay::backend::renderer::sync::SyncPoint>,
+    /// The fence of a frame composited into the swapchain, which the commit
+    /// must wait for (`render_surface`).
+    sync: Option<SyncPoint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2727,9 +2737,25 @@ pub fn device_added(
     let gbm = Device::new(fd.clone())
         .map_err(|error| driver_load_error(path, "create a GBM device", &error))?;
 
-    let egl = unsafe { EGLDisplay::new(gbm.clone()) }
-        .map_err(|error| driver_load_error(path, "initialize EGL", &error))?;
-    let ctx = EGLContext::new_with_priority(&egl, ContextPriority::High)?;
+    // NVIDIA's driver waits for the GPU (a fence, `glFinish`) by spinning on the clock and
+    // `sched_yield`, so every wait still left on this thread (a client's acquire point, a
+    // texture's read fence) costs as much CPU as the GPU takes. `__GL_YIELD=USLEEP` makes it
+    // sleep instead. It is read when the driver loads, here; clients started later do not
+    // inherit it. A value the user set is kept.
+    let gl_yield = std::env::var_os("__GL_YIELD").is_none();
+    if gl_yield {
+        crate::process_env::set_var("__GL_YIELD", "USLEEP");
+    }
+    let loaded = (|| -> Result<_, Box<dyn std::error::Error>> {
+        let egl = unsafe { EGLDisplay::new(gbm.clone()) }
+            .map_err(|error| driver_load_error(path, "initialize EGL", &error))?;
+        let ctx = EGLContext::new_with_priority(&egl, ContextPriority::High)?;
+        Ok((egl, ctx))
+    })();
+    if gl_yield {
+        crate::process_env::remove_var("__GL_YIELD");
+    }
+    let (_egl, ctx) = loaded?;
     let mut renderer = unsafe { GlesRenderer::new(ctx)? };
     // Only the GPU clients render with (the first one opened, which hosts the dmabuf global)
     // binds the display. Binding it on another GPU advertises that GPU's `wl_drm`: on a hybrid
@@ -3996,6 +4022,23 @@ fn submit_deferred_frame(
     let Some(deferred) = surface.deferred_submit.take() else {
         return;
     };
+    if let Some(sync) = deferred.sync.as_ref().filter(|sync| !sync.is_reached()) {
+        let output = surface.output.name();
+        if submit_when_rendered(
+            loop_handle,
+            node,
+            crtc,
+            generation,
+            deadline_scheduled,
+            sync,
+            output.clone(),
+        ) {
+            surface.deferred_submit = Some(deferred);
+            return;
+        }
+        let _ = sync.wait();
+        crate::frame_stats::record(&output, |frames| frames.waited_for_gpu += 1);
+    }
     let queue_started_at = Instant::now();
     let submit_error = {
         timescope::scope!("tty deferred queue_frame");
@@ -4020,6 +4063,7 @@ fn submit_deferred_frame(
             }
             surface.queued_at = Some(queue_started_at);
             surface.queued_cpu_duration = deferred.total_cpu_elapsed;
+            crate::frame_stats::record(&surface.output.name(), |frames| frames.committed += 1);
             surface.skipped_while_pending_count = 0;
             // `frame_pending` and `WaitingForVBlank` were already set when
             // the frame was staged.
@@ -4077,6 +4121,44 @@ fn submit_deferred_frame(
             state.schedule_redraw();
         }
     }
+}
+
+/// Commit the frame staged under `generation` once the GPU has finished drawing it:
+/// `submit_deferred_frame` runs when the fence's fd becomes readable. NVIDIA cannot take the
+/// fence with the commit (IN_FENCE_FD, see `render_surface`), and waiting for it on this
+/// thread spins in the driver for as long as the GPU draws, holding up every other output
+/// and input meanwhile. `false` when the fence cannot be exported: the caller waits for it.
+fn submit_when_rendered(
+    loop_handle: &LoopHandle<'_, ShojiWM>,
+    node: DrmNode,
+    crtc: crtc::Handle,
+    generation: u64,
+    deadline_scheduled: bool,
+    sync: &SyncPoint,
+    output: String,
+) -> bool {
+    let Some(fence) = sync.export() else {
+        return false;
+    };
+    let held_at = Instant::now();
+    let callback_loop_handle = loop_handle.clone();
+    loop_handle
+        .insert_source(
+            Generic::new(fence, Interest::READ, PollMode::OneShot),
+            move |_, _, state| {
+                crate::frame_stats::record_gpu_wait(&output, held_at.elapsed());
+                submit_deferred_frame(
+                    state,
+                    &callback_loop_handle,
+                    node,
+                    crtc,
+                    generation,
+                    deadline_scheduled,
+                );
+                Ok(PostAction::Remove)
+            },
+        )
+        .is_ok()
 }
 
 /// Submit a frame that was rendered ahead, now that the flip it waited for completed.
@@ -6130,24 +6212,36 @@ fn render_surface(
         };
 
         let mut content_elements: Vec<TtyRenderElements> = Vec::new();
-        // Synthetic DamageOnly elements force the OutputDamageTracker to repaint
-        // regions (decorations, manual invalidation). During the fullscreen fast
-        // path they are actively harmful: the fullscreen surface occludes every
-        // region they target, but as non-scanout elements stacked above the
-        // client surface they knock it off the primary plane. Worse, scanning
-        // out skips the swapchain render, which feeds back as fresh decoration
-        // damage the next frame — so the damage element reappears every other
-        // frame and direct scanout flaps engaged/disengaged at ~30 Hz. The
-        // client surface carries its own damage for smithay's tracker, so
-        // dropping these here is safe and keeps scanout steady.
-        if fullscreen_window.is_none() {
-            content_elements.extend(
-                damage::elements_for_output(&extra_damage, output_geo)
-                    .into_iter()
-                    .map(TtyRenderElements::Damage),
-            );
-        }
-        overlay_below_layers += content_elements.len();
+        // The output's damage elements (`damage::element_for_output`) force the
+        // OutputDamageTracker to repaint regions (decorations, manual
+        // invalidation): one on top of the display's list, one on top of the
+        // captures', each always the topmost of its list so that it never moves
+        // in the stack. While locked there are none, as the lock surface is all
+        // that shows. During the fullscreen fast path they are actively harmful:
+        // the fullscreen surface occludes every region they target, but as
+        // non-scanout elements stacked above the client surface they knock it
+        // off the primary plane. Worse, scanning out skips the swapchain render,
+        // which feeds back as fresh decoration damage the next frame — so the
+        // damage element reappears every other frame and direct scanout flaps
+        // engaged/disengaged at ~30 Hz. The client surface carries its own
+        // damage for smithay's tracker, so dropping these here is safe and keeps
+        // scanout steady.
+        let output_damage =
+            (fullscreen_window.is_none() && !state.session_lock_active).then(|| {
+                let name = output.name();
+                (
+                    damage::element_for_output(
+                        &format!("{name}:display"),
+                        &extra_damage,
+                        output_geo,
+                    ),
+                    damage::element_for_output(
+                        &format!("{name}:capture"),
+                        &extra_damage,
+                        output_geo,
+                    ),
+                )
+            });
         content_elements.extend(scene_elements);
         let live_locker = session_lock_surface_for_output
             .as_ref()
@@ -6236,6 +6330,10 @@ fn render_surface(
                 }),
             );
         }
+        let display_damage = output_damage.map(|(display, capture)| {
+            content_for_capture.insert(0, TtyRenderElements::Damage(capture));
+            TtyRenderElements::Damage(display)
+        });
         // The element count for diagnostics — final elements is built below
         // after capture has run against the by-reference slices.
         timing.render_element_count = cursor_pointer_elements.len() + content_for_capture.len();
@@ -6408,12 +6506,13 @@ fn render_surface(
         // After capture has run against the cursor / content slices by
         // reference, move them into a single element list for the DRM render.
         let mut elements: Vec<TtyRenderElements> = Vec::with_capacity(
-            error_text_elements.len()
+            1 + error_text_elements.len()
                 + error_background_elements.len()
                 + fps_overlay_elements.len()
                 + cursor_elements.len()
                 + content_for_capture.len(),
         );
+        elements.extend(display_damage);
         elements.extend(error_text_elements);
         elements.extend(error_background_elements);
         elements.extend(fps_overlay_elements);
@@ -6701,14 +6800,16 @@ fn render_surface(
                                             // needs_sync() is true the page flip would be submitted before
                                             // the GPU finishes rendering, causing the display to scan out a
                                             // partially-rendered buffer and producing visible microstutter
-                                            // during scroll/animation. Block on the swapchain sync point
-                                            // manually before queue_frame commits the flip.
-                                            if result.needs_sync()
-                                                && let PrimaryPlaneElement::Swapchain(ref element) =
-                                                    result.primary_element
-                                            {
-                                                let _ = element.sync.wait();
-                                            }
+                                            // during scroll/animation. The commit waits for the
+                                            // swapchain sync point instead (`submit_when_rendered`).
+                                            let sync = match &result.primary_element {
+                                                PrimaryPlaneElement::Swapchain(element)
+                                                    if result.needs_sync() =>
+                                                {
+                                                    Some(element.sync.clone())
+                                                }
+                                                _ => None,
+                                            };
                                             let primary_scanout = matches!(
                                                 result.primary_element,
                                                 PrimaryPlaneElement::Element(_)
@@ -6745,6 +6846,7 @@ fn render_surface(
                                                     .is_some(),
                                                 states: result.states,
                                                 cross_gpu_pending: None,
+                                                sync,
                                             }
                                         })
                                 } else {
@@ -6762,14 +6864,16 @@ fn render_surface(
                                             // needs_sync() is true the page flip would be submitted before
                                             // the GPU finishes rendering, causing the display to scan out a
                                             // partially-rendered buffer and producing visible microstutter
-                                            // during scroll/animation. Block on the swapchain sync point
-                                            // manually before queue_frame commits the flip.
-                                            if result.needs_sync()
-                                                && let PrimaryPlaneElement::Swapchain(ref element) =
-                                                    result.primary_element
-                                            {
-                                                let _ = element.sync.wait();
-                                            }
+                                            // during scroll/animation. The commit waits for the
+                                            // swapchain sync point instead (`submit_when_rendered`).
+                                            let sync = match &result.primary_element {
+                                                PrimaryPlaneElement::Swapchain(element)
+                                                    if result.needs_sync() =>
+                                                {
+                                                    Some(element.sync.clone())
+                                                }
+                                                _ => None,
+                                            };
                                             let primary_scanout = matches!(
                                                 result.primary_element,
                                                 PrimaryPlaneElement::Element(_)
@@ -6806,6 +6910,7 @@ fn render_surface(
                                                     .is_some(),
                                                 states: result.states,
                                                 cross_gpu_pending: None,
+                                                sync,
                                             }
                                         })
                                 }
@@ -7203,6 +7308,34 @@ fn render_surface(
                     deferred = arm_held_submit(loop_handle, node, crtc, generation, hold);
                 }
             }
+            // The GPU may still be drawing the frame. Rather than wait for it here, the
+            // commit is held until its fence signals (`submit_when_rendered`); a frame
+            // rendered ahead or held for the deadline waits for it when it is submitted. A
+            // tearing flip cannot be held (`submit_deferred_frame` commits vblank-synced).
+            let pending_sync = result.sync.clone().filter(|sync| !sync.is_reached());
+            if !rendering_ahead
+                && !deferred
+                && let Some(sync) = pending_sync.as_ref()
+            {
+                let generation = surface.deferred_submit_generation.wrapping_add(1);
+                surface.deferred_submit_generation = generation;
+                if !should_tear
+                    && submit_when_rendered(
+                        loop_handle,
+                        node,
+                        crtc,
+                        generation,
+                        false,
+                        sync,
+                        output.name(),
+                    )
+                {
+                    deferred = true;
+                } else {
+                    let _ = sync.wait();
+                    crate::frame_stats::record(&output.name(), |frames| frames.waited_for_gpu += 1);
+                }
+            }
             if rendering_ahead {
                 // Staged until the flip in flight completes; `frame_finish` submits it.
                 surface.ahead_submit = Some(DeferredSubmit {
@@ -7211,6 +7344,7 @@ fn render_surface(
                     latency_render_started_at: latency_anchor
                         .map(|(anchor_mono, _, _)| anchor_mono),
                     frame_target: frame_time,
+                    sync: pending_sync.clone(),
                 });
             } else if deferred || cross_gpu_pending.is_some() {
                 if cross_gpu_pending.is_some() {
@@ -7223,6 +7357,7 @@ fn render_surface(
                     latency_render_started_at: latency_anchor
                         .map(|(anchor_mono, _, _)| anchor_mono),
                     frame_target: frame_time,
+                    sync: pending_sync.clone(),
                 });
             } else {
                 // `should_tear` selects an immediate (async) page flip when the fullscreen
@@ -7300,6 +7435,7 @@ fn render_surface(
                 }
                 surface.queued_at = Some(queue_started_at);
                 surface.queued_cpu_duration = total_cpu_elapsed;
+                crate::frame_stats::record(&output.name(), |frames| frames.committed += 1);
             }
             surface.cross_gpu_staging = None;
             if let Some(sync) = cross_gpu_pending {
@@ -7377,6 +7513,7 @@ fn render_surface(
                     .insert(output_name, next_frame_time_ms);
             }
         } else {
+            crate::frame_stats::record(&output.name(), |frames| frames.empty += 1);
             if frame_liveness_debug_enabled() {
                 tracing::info!(
                     output = %output.name(),
@@ -14025,6 +14162,8 @@ pub(crate) fn forget_output(state: &mut ShojiWM, output: &Output) {
     state.damage_blink_pending.remove(&output_name);
     state.damage_blink_capture_suppression.remove(&output_name);
     state.pending_decoration_damage.clear();
+    damage::forget_output(&format!("{output_name}:display"));
+    damage::forget_output(&format!("{output_name}:capture"));
     announce_output_icc_profiles(state);
     state.apply_runtime_display_configuration();
     state.notify_runtime_outputs_changed();

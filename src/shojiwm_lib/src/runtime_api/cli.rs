@@ -36,8 +36,8 @@ pub struct CommonArgs {
     pub extra: BTreeMap<String, String>,
     pub help: bool,
     pub version: bool,
-    /// `-q/--quit` or `-r/--reload`: tell the running compositor to do that
-    /// instead of starting one.
+    /// `-q/--quit`, `-r/--reload` or `--frame-stats`: tell the running
+    /// compositor to do that (or ask it) instead of starting one.
     pub control_command: Option<crate::control_socket::Command>,
 }
 
@@ -113,6 +113,8 @@ impl CommonArgs {
                 Some(crate::control_socket::Command::Quit)
             } else if flag("--reload") || flag("-r") {
                 Some(crate::control_socket::Command::Reload)
+            } else if flag("--frame-stats") {
+                Some(crate::control_socket::Command::FrameStats)
             } else {
                 parse_option_value(args, "--key", &consumed_values).map(|chord| {
                     crate::control_socket::Command::Key {
@@ -174,6 +176,10 @@ const COMMON_HELP: &[(&str, &str)] = &[
     (
         "--hold <MS>",
         "With --key: hold the chord this long before releasing",
+    ),
+    (
+        "--frame-stats",
+        "Print the running ShojiWM's per-output frame counters as JSON",
     ),
     ("-h, --help", "Print this help"),
     ("-V, --version", "Print the version"),

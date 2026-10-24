@@ -1,4 +1,5 @@
-//! Compositor control socket behind `shoji_wm --quit` / `--reload`.
+//! Compositor control socket behind `shoji_wm --quit` / `--reload` /
+//! `--frame-stats`.
 //!
 //! The same two escape hatches as `Super+Shift+Q` / `Super+Shift+R`, reachable
 //! from a terminal, a status bar's click handler or a config keybinding that
@@ -10,8 +11,8 @@
 //! `SHOJIWM_SOCKET`. The wire format is one command per connection:
 //!
 //! ```text
-//! client -> server   "quit\n" | "reload\n" | "key <chord> [<hold-ms>]\n"
-//! server -> client   "ok\n" | "error: <message>\n"
+//! client -> server   "quit\n" | "reload\n" | "key <chord> [<hold-ms>]\n" | "frame-stats\n"
+//! server -> client   "ok\n" | "<one line of JSON>\n" | "error: <message>\n"
 //! ```
 //!
 //! `key Super+Return` presses and releases the chord on a virtual keyboard
@@ -19,6 +20,9 @@
 //! key binds (see [`crate::virtual_input`]). `key XF86AudioRaiseVolume 800`
 //! holds it for 800 ms before the release, long enough for key repeat. The
 //! answer comes once the event loop has pressed the chord.
+//!
+//! `frame-stats` is answered from this socket's thread with the per-output
+//! counters ([`crate::frame_stats`]), never the event loop's.
 
 use std::{
     ffi::OsStr,
@@ -53,6 +57,7 @@ pub enum Command {
         chord: String,
         hold_ms: u32,
     },
+    FrameStats,
 }
 
 impl Command {
@@ -62,6 +67,7 @@ impl Command {
             Self::Reload => "reload".into(),
             Self::Key { chord, hold_ms: 0 } => format!("key {chord}"),
             Self::Key { chord, hold_ms } => format!("key {chord} {hold_ms}"),
+            Self::FrameStats => "frame-stats".into(),
         }
     }
 
@@ -70,6 +76,7 @@ impl Command {
         match line {
             "quit" => Some(Self::Quit),
             "reload" => Some(Self::Reload),
+            "frame-stats" => Some(Self::FrameStats),
             _ => {
                 let mut words = line.strip_prefix("key ")?.split_whitespace();
                 let chord = words.next()?.to_string();
@@ -146,6 +153,7 @@ pub fn start(
                     Ok(())
                 }
                 Command::Key { chord, hold_ms } => state.inject_key_chord(&chord, hold_ms),
+                Command::FrameStats => Ok(()),
             };
             let _ = reply.send(result);
         }
@@ -175,6 +183,7 @@ fn serve(listener: UnixListener, sender: Sender<Request>) {
             continue;
         };
         let reply = match read_command(&stream) {
+            Ok(Command::FrameStats) => crate::frame_stats::json(),
             Ok(command) => {
                 let (reply_sender, reply_receiver) = mpsc::channel();
                 if sender.send((command, reply_sender)).is_err() {
@@ -204,11 +213,12 @@ fn read_command(stream: &UnixStream) -> Result<Command, String> {
     Command::parse(&line).ok_or_else(|| format!("unknown command {:?}", line.trim()))
 }
 
-/// Client side: send `command` to the running compositor.
+/// Client side: send `command` to the running compositor. `Some` carries a
+/// reply with content (`frame-stats`).
 ///
 /// The socket comes from `SHOJIWM_SOCKET`, or failing that from
 /// `WAYLAND_DISPLAY`, so a shell started inside the session finds it either way.
-pub fn send(command: Command) -> Result<(), String> {
+pub fn send(command: Command) -> Result<Option<String>, String> {
     let path = std::env::var_os(SOCKET_ENV)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
@@ -230,8 +240,9 @@ pub fn send(command: Command) -> Result<(), String> {
         .read_line(&mut reply)
         .map_err(|error| error.to_string())?;
     match reply.trim() {
-        "ok" => Ok(()),
+        "ok" => Ok(None),
         "" => Err("the compositor closed the connection without answering".to_string()),
+        json if command == Command::FrameStats && json.starts_with('{') => Ok(Some(json.to_string())),
         other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
     }
 }
