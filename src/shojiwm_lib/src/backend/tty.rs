@@ -5457,6 +5457,25 @@ fn render_surface(
     node: DrmNode,
     crtc: crtc::Handle,
 ) -> Result<RenderSurfaceOutcome, Box<dyn std::error::Error>> {
+    let outer = state.frame_in_preparation.take();
+    let outcome = render_surface_frame(state, loop_handle, node, crtc);
+    // A change left to this frame (`ShojiWM::schedule_window_redraw`) still
+    // needs one when the frame was not drawn after all.
+    if let Some(frame) = std::mem::replace(&mut state.frame_in_preparation, outer)
+        && frame.changes_left
+        && !matches!(outcome, Ok(RenderSurfaceOutcome::Processed))
+    {
+        state.schedule_output_redraw(&frame.output);
+    }
+    outcome
+}
+
+fn render_surface_frame(
+    state: &mut ShojiWM,
+    loop_handle: &LoopHandle<'_, ShojiWM>,
+    node: DrmNode,
+    crtc: crtc::Handle,
+) -> Result<RenderSurfaceOutcome, Box<dyn std::error::Error>> {
     let frame_started_at = Instant::now();
     // Latency diagnostic (`SHOJI_LATENCY_TRACE`): anchor pair for the input-to-photon
     // measurement. Both readings are CLOCK_MONOTONIC, so a later `Instant`
@@ -5605,7 +5624,14 @@ fn render_surface(
         surface.last_decoration_refresh_at = Some(Instant::now());
     }
     // This frame is about to be laid out: it should show where the pointer is now.
+    // It also draws what the pointer dispatch, the tick and the refreshes below
+    // change, so a window change made there asks no second frame of this output.
     if redraw_state_at_entry == TtyRedrawState::Queued {
+        state.frame_in_preparation = Some(crate::state::FramePreparation {
+            output: output.name(),
+            open: true,
+            changes_left: false,
+        });
         state.flush_pointer_dispatch();
     }
     let mut motion_trace_frame_tick: Option<(f64, bool)> = None;
@@ -5689,6 +5715,10 @@ fn render_surface(
         note_frame_evaluation(state, &output.name(), "popup effects", result);
     }
     let layer_effects_elapsed_ms = layer_effects_started_at.elapsed().as_secs_f64() * 1000.0;
+    // From here on (the scene, the next frame's pretick) changes need frames again.
+    if let Some(frame) = &mut state.frame_in_preparation {
+        frame.open = false;
+    }
     if ShojiWM::motion_trace_enabled() {
         log_motion_trace_frame(state, &output, motion_trace_frame_tick);
     }
@@ -6192,6 +6222,9 @@ fn render_surface(
                 .composition_windows
                 .insert(output.name(), composition_windows);
         }
+        state
+            .output_drawn_windows
+            .insert(output.name(), windows_top_to_bottom);
         let mut built = built?;
         for snapshot in live_window_snapshots
             .values()
@@ -6978,6 +7011,7 @@ fn render_surface(
                 return Err(err);
             }
         };
+        crate::frame_stats::record_render(&output.name(), !gated);
         if gated {
             crate::frame_stats::record(&output.name(), |frames| frames.unchanged += 1);
         } else {
@@ -14205,6 +14239,7 @@ pub(crate) fn forget_output(state: &mut ShojiWM, output: &Output) {
     state.hdr_cursor_caches.remove(&output_name);
     state.cursor_transform_caches.remove(&output_name);
     state.runtime_animation_outputs.remove(&output_name);
+    state.output_drawn_windows.remove(&output_name);
     state.damage_blink_visible.remove(&output_name);
     state.damage_blink_pending.remove(&output_name);
     state.damage_blink_capture_suppression.remove(&output_name);
@@ -15038,7 +15073,13 @@ fn schedule_estimated_vblank_callback(
                         "tty frame liveness: estimated vblank queued redraw",
                     );
                 }
-                state.schedule_redraw();
+                // The redraw that waited is this output's: the others took theirs
+                // when it was asked for (`queue_tty_redraws`).
+                if crate::perf_options::PerfOption::TargetedRedraw.enabled() {
+                    state.schedule_output_redraw(&output.name());
+                } else {
+                    state.schedule_redraw();
+                }
             } else {
                 if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG") {
                     tracing::info!(
