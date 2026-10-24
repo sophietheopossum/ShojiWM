@@ -282,6 +282,41 @@ fn ratchet_frame_target(
     }
 }
 
+/// The vblank time a flip event carries, when the driver gave one.
+///
+/// A zero timestamp is no timestamp: amdgpu reports one for the flip that follows a
+/// modeset (after another output was unplugged, say). Taken at face value it is a vblank
+/// at boot time. Every "did the driver timestamp this flip" decision goes through here,
+/// so the exact-target path, the grid input and the presentation flags cannot disagree.
+fn flip_timestamp(time: DrmEventTime) -> Option<Duration> {
+    match time {
+        DrmEventTime::Monotonic(tp) if !tp.is_zero() => Some(tp),
+        _ => None,
+    }
+}
+
+/// The vblank a flip observed at `observed` completed at, and the next frame's presentation
+/// time after it.
+///
+/// A driver timestamp (`timestamped`) is that vblank, so the next one is exactly a period
+/// later, and the grid could only add error: after a mode change or a resume its history
+/// lies on a phase that no longer exists, and an early target holds commit-timed clients
+/// back a frame. Without one, `observed` is when the event was dispatched, and only the
+/// grid of recent observations can recover the vblank.
+fn next_frame_after_flip(
+    timestamped: bool,
+    history: &std::collections::VecDeque<Duration>,
+    observed: Duration,
+    last_grid_target: Option<Duration>,
+    period: Duration,
+) -> (Duration, Duration) {
+    if timestamped {
+        return (observed, observed + period);
+    }
+    let (vblank, next) = vblank_grid(history, observed, period);
+    (vblank, ratchet_frame_target(last_grid_target, next, period))
+}
+
 fn sanitize_next_frame_target(
     next_frame_target: Option<Duration>,
     fallback_frame_time: Duration,
@@ -1707,6 +1742,10 @@ fn reset_surface_after_tty_pause(surface: &mut SurfaceData) {
     surface.frame_callback_timer_armed = false;
     surface.commit_timing_timer_armed = false;
     surface.next_frame_target = None;
+    // The vblank phase does not survive losing DRM access, and the grid would keep placing
+    // frames on the old one for dozens of flips.
+    surface.vblank_observations.clear();
+    surface.last_grid_frame_target = None;
     surface.tearing_active = false;
     surface.redraw_state = TtyRedrawState::Idle;
 }
@@ -1812,6 +1851,9 @@ fn power_on_surface(surface: &mut SurfaceData) {
     if let Some(target) = surface.cross_gpu.as_mut() {
         target.reset(&surface.output);
     }
+    // Switching the CRTC off lost its vblank phase too, so the grid starts over.
+    surface.vblank_observations.clear();
+    surface.last_grid_frame_target = None;
     surface.redraw_state = if surface.frame_pending {
         TtyRedrawState::WaitingForVBlank {
             redraw_needed: true,
@@ -2252,7 +2294,8 @@ fn drivers_take_part_in_implicit_sync(drivers: &[Option<String>]) -> bool {
 #[cfg(test)]
 mod vblank_grid_tests {
     use super::{
-        VBLANK_GRID_HISTORY, ratchet_frame_target, sanitize_next_frame_target, vblank_grid,
+        DrmEventTime, VBLANK_GRID_HISTORY, flip_timestamp, next_frame_after_flip,
+        ratchet_frame_target, sanitize_next_frame_target, vblank_grid,
     };
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -2347,6 +2390,58 @@ mod vblank_grid_tests {
         assert_eq!(
             sanitize_next_frame_target(Some(fallback + period), fallback, period),
             (fallback + period, false)
+        );
+    }
+
+    /// A driver timestamp is the vblank itself, so the next frame is exactly a period later
+    /// whatever the history says. Here it is from before a mode change (another period and
+    /// phase), and the last target is one the grid would ratchet past.
+    #[test]
+    fn a_timestamped_flip_targets_the_next_vblank_exactly() {
+        let period = us(PERIOD_US);
+        let stale: VecDeque<Duration> = (0..VBLANK_GRID_HISTORY)
+            .map(|index| us(1_000_000.0 + index as f64 * 16_666.0 + 3_000.0))
+            .collect();
+        let observed = us(2_000_000.0);
+        assert_eq!(
+            next_frame_after_flip(true, &stale, observed, Some(observed + period / 4), period),
+            (observed, observed + period)
+        );
+    }
+
+    /// Without a timestamp the grid still decides: a late dispatch is pulled back onto the
+    /// phase of the promptest observations.
+    #[test]
+    fn an_untimestamped_flip_still_uses_the_grid() {
+        let period = us(PERIOD_US);
+        let history: VecDeque<Duration> = [100.0, 4_200.0, 150.0, 6_000.0, 3_000.0]
+            .iter()
+            .enumerate()
+            .map(|(index, delay)| us(1_000_000.0 + index as f64 * PERIOD_US + delay))
+            .collect();
+        let observed = *history.back().unwrap();
+        let (_, next) = next_frame_after_flip(false, &history, observed, None, period);
+        let expected = 1_000_000.0 + 5.0 * PERIOD_US + 100.0;
+        let predicted = next.as_secs_f64() * 1_000_000.0;
+        assert!(
+            (predicted - expected).abs() < 1.0,
+            "predicted {predicted} us"
+        );
+    }
+
+    /// amdgpu reports a zero timestamp for the flip after a modeset. It must count as
+    /// untimestamped (grid path), never as an exact vblank at boot time; only a nonzero
+    /// monotonic timestamp is the vblank itself.
+    #[test]
+    fn a_zero_driver_timestamp_is_no_timestamp() {
+        assert_eq!(flip_timestamp(DrmEventTime::Monotonic(Duration::ZERO)), None);
+        assert_eq!(
+            flip_timestamp(DrmEventTime::Realtime(std::time::SystemTime::UNIX_EPOCH)),
+            None
+        );
+        assert_eq!(
+            flip_timestamp(DrmEventTime::Monotonic(us(1_000_000.0))),
+            Some(us(1_000_000.0))
         );
     }
 }
@@ -2532,38 +2627,33 @@ fn frame_finish(
         .as_ref()
         .map(|metadata| metadata.sequence)
         .unwrap_or(0);
-    // A zero timestamp is no timestamp: amdgpu reports one for the flip that follows a
-    // modeset (after another output was unplugged, say). Taken at face value it is a vblank
-    // at boot time, and the grid below underflowed on it.
-    let presentation_clock = metadata
-        .as_ref()
-        .and_then(|metadata| match metadata.time {
-            DrmEventTime::Monotonic(tp) if !tp.is_zero() => Some(tp),
-            _ => None,
-        })
-        .unwrap_or_else(|| Duration::from(state.clock.now()));
-    // The next frame's presentation time, on the output's vblank grid. It is what frame
-    // callbacks report and what frame-driven runtime work (kinetic scrolling) is stamped
-    // with, so it has to advance by whole refresh periods: `presentation_clock` itself is
-    // only as good as the driver's timestamp, and NVIDIA's flip events carry none, which
-    // leaves the time this event was dispatched — late by however long the main thread
-    // was busy. Stepping a glide by those gaps (8, 12, 10.7, 10 ms while the display
-    // flipped every 8.33) was the judder in kinetic scrolling.
-    if surface.vblank_observations.len() == VBLANK_GRID_HISTORY {
-        surface.vblank_observations.pop_front();
+    let driver_timestamp = metadata.as_ref().and_then(|m| flip_timestamp(m.time));
+    let presentation_clock =
+        driver_timestamp.unwrap_or_else(|| Duration::from(state.clock.now()));
+    // The next frame's presentation time. It is what frame callbacks report and what
+    // frame-driven runtime work (kinetic scrolling) is stamped with, so it has to advance
+    // by whole refresh periods. With a driver timestamp `presentation_clock` is the vblank
+    // itself. NVIDIA's flip events carry none, which leaves the time this event was
+    // dispatched — late by however long the main thread was busy. Stepping a glide by those
+    // gaps (8, 12, 10.7, 10 ms while the display flipped every 8.33) was the judder in
+    // kinetic scrolling, so there the target comes from the output's vblank grid instead.
+    let timestamped = driver_timestamp.is_some();
+    if !timestamped {
+        if surface.vblank_observations.len() == VBLANK_GRID_HISTORY {
+            surface.vblank_observations.pop_front();
+        }
+        surface.vblank_observations.push_back(presentation_clock);
     }
-    surface.vblank_observations.push_back(presentation_clock);
-    let (grid_vblank, mut next_frame_target) = vblank_grid(
+    let (grid_vblank, next_frame_target) = next_frame_after_flip(
+        timestamped,
         &surface.vblank_observations,
         presentation_clock,
-        surface.frame_duration,
-    );
-    next_frame_target = ratchet_frame_target(
         surface.last_grid_frame_target,
-        next_frame_target,
         surface.frame_duration,
     );
-    surface.last_grid_frame_target = Some(next_frame_target);
+    if !timestamped {
+        surface.last_grid_frame_target = Some(next_frame_target);
+    }
     surface.next_frame_target = Some(next_frame_target);
     if ShojiWM::motion_trace_enabled() {
         info!(
@@ -2571,9 +2661,7 @@ fn frame_finish(
             presented_ms = presentation_clock.as_secs_f64() * 1000.0,
             grid_ms = grid_vblank.as_secs_f64() * 1000.0,
             next_frame_target_ms = next_frame_target.as_secs_f64() * 1000.0,
-            timestamped = metadata
-                .as_ref()
-                .is_some_and(|metadata| matches!(metadata.time, DrmEventTime::Monotonic(_))),
+            timestamped,
             sequence = present_sequence,
             "motion trace: vblank"
         );
@@ -2661,10 +2749,7 @@ fn frame_finish(
     if let Ok(user_data) = submit_result {
         let clock = presentation_clock;
         let sequence = present_sequence;
-        let flags = if metadata
-            .as_ref()
-            .is_some_and(|metadata| matches!(metadata.time, DrmEventTime::Monotonic(_)))
-        {
+        let flags = if timestamped {
             wp_presentation_feedback::Kind::Vsync
                 | wp_presentation_feedback::Kind::HwClock
                 | wp_presentation_feedback::Kind::HwCompletion
@@ -13214,6 +13299,9 @@ pub fn apply_tty_output_mode(
                     &DrmOutputRenderElements::default(),
                 )?;
             surface.frame_duration = Duration::from_secs_f64(1_000f64 / mode.refresh as f64);
+            // Observations from the old mode lie on another period and phase.
+            surface.vblank_observations.clear();
+            surface.last_grid_frame_target = None;
             if surface.powered_off {
                 // The new mode applies at power-on. `use_mode` itself may commit (smithay's
                 // modeset bandwidth fallback), so make sure the panel stays dark.
