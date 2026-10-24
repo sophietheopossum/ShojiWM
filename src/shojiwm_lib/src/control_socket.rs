@@ -232,7 +232,7 @@ fn read_command(stream: &UnixStream) -> Result<Command, String> {
 }
 
 /// Client side: send `command` to the running compositor. `Some` carries a
-/// reply with content (`frame-stats`).
+/// reply with content (`frame-stats`, `frame-debug`).
 ///
 /// The socket comes from `SHOJIWM_SOCKET`, or failing that from
 /// `WAYLAND_DISPLAY`, so a shell started inside the session finds it either way.

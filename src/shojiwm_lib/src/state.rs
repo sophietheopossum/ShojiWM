@@ -5274,6 +5274,9 @@ impl ShojiWM {
     #[track_caller]
     pub fn schedule_redraw(&mut self) {
         let caller = std::panic::Location::caller();
+        if crate::frame_stats::debugging() {
+            crate::frame_stats::record_redraw_caller(caller);
+        }
         if std::env::var_os("SHOJI_REDRAW_STATS")
             .is_some_and(|value| value != "0" && !value.is_empty())
         {

@@ -1424,8 +1424,8 @@ pub fn init_winit(
                                     .map(|mode| Duration::from_secs_f64(1_000f64 / mode.refresh as f64))
                                     .unwrap_or(Duration::ZERO);
                             state.pre_repaint(&output, frame_target);
-                            if crate::env_flag!("SHOJI_FRAME_DAMAGE_DEBUG") {
-                                let damaged = damage_probe.frame(&output, &elements);
+                            // Frame debugging: the frame's damage as an age-1 tracker would see it.
+                            if let Some(damaged) = crate::frame_stats::probe_frame(&output, &elements) {
                                 crate::frame_stats::record(&output.name(), |frames| {
                                     if damaged {
                                         frames.committed += 1;
