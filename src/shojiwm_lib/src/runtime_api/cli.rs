@@ -34,8 +34,9 @@ pub struct CommonArgs {
     pub extra: BTreeMap<String, String>,
     pub help: bool,
     pub version: bool,
-    /// `-q/--quit`, `-r/--reload` or `--frame-stats`: tell the running
-    /// compositor to do that (or ask it) instead of starting one.
+    /// `-q/--quit`, `-r/--reload`, `--frame-stats`, `--frame-debug [on|off]`,
+    /// `--perf-option NAME=on|off` or `--perf-options`: tell the running compositor to do that
+    /// (or ask it) instead of starting one.
     pub control_command: Option<crate::control_socket::Command>,
 }
 
@@ -107,6 +108,25 @@ impl CommonArgs {
                 Some(crate::control_socket::Command::Reload)
             } else if flag("--frame-stats") {
                 Some(crate::control_socket::Command::FrameStats)
+            } else if flag("--frame-debug")
+                || args.iter().any(|arg| arg.starts_with("--frame-debug="))
+            {
+                Some(match parse_option_value(args, "--frame-debug").as_deref() {
+                    Some("on") => crate::control_socket::Command::FrameDebugOn,
+                    Some("off") => crate::control_socket::Command::FrameDebugOff,
+                    _ => crate::control_socket::Command::FrameDebugTake,
+                })
+            } else if flag("--perf-options") {
+                Some(crate::control_socket::Command::PerfOptions)
+            } else if let Some(value) = parse_option_value(args, "--perf-option") {
+                value.split_once('=').and_then(|(name, state)| {
+                    let option = crate::perf_options::PerfOption::parse(name)?;
+                    match state {
+                        "on" => Some(crate::control_socket::Command::PerfOption(option, true)),
+                        "off" => Some(crate::control_socket::Command::PerfOption(option, false)),
+                        _ => None,
+                    }
+                })
             } else {
                 None
             },
@@ -153,6 +173,18 @@ const COMMON_HELP: &[(&str, &str)] = &[
     (
         "--frame-stats",
         "Print the running ShojiWM's per-output frame counters as JSON",
+    ),
+    (
+        "--frame-debug [on|off]",
+        "Turn the running ShojiWM's frame debugging on or off, or print (and clear) what it collected as JSON",
+    ),
+    (
+        "--perf-option <NAME=on|off>",
+        "Turn one of the running ShojiWM's rendering shortcuts (frame-gate, targeted-redraw, clip-opaque) on or off",
+    ),
+    (
+        "--perf-options",
+        "Print the running ShojiWM's rendering shortcuts as JSON",
     ),
     ("-h, --help", "Print this help"),
     ("-V, --version", "Print the version"),
@@ -264,6 +296,32 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_frame_debug() {
+        use crate::control_socket::Command;
+        let command = |values: &[&str]| CommonArgs::parse(&args(values), &[]).control_command;
+        assert_eq!(
+            command(&["--frame-debug", "on"]),
+            Some(Command::FrameDebugOn)
+        );
+        assert_eq!(
+            command(&["--frame-debug=off"]),
+            Some(Command::FrameDebugOff)
+        );
+        assert_eq!(command(&["--frame-debug"]), Some(Command::FrameDebugTake));
+        use crate::perf_options::PerfOption;
+        assert_eq!(command(&["--perf-options"]), Some(Command::PerfOptions));
+        assert_eq!(
+            command(&["--perf-option", "clip-opaque=off"]),
+            Some(Command::PerfOption(PerfOption::ClipOpaque, false))
+        );
+        assert_eq!(
+            command(&["--perf-option=frame-gate=on"]),
+            Some(Command::PerfOption(PerfOption::FrameGate, true))
+        );
+        assert_eq!(command(&["--perf-option", "nope=on"]), None);
     }
 
     #[test]

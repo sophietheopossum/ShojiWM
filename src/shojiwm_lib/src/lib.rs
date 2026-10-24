@@ -40,6 +40,7 @@ pub mod keyboard_layout;
 pub mod log_rate_limit;
 pub mod modifier_tap;
 pub mod output_power;
+pub mod perf_options;
 pub mod plasma_virtual_desktop;
 pub mod plasma_window_management;
 pub mod pointer_dispatch;
