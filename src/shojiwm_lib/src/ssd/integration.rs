@@ -7619,6 +7619,9 @@ fn collect_text_buffers(
         return;
     }
 
+    // A scale transform on the label or an ancestor shrinks its rect: the
+    // text shrinks with it, as borders and radii do (`node_geometry`).
+    let text_scale = node.transform_scale.0.min(node.transform_scale.1) as f32;
     let spec = LabelSpec {
         rect: node.rect,
         rect_precise: Some(
@@ -7631,12 +7634,16 @@ fn collect_text_buffers(
         font_size: node
             .style
             .font_size
-            .unwrap_or(crate::ssd::DEFAULT_LABEL_FONT_SIZE) as f32,
+            .unwrap_or(crate::ssd::DEFAULT_LABEL_FONT_SIZE) as f32
+            * text_scale,
         font_weight: node.style.font_weight.clone(),
         font_family: node.style.font_family.clone(),
         text_align: node.style.text_align.clone(),
         text_overflow: node.style.text_overflow.clone(),
-        line_height: node.style.line_height.map(|value| value as f32),
+        line_height: node
+            .style
+            .line_height
+            .map(|value| value as f32 * text_scale),
         raster_scale,
     };
 
@@ -8520,12 +8527,28 @@ mod tests {
     fn pending_label_recolor_keeps_old_pixel_metadata_until_rasterized() {
         use crate::backend::{async_assets::AsyncAssetJob, text::TextRasterizer};
         let layout = |text: &str, color| {
-            let mut label = DecorationNode::new(DecorationNodeKind::Label(super::super::LabelNode { text: text.into() }))
-                .with_style(DecorationStyle { width: Some(40.0), height: Some(20.0), color: Some(color), ..Default::default() });
+            let mut label =
+                DecorationNode::new(DecorationNodeKind::Label(super::super::LabelNode {
+                    text: text.into(),
+                }))
+                .with_style(DecorationStyle {
+                    width: Some(40.0),
+                    height: Some(20.0),
+                    color: Some(color),
+                    ..Default::default()
+                });
             label.stable_id = Some("day".into());
-            DecorationTree::new(DecorationNode::new(DecorationNodeKind::Box(BoxNode { direction: LayoutDirection::Column }))
-                .with_children(vec![label, DecorationNode::new(DecorationNodeKind::WindowSlot)]))
-                .layout_for_client(LogicalRect::new(0, 20, 100, 100)).unwrap()
+            DecorationTree::new(
+                DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                    direction: LayoutDirection::Column,
+                }))
+                .with_children(vec![
+                    label,
+                    DecorationNode::new(DecorationNodeKind::WindowSlot),
+                ]),
+            )
+            .layout_for_client(LogicalRect::new(0, 20, 100, 100))
+            .unwrap()
         };
         let old = layout("12", Color::rgba(0, 0, 0, 255));
         let old_order = build_render_order_map(&old);
@@ -8537,19 +8560,40 @@ mod tests {
         let geometry = build_node_geometry_map(&new);
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut asynchronous = TextRasterizer::new(Some(sender));
-        let pending = build_text_buffers_with_fallback(&new, &order, 1.0, &mut asynchronous, &previous);
-        assert!(matches!(receiver.try_recv(), Ok(AsyncAssetJob::Text { .. })));
-        assert_eq!(pending[0].color, previous[0].color, "fallback pixels still have the old ink");
-        assert!(text_buffers_need_raster_for_layout(&new, &geometry, &pending, 1.0));
+        let pending =
+            build_text_buffers_with_fallback(&new, &order, 1.0, &mut asynchronous, &previous);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AsyncAssetJob::Text { .. })
+        ));
+        assert_eq!(
+            pending[0].color, previous[0].color,
+            "fallback pixels still have the old ink"
+        );
+        assert!(text_buffers_need_raster_for_layout(
+            &new, &geometry, &pending, 1.0
+        ));
         let moved = retarget_text_buffers_with_node_geometry(&new, &order, &geometry, &pending);
-        assert_eq!(moved[0].color, previous[0].color, "moving pixels cannot recolor them");
+        assert_eq!(
+            moved[0].color, previous[0].color,
+            "moving pixels cannot recolor them"
+        );
         let replaced = layout("21", Color::WHITE);
-        let moved = retarget_text_buffers_with_node_geometry(&replaced, &build_render_order_map(&replaced),
-            &build_node_geometry_map(&replaced), &pending);
-        assert_eq!(moved[0].text, "12", "moving pixels cannot change their text either");
+        let moved = retarget_text_buffers_with_node_geometry(
+            &replaced,
+            &build_render_order_map(&replaced),
+            &build_node_geometry_map(&replaced),
+            &pending,
+        );
+        assert_eq!(
+            moved[0].text, "12",
+            "moving pixels cannot change their text either"
+        );
         let ready = build_text_buffers_with_fallback(&new, &order, 1.0, &mut sync, &pending);
         assert_eq!(ready[0].color, Color::WHITE);
-        assert!(!text_buffers_need_raster_for_layout(&new, &geometry, &ready, 1.0));
+        assert!(!text_buffers_need_raster_for_layout(
+            &new, &geometry, &ready, 1.0
+        ));
     }
 
     #[test]
