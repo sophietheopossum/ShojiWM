@@ -351,9 +351,14 @@ fn apply_cached_tree_update(
         (Some(_), false) => Err(DecorationEvaluationError::RuntimeProtocol(
             "cached composition returned both a full tree and patches".into(),
         )),
-        (None, true) => Err(DecorationEvaluationError::RuntimeProtocol(
-            "cached composition returned neither a full tree nor patches".into(),
-        )),
+        // A cached runtime can be polled after another evaluation consumed its
+        // dirty nodes, or because only its effects changed. An empty patch list
+        // retains the tree; rejecting it aborts the whole output refresh and
+        // prevents later windows from receiving their first evaluation.
+        (None, true) => Ok(CachedTreeUpdate {
+            changed: false,
+            layout_equivalent: true,
+        }),
         (None, false) => {
             let mut changed = false;
             let mut layout_equivalent = true;
@@ -1590,7 +1595,7 @@ impl ShojiWM {
         if !invocation.invoked {
             self.live_window_snapshots
                 .insert(window_id.to_string(), live_snapshot);
-            // Other windows' changes came with it.
+            // Other windows' changes came with it: see invoke_decoration_handler.
             self.apply_runtime_handler_mutation(invocation);
             return Ok(false);
         }
@@ -2750,6 +2755,30 @@ impl ShojiWM {
     pub fn refresh_window_decorations_for_output(
         &mut self,
         target_output_name: Option<&str>,
+    ) -> Result<(), DecorationEvaluationError> {
+        // A pass can run inside another: one drains the runtime's messages,
+        // and a synthesized press among them refreshes before it is handled.
+        // Only the outermost pass opens and closes the record of windows
+        // marked meanwhile. An inner pass that replaced it would let the
+        // outer one clear a window marked after it was processed, and the
+        // runtime reports a window once until it is evaluated: it would
+        // never be refreshed again.
+        let outermost = self.runtime_dirty_marked_during_refresh.is_none();
+        if outermost {
+            self.runtime_dirty_marked_during_refresh = Some(Default::default());
+        }
+        let result = self.refresh_window_decorations_pass(target_output_name, outermost);
+        if outermost {
+            // Closed by the pass, unless it failed before its end.
+            self.runtime_dirty_marked_during_refresh = None;
+        }
+        result
+    }
+
+    fn refresh_window_decorations_pass(
+        &mut self,
+        target_output_name: Option<&str>,
+        outermost: bool,
     ) -> Result<(), DecorationEvaluationError> {
         timescope::scope!("ssd refresh_window_decorations_for_output");
         let refresh_started_at = Instant::now();
@@ -4907,7 +4936,12 @@ impl ShojiWM {
             elapsed_ms = refresh_elapsed_ms,
             "refresh_window_decorations finished"
         );
-        let marked_during_refresh = self.runtime_dirty_marked_during_refresh.take().unwrap_or_default();
+        let marked_during_refresh = if outermost {
+            self.runtime_dirty_marked_during_refresh.take()
+        } else {
+            self.runtime_dirty_marked_during_refresh.clone()
+        }
+        .unwrap_or_default();
         for window_id in processed_runtime_dirty_window_ids {
             // Marked again after it was processed: refresh it next time.
             if marked_during_refresh.contains(&window_id) {
@@ -4935,6 +4969,7 @@ impl ShojiWM {
         self.async_asset_dirty = false;
         self.sync_taskbar_window_states();
         self.sync_popup_dismissals();
+        self.refresh_decoration_hover();
 
         Ok(())
     }
@@ -6024,6 +6059,9 @@ fn sample_easing(easing: ManagedWindowAnimationEasingSnapshot, progress: f64) ->
         ManagedWindowAnimationEasingSnapshot::CubicBezier { x1, y1, x2, y2 } => {
             sample_cubic_bezier(x1, y1, x2, y2, progress)
         }
+        ManagedWindowAnimationEasingSnapshot::Spring { stiffness, damping, mass } => {
+            ManagedWindowAnimationEasingSnapshot::spring_progress(stiffness, damping, mass, progress)
+        }
     }
 }
 
@@ -6962,7 +7000,7 @@ fn collect_retargeted_text_buffers(
         );
     });
 
-    let super::DecorationNodeKind::Label(label) = &node.kind else {
+    let super::DecorationNodeKind::Label(_) = &node.kind else {
         return;
     };
 
@@ -6975,9 +7013,12 @@ fn collect_retargeted_text_buffers(
         .stable_id
         .as_deref()
         .and_then(|stable_id| node_geometry.node_geometry(stable_id));
-    let rect_precise = shared_geometry
-        .map(|geometry| geometry.rect_precise)
-        .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect));
+    let (grow, grow_precise) = blur_growth(crate::backend::blur::quantize(node.style.blur.unwrap_or(0.0)));
+    let rect_precise = grow_precise(
+        shared_geometry
+            .map(|geometry| geometry.rect_precise)
+            .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
+    );
     let clip_rect_precise = shared_geometry
         .and_then(|geometry| geometry.clip_rect_precise)
         .or_else(|| {
@@ -6991,18 +7032,16 @@ fn collect_retargeted_text_buffers(
     buffer.owner_node_id = node.stable_id.clone();
     buffer.stable_key = stable_key.clone();
     buffer.order = *order_map.get(&stable_key).unwrap_or(&usize::MAX);
-    buffer.rect = node.rect;
+    buffer.rect = grow(node.rect);
     buffer.rect_precise = Some(rect_precise);
     buffer.clip_rect = node.effective_clip.map(|clip| clip.rect);
     buffer.clip_radius = node.effective_clip.map(|clip| clip.radius).unwrap_or(0);
     buffer.clip_rect_precise = clip_rect_precise;
     buffer.clip_radius_precise = clip_radius_precise;
-    buffer.text = label.text.clone();
-    buffer.color = node
-        .style
-        .color
-        .unwrap_or(super::Color::WHITE)
-        .with_opacity(node.style.opacity);
+    buffer.opacity = node.style.opacity.unwrap_or(1.0);
+    // Retargeting moves existing pixels; it does not rasterize new text or
+    // ink. Keep their metadata truthful so a later raster check can detect
+    // a pending content/appearance change instead of accepting stale pixels.
     buffers.push(buffer);
 }
 
@@ -7067,9 +7106,12 @@ fn collect_retargeted_icon_buffers(
         .stable_id
         .as_deref()
         .and_then(|stable_id| node_geometry.node_geometry(stable_id));
-    let rect_precise = shared_geometry
-        .map(|geometry| geometry.rect_precise)
-        .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect));
+    let (grow, grow_precise) = blur_growth(crate::backend::blur::quantize(node.style.blur.unwrap_or(0.0)));
+    let rect_precise = grow_precise(
+        shared_geometry
+            .map(|geometry| geometry.rect_precise)
+            .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
+    );
     let clip_rect_precise = shared_geometry
         .and_then(|geometry| geometry.clip_rect_precise)
         .or_else(|| {
@@ -7083,12 +7125,13 @@ fn collect_retargeted_icon_buffers(
     buffer.owner_node_id = node.stable_id.clone();
     buffer.stable_key = stable_key.clone();
     buffer.order = *order_map.get(&stable_key).unwrap_or(&usize::MAX);
-    buffer.rect = node.rect;
+    buffer.rect = grow(node.rect);
     buffer.rect_precise = Some(rect_precise);
     buffer.clip_rect = node.effective_clip.map(|clip| clip.rect);
     buffer.clip_radius = node.effective_clip.map(|clip| clip.radius).unwrap_or(0);
     buffer.clip_rect_precise = clip_rect_precise;
     buffer.clip_radius_precise = clip_radius_precise;
+    buffer.opacity = node.style.opacity.unwrap_or(1.0);
 
     if matches!(&node.kind, super::DecorationNodeKind::AppIcon(icon) if icon.fallback.is_none())
         && snapshot.icon.is_none()
@@ -7332,6 +7375,25 @@ fn is_descendant_node_id(node_id: &str, ancestor_id: &str) -> bool {
         && matches!(node_id.as_bytes()[ancestor_id.len()], b'.' | b'/')
 }
 
+/// Rects grown by the reach of a `blur` (logical px), for a blurred label
+/// or icon rasterized with room for its blur.
+fn blur_growth(
+    blur: f32,
+) -> (impl Fn(LogicalRect) -> LogicalRect, impl Fn(PreciseLogicalRect) -> PreciseLogicalRect) {
+    let pad = crate::backend::blur::padding(blur);
+    (
+        move |rect: LogicalRect| {
+            LogicalRect::new(rect.x - pad, rect.y - pad, rect.width + 2 * pad, rect.height + 2 * pad)
+        },
+        move |rect: PreciseLogicalRect| PreciseLogicalRect {
+            x: rect.x - pad as f32,
+            y: rect.y - pad as f32,
+            width: rect.width + 2.0 * pad as f32,
+            height: rect.height + 2.0 * pad as f32,
+        },
+    )
+}
+
 fn node_id_matches_dirty_scope(
     node_id: &str,
     dirty_node_ids: &std::collections::HashSet<&str>,
@@ -7494,6 +7556,7 @@ fn collect_cached_buffers(
                 .filter(|clip| clip.radius.raw() > 0)
                 .or(clips.nearest_rounded);
             shader_buffers.push(CachedShaderEffect {
+                opacity: node.style.opacity.unwrap_or(1.0),
                 owner_node_id: node.stable_id.clone(),
                 stable_key: format!("{path}:shader"),
                 order: *order_map
@@ -7601,16 +7664,21 @@ fn collect_text_buffers(
     if color.a == 0 {
         return;
     }
+    // A blurred label is drawn over its rect grown by the blur's reach.
+    let blur = crate::backend::blur::quantize(node.style.blur.unwrap_or(0.0));
+    let (grow, grow_precise) = blur_growth(blur);
 
     let spec = LabelSpec {
-        rect: node.rect,
-        rect_precise: Some(
+        rect: grow(node.rect),
+        rect_precise: Some(grow_precise(
             shared_geometry
                 .map(|geometry| geometry.rect_precise)
                 .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
-        ),
+        )),
         text: label.text.clone(),
-        color: color.with_opacity(node.style.opacity),
+        // Opacity is applied when drawn (`opacity` below): baked into the
+        // colour, every step of a fade would rasterize the text again.
+        color,
         font_size: node.style.font_size.unwrap_or(13.0) as f32,
         font_weight: node.style.font_weight.clone(),
         font_family: node.style.font_family.clone(),
@@ -7618,13 +7686,16 @@ fn collect_text_buffers(
         text_overflow: node.style.text_overflow.clone(),
         line_height: node.style.line_height.map(|value| value as f32),
         raster_scale,
+        blur,
     };
 
     let stable_key = format!("{path}:label");
     let order = *order_map.get(&stable_key).unwrap_or(&usize::MAX);
-    let current_rect_precise = shared_geometry
-        .map(|geometry| geometry.rect_precise)
-        .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect));
+    let current_rect_precise = grow_precise(
+        shared_geometry
+            .map(|geometry| geometry.rect_precise)
+            .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
+    );
     let current_clip_rect_precise = shared_geometry
         .and_then(|geometry| geometry.clip_rect_precise)
         .or_else(|| {
@@ -7662,6 +7733,7 @@ fn collect_text_buffers(
         buffer.clip_radius = node.effective_clip.map(|clip| clip.radius).unwrap_or(0);
         buffer.clip_rect_precise = current_clip_rect_precise;
         buffer.clip_radius_precise = current_clip_radius_precise;
+        buffer.opacity = node.style.opacity.unwrap_or(1.0);
         if label_debug_enabled() {
             info!(
                 stable_key = %buffer.stable_key,
@@ -7690,6 +7762,7 @@ fn collect_text_buffers(
             spec.rect,
             current_rect_precise,
             spec.text_align.as_deref(),
+            blur,
         );
         buffer.owner_node_id = node.stable_id.clone();
         buffer.stable_key = stable_key;
@@ -7715,7 +7788,10 @@ fn collect_text_buffers(
                 buffer.clip_radius_precise = None;
             }
         }
-        buffer.color = spec.color;
+        buffer.opacity = node.style.opacity.unwrap_or(1.0);
+        // These are still the previous pixels while the async job runs.
+        // Recording the requested color here would make the next raster
+        // check accept the old texture as already recolored.
         if label_debug_enabled() {
             info!(
                 stable_key = %buffer.stable_key,
@@ -7750,15 +7826,27 @@ fn fallback_label_rect(
     rect: LogicalRect,
     rect_precise: PreciseLogicalRect,
     text_align: Option<&str>,
+    new_blur: f32,
 ) -> (LogicalRect, PreciseLogicalRect) {
     let old = previous
         .rect_precise
         .unwrap_or_else(|| precise_rect_from_logical(previous.rect));
     let free_x = rect_precise.width - old.width;
+    // Both rects are grown by their blur's padding around the text, so
+    // aligning the grown edges misplaces the text by the padding
+    // difference when the blur changed. A stand-in raster's blur is
+    // recorded as -1 (its pixels were made for some other blur of the
+    // same label); assume the current padding then.
+    let old_pad = if previous.blur >= 0.0 {
+        crate::backend::blur::padding(previous.blur)
+    } else {
+        crate::backend::blur::padding(new_blur)
+    } as f32;
+    let pad_delta = crate::backend::blur::padding(new_blur) as f32 - old_pad;
     let dx = match text_align {
         Some("center") => free_x * 0.5,
-        Some("end") => free_x,
-        _ => 0.0,
+        Some("end") => free_x - pad_delta,
+        _ => pad_delta,
     };
     // Text is centered vertically in its texture.
     let dy = (rect_precise.height - old.height) * 0.5;
@@ -7854,11 +7942,8 @@ fn text_buffers_need_raster_for_node(
 
     let stable_key = format!("{path}:label");
     let previous_buffer = fallback_text_buffer(previous, node.stable_id.as_deref(), &stable_key);
-    let color = node
-        .style
-        .color
-        .unwrap_or(super::Color::WHITE)
-        .with_opacity(node.style.opacity);
+    // Opacity is applied when drawn, not rasterized.
+    let color = node.style.color.unwrap_or(super::Color::WHITE);
     let expects_no_buffer =
         label.text.is_empty() || node.rect.width <= 0 || node.rect.height <= 0 || color.a == 0;
     if expects_no_buffer {
@@ -7873,18 +7958,24 @@ fn text_buffers_need_raster_for_node(
         .stable_id
         .as_deref()
         .and_then(|stable_id| node_geometry.node_geometry(stable_id));
-    let rect_precise = shared_geometry
-        .map(|geometry| geometry.rect_precise)
-        .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect));
+    let blur = crate::backend::blur::quantize(node.style.blur.unwrap_or(0.0));
+    let (grow, grow_precise) = blur_growth(blur);
+    let rect = grow(node.rect);
+    let rect_precise = grow_precise(
+        shared_geometry
+            .map(|geometry| geometry.rect_precise)
+            .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
+    );
     let previous_rect_precise = previous_buffer
         .rendered_rect_precise
         .unwrap_or_else(|| precise_rect_from_logical(previous_buffer.rendered_rect));
 
     previous_buffer.text != label.text
         || previous_buffer.color != color
+        || previous_buffer.blur != blur
         || previous_buffer.raster_scale != raster_scale
-        || previous_buffer.rendered_rect.width != node.rect.width
-        || previous_buffer.rendered_rect.height != node.rect.height
+        || previous_buffer.rendered_rect.width != rect.width
+        || previous_buffer.rendered_rect.height != rect.height
         || (previous_rect_precise.width - rect_precise.width).abs() > 0.001
         || (previous_rect_precise.height - rect_precise.height).abs() > 0.001
 }
@@ -7938,20 +8029,25 @@ fn collect_icon_buffers(
         .stable_id
         .as_deref()
         .and_then(|stable_id| node_geometry.node_geometry(stable_id));
+    // A blurred icon is drawn over its rect grown by the blur's reach.
+    let blur = crate::backend::blur::quantize(node.style.blur.unwrap_or(0.0));
+    let (grow, grow_precise) = blur_growth(blur);
+    let rect_precise = grow_precise(
+        shared_geometry
+            .map(|geometry| geometry.rect_precise)
+            .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
+    );
 
     let spec = IconSpec {
-        rect: node.rect,
-        rect_precise: Some(
-            shared_geometry
-                .map(|geometry| geometry.rect_precise)
-                .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
-        ),
+        rect: grow(node.rect),
+        rect_precise: Some(rect_precise),
         icon: source.icon.cloned(),
         app_id: source.app_id.map(str::to_owned),
         asset_path,
         image_fit,
         fallback_asset_path,
         raster_scale,
+        blur,
     };
 
     if let Some(buffer) = rasterizer.render_icon(&spec) {
@@ -7961,11 +8057,7 @@ fn collect_icon_buffers(
         buffer.order = *order_map
             .get(&format!("{path}:icon"))
             .unwrap_or(&usize::MAX);
-        buffer.rect_precise = Some(
-            shared_geometry
-                .map(|geometry| geometry.rect_precise)
-                .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
-        );
+        buffer.rect_precise = Some(rect_precise);
         buffer.clip_rect = node.effective_clip.map(|clip| clip.rect);
         buffer.clip_radius = node.effective_clip.map(|clip| clip.radius).unwrap_or(0);
         buffer.clip_rect_precise = shared_geometry
@@ -7977,6 +8069,7 @@ fn collect_icon_buffers(
         buffer.clip_radius_precise = node
             .resolved_effective_clip
             .map(|clip| node.frame.logical_len(clip.radius).max(0.0));
+        buffer.opacity = node.style.opacity.unwrap_or(1.0);
         buffers.push(buffer);
     }
 }
@@ -8503,6 +8596,79 @@ mod tests {
     };
 
     #[test]
+    fn a_gradient_alone_fills_the_box() {
+        use super::super::{GradientStop, LinearGradient, paint::PaintProgram};
+        let gradient = LinearGradient {
+            angle: 90.0,
+            stops: vec![
+                GradientStop { offset: 0.0, color: Color::rgba(0, 0, 255, 255) },
+                GradientStop { offset: 0.8, color: Color::rgba(0, 255, 0, 255) },
+                // Before the previous one: held at it, as CSS.
+                GradientStop { offset: 0.5, color: Color::rgba(255, 0, 0, 255) },
+            ],
+        };
+        let mut bar = DecorationNode::new(DecorationNodeKind::Box(BoxNode { direction: LayoutDirection::Row })).with_style(DecorationStyle {
+            width: Some(60.0),
+            height: Some(4.0),
+            border_radius: Some(2.0),
+            background_gradient: Some(gradient),
+            ..Default::default()
+        });
+        bar.stable_id = Some("bar".into());
+        let layout = DecorationTree::new(
+            DecorationNode::new(DecorationNodeKind::Box(BoxNode { direction: LayoutDirection::Column }))
+                .with_children(vec![bar, DecorationNode::new(DecorationNodeKind::WindowSlot)]),
+        )
+        .layout_for_client(LogicalRect::new(0, 20, 100, 100))
+        .unwrap();
+        let buffers = paint_buffers_for_layout(&layout);
+        let item = buffers.iter().find(|buffer| buffer.owner_node_id.as_deref() == Some("bar")).expect("the bar paints");
+        assert!(matches!(item.paint.program, PaintProgram::Box { fill: true, .. }), "a gradient fills without a colour");
+        let gradient = item.paint.gradient.expect("its gradient");
+        assert_eq!(gradient.count, 3);
+        assert_eq!(gradient.offsets, [0.0, 0.8, 0.8, 0.8]);
+        assert!((gradient.angle - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        assert_eq!(gradient.colors[3], Color::rgba(255, 0, 0, 255), "unused stops repeat the last");
+        assert!(item.paint.transparent_interior().is_none(), "a filled gradient has no hollow middle");
+    }
+
+    #[test]
+    fn pending_label_recolor_keeps_old_pixel_metadata_until_rasterized() {
+        use crate::backend::{async_assets::AsyncAssetJob, text::TextRasterizer};
+        let layout = |text: &str, color| {
+            let mut label = DecorationNode::new(DecorationNodeKind::Label(super::super::LabelNode { text: text.into() }))
+                .with_style(DecorationStyle { width: Some(40.0), height: Some(20.0), color: Some(color), ..Default::default() });
+            label.stable_id = Some("day".into());
+            DecorationTree::new(DecorationNode::new(DecorationNodeKind::Box(BoxNode { direction: LayoutDirection::Column }))
+                .with_children(vec![label, DecorationNode::new(DecorationNodeKind::WindowSlot)]))
+                .layout_for_client(LogicalRect::new(0, 20, 100, 100)).unwrap()
+        };
+        let old = layout("12", Color::rgba(0, 0, 0, 255));
+        let old_order = build_render_order_map(&old);
+        let mut sync = TextRasterizer::new(None);
+        let previous = build_text_buffers_with_fallback(&old, &old_order, 1.0, &mut sync, &[]);
+        assert_eq!(previous.len(), 1);
+        let new = layout("12", Color::WHITE);
+        let order = build_render_order_map(&new);
+        let geometry = build_node_geometry_map(&new);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut asynchronous = TextRasterizer::new(Some(sender));
+        let pending = build_text_buffers_with_fallback(&new, &order, 1.0, &mut asynchronous, &previous);
+        assert!(matches!(receiver.try_recv(), Ok(AsyncAssetJob::Text { .. })));
+        assert_eq!(pending[0].color, previous[0].color, "fallback pixels still have the old ink");
+        assert!(text_buffers_need_raster_for_layout(&new, &geometry, &pending, 1.0));
+        let moved = retarget_text_buffers_with_node_geometry(&new, &order, &geometry, &pending);
+        assert_eq!(moved[0].color, previous[0].color, "moving pixels cannot recolor them");
+        let replaced = layout("21", Color::WHITE);
+        let moved = retarget_text_buffers_with_node_geometry(&replaced, &build_render_order_map(&replaced),
+            &build_node_geometry_map(&replaced), &pending);
+        assert_eq!(moved[0].text, "12", "moving pixels cannot change their text either");
+        let ready = build_text_buffers_with_fallback(&new, &order, 1.0, &mut sync, &pending);
+        assert_eq!(ready[0].color, Color::WHITE);
+        assert!(!text_buffers_need_raster_for_layout(&new, &geometry, &ready, 1.0));
+    }
+
+    #[test]
     fn shader_clip_coverage_stays_inside_border_ring_at_fractional_scale() {
         // Numeric replication of the live render math for the terminal-glass
         // ShaderEffect (direct child of a WindowBorder). The shader display
@@ -9012,6 +9178,17 @@ mod tests {
         assert!(node_id_matches_dirty_scope("w1/0/2", &dirty));
         assert!(!node_id_matches_dirty_scope("w1/0/21", &dirty));
         assert!(!node_id_matches_dirty_scope("root.Box#barista", &dirty));
+    }
+
+    #[test]
+    fn cached_tree_empty_update_retains_the_tree() {
+        let root = DecorationNode::new(DecorationNodeKind::WindowSlot);
+        let mut tree = DecorationTree::new(root.clone());
+        let update = apply_cached_tree_update(&mut tree, None, Vec::new())
+            .expect("an unchanged cached composition is valid");
+        assert!(!update.changed);
+        assert!(update.layout_equivalent);
+        assert_eq!(tree.root, root);
     }
 
     #[test]

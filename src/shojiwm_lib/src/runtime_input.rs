@@ -482,7 +482,16 @@ pub fn apply_keyboard_config_for_backend_device<D: SmithayInputDevice>(
         .and_then(|snapshot| keyboard_config_for_snapshot(&state.runtime_input_config, snapshot))
         .filter(|keyboard| keyboard.has_xkb_config())
         .or(global_keyboard);
-    apply_keyboard_xkb_config(state, keyboard, "runtime keyboard device xkb config");
+    // A physical device (it has a snapshot; virtual keyboards do not)
+    // takes the seat keymap back from a virtual keyboard that installed
+    // its own, even when the configured keymap has not changed.
+    let restore = snapshot.is_some() && state.virtual_keyboard_keymap_active;
+    apply_keyboard_xkb_config_forced(
+        state,
+        keyboard,
+        "runtime keyboard device xkb config",
+        restore,
+    );
 }
 
 fn apply_keyboard_xkb_config(
@@ -490,7 +499,16 @@ fn apply_keyboard_xkb_config(
     keyboard: Option<RuntimeKeyboardInputConfig>,
     log_label: &'static str,
 ) {
-    if state.runtime_applied_xkb_config == keyboard {
+    apply_keyboard_xkb_config_forced(state, keyboard, log_label, false);
+}
+
+fn apply_keyboard_xkb_config_forced(
+    state: &mut ShojiWM,
+    keyboard: Option<RuntimeKeyboardInputConfig>,
+    log_label: &'static str,
+    force: bool,
+) {
+    if !force && state.runtime_applied_xkb_config == keyboard {
         return;
     }
     let Some(handle) = state.seat.get_keyboard() else {
@@ -509,6 +527,7 @@ fn apply_keyboard_xkb_config(
     match handle.set_xkb_config(state, xkb_config) {
         Ok(()) => {
             state.runtime_applied_xkb_config = keyboard;
+            state.virtual_keyboard_keymap_active = false;
             state.refresh_keyboard_focus_for_keymap_change();
         }
         Err(error) => {

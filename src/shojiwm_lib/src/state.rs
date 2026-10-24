@@ -68,6 +68,7 @@ use smithay::{
         selection::{
             data_device::DataDeviceState, primary_selection::PrimarySelectionState,
             wlr_data_control::DataControlState,
+            ext_data_control::DataControlState as ExtDataControlState,
         },
         session_lock::{LockSurface, SessionLockManagerState},
         shell::kde::decoration::KdeDecorationState,
@@ -333,6 +334,7 @@ pub struct ShojiWM {
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub data_control_state: DataControlState,
+    pub ext_data_control_state: ExtDataControlState,
     pub popups: PopupManager,
 
     pub seat: Seat<Self>,
@@ -401,9 +403,10 @@ pub struct ShojiWM {
     pub damage_blink_capture_suppression: HashMap<String, u8>,
     pub runtime_poll_dirty: bool,
     pub runtime_dirty_window_ids: std::collections::HashSet<String>,
-    /// Windows marked dirty while a decoration refresh pass runs (by a host
-    /// message it drains, say): the pass must not clear them with the
-    /// windows it processed earlier, or their changes are never refreshed.
+    /// Windows marked dirty while a decoration refresh pass runs (a hover
+    /// handler, say): the pass must not clear them with the windows it
+    /// processed earlier, or their changes are never refreshed. Kept by the
+    /// outermost pass when one runs inside another.
     pub runtime_dirty_marked_during_refresh: Option<std::collections::HashSet<String>>,
     pub runtime_managed_only_window_ids: std::collections::HashSet<String>,
     pub runtime_node_only_window_ids: std::collections::HashSet<String>,
@@ -456,6 +459,13 @@ pub struct ShojiWM {
     pub output_icc: HashMap<String, std::sync::Arc<crate::color::icc::IccLut>>,
     /// What the log last said about each configured profile (by `IccLut::id`).
     pub output_icc_status: HashMap<String, (u64, crate::backend::tty::IccProfileStatus)>,
+    /// Night light's colour temperature in kelvin
+    /// (`COMPOSITOR.output.set_night_light`); `None` while it is off.
+    pub night_light: Option<f32>,
+    /// The LUTs night light runs, by the profile they are composed with (by
+    /// `IccLut::id`; `None` for outputs without one, which share theirs),
+    /// with the temperature each was built for.
+    pub night_light_luts: HashMap<Option<u64>, (f32, std::sync::Arc<crate::color::icc::IccLut>)>,
     pub managed_window_animations: HashMap<String, BTreeMap<String, ActiveManagedWindowAnimation>>,
     pub managed_window_animation_sequence: u64,
     pub runtime_output_configs: std::collections::BTreeMap<String, RuntimeOutputConfig>,
@@ -487,6 +497,9 @@ pub struct ShojiWM {
     pub runtime_window_resize_modifier: Option<RuntimePointerModifier>,
     pub runtime_input_config: RuntimeInputConfig,
     pub runtime_applied_xkb_config: Option<crate::runtime_input::RuntimeKeyboardInputConfig>,
+    /// A virtual keyboard's keymap is currently installed on the seat
+    /// instead of the configured one; the next physical key restores it.
+    pub virtual_keyboard_keymap_active: bool,
     pub runtime_active_keyboard_device: Option<RuntimeInputDeviceSnapshot>,
     pub runtime_input_devices: BTreeMap<String, RuntimeInputDeviceSnapshot>,
     pub runtime_libinput_devices: HashMap<String, input::Device>,
@@ -494,6 +507,10 @@ pub struct ShojiWM {
     pub runtime_pointer_move_async_enabled: bool,
     pub runtime_gesture_swipe_enabled: bool,
     pub runtime_gesture_swipe_async_enabled: bool,
+    /// The config listens to touchpad pinches; the fingers of the one in
+    /// progress.
+    pub runtime_gesture_pinch_async_enabled: bool,
+    pub runtime_gesture_pinch_fingers: u32,
     /// The config listens to drag and drop (`COMPOSITOR.dnd.event.onStart`).
     pub runtime_dnd_enabled: bool,
     /// The drag in progress and the drag views the config shows.
@@ -746,6 +763,20 @@ impl ShojiWM {
         let layer = surface
             .as_ref()
             .and_then(|(surface, _)| self.layer_surface_for_hit_surface(surface));
+        // Native drop controls receive data in the compositor. Do not offer
+        // it to their transparent anchor client (which has no data device).
+        if !self.session_lock_active
+            && self.dnd.active.is_some()
+            && layer.is_none()
+            && matches!(
+                self.decoration_under(pos),
+                Some((_, crate::ssd::DecorationHitTestResult::Action(
+                    crate::ssd::WindowAction::RuntimeHandler(id)
+                ))) if id.ends_with(crate::dnd::DROP_SUFFIX)
+            )
+        {
+            return PointerContents::default();
+        }
         PointerContents { surface, layer }
     }
 
@@ -1628,6 +1659,10 @@ impl ShojiWM {
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
         let data_control_state =
             DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        // Both protocol generations share Smithay's seat selection. Modern
+        // clipboard clients (including Dux) use ext_data_control exclusively.
+        let ext_data_control_state =
+            ExtDataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
 
         // A seat is a group of keyboards, pointer and touch devices.
         // A seat typically has a pointer and maintains a keyboard focus and a pointer focus.
@@ -1769,7 +1804,9 @@ impl ShojiWM {
             idle_inhibited_surfaces: Vec::new(),
             active_idle_inhibit_labels: Vec::new(),
             session_lock_state,
-            session_lock_active: false,
+            // Started locked (a login screen made of the lock screen): only
+            // lock surfaces are drawn until a locker locks and unlocks.
+            session_lock_active: runtime.start_locked(),
             session_lock_surfaces: HashMap::new(),
             image_copy_capture_sessions: std::collections::HashMap::new(),
             image_copy_capture_pending: Vec::new(),
@@ -1780,6 +1817,7 @@ impl ShojiWM {
             data_device_state,
             primary_selection_state,
             data_control_state,
+            ext_data_control_state,
             popups,
             seat,
 
@@ -1848,6 +1886,8 @@ impl ShojiWM {
             hdr_cursor_caches: Default::default(),
             output_icc: Default::default(),
             output_icc_status: Default::default(),
+            night_light: None,
+            night_light_luts: Default::default(),
             managed_window_animations: Default::default(),
             managed_window_animation_sequence: 0,
             runtime_output_configs: Default::default(),
@@ -1869,6 +1909,7 @@ impl ShojiWM {
             runtime_window_resize_modifier: None,
             runtime_input_config: Default::default(),
             runtime_applied_xkb_config: None,
+            virtual_keyboard_keymap_active: false,
             runtime_active_keyboard_device: None,
             runtime_input_devices: Default::default(),
             runtime_libinput_devices: Default::default(),
@@ -1876,6 +1917,8 @@ impl ShojiWM {
             runtime_pointer_move_async_enabled: false,
             runtime_gesture_swipe_enabled: false,
             runtime_gesture_swipe_async_enabled: false,
+            runtime_gesture_pinch_async_enabled: false,
+            runtime_gesture_pinch_fingers: 0,
             runtime_dnd_enabled: false,
             dnd: Default::default(),
             runtime_gesture_swipe: None,
@@ -3076,6 +3119,13 @@ impl ShojiWM {
                 HostMessage::OutputPower(request) => {
                     self.apply_runtime_output_power_request(request);
                 }
+                HostMessage::NightLight(kelvin) => {
+                    if self.night_light != kelvin {
+                        self.night_light = kelvin;
+                        self.night_light_luts.clear();
+                        self.schedule_redraw();
+                    }
+                }
                 HostMessage::PointerHookResult(invocation) => {
                     let loop_handle = self.loop_handle.clone();
                     self.handle_runtime_pointer_move_async_invocation(invocation, &loop_handle);
@@ -3092,6 +3142,7 @@ impl ShojiWM {
                     self.apply_output_compositions(compositions);
                 }
                 HostMessage::InputGrab(update) => self.apply_runtime_input_grab_update(update),
+                HostMessage::SyntheticPointer(input) => self.synthetic_pointer(input),
                 HostMessage::CursorPosition(target) => self.set_cursor_position(target),
                 HostMessage::CursorOverride(kind) => {
                     if self.config_cursor_override != kind {
@@ -3100,6 +3151,10 @@ impl ShojiWM {
                     }
                 }
                 HostMessage::DragView(command) => self.apply_drag_view_command(command),
+                HostMessage::StartCopyDrag { id, mime_type, data } => {
+                    self.start_copy_drag(id, mime_type, data)
+                }
+                HostMessage::CancelCopyDrag(id) => self.cancel_copy_drag(id),
                 HostMessage::BackgroundEffect(config) => {
                     if self.configured_background_effect != config {
                         self.configured_background_effect = config;
@@ -4039,6 +4094,7 @@ impl ShojiWM {
         self.runtime_pointer_move_async_enabled = update.pointer_move_async;
         self.runtime_gesture_swipe_enabled = update.gesture_swipe;
         self.runtime_gesture_swipe_async_enabled = update.gesture_swipe_async;
+        self.runtime_gesture_pinch_async_enabled = update.gesture_pinch_async;
     }
 
     pub fn consume_runtime_event_config(&mut self, update: Option<RuntimeEventConfigUpdate>) {
@@ -5176,6 +5232,25 @@ impl ShojiWM {
     /// Whether `output_name` must be redrawn fully this frame; consumes a one-shot request.
     pub fn take_full_damage(&mut self, output_name: &str) -> bool {
         self.full_damage_pending_outputs.remove(output_name) || self.force_full_damage
+    }
+
+    /// The LUT the encode pass runs on SDR output `name`: night light's,
+    /// composed with the output's ICC profile, while night light is on, else
+    /// the profile's. `None` when neither applies.
+    pub fn output_lut(&mut self, name: &str) -> Option<std::sync::Arc<crate::color::icc::IccLut>> {
+        let profile = self.output_icc.get(name).cloned();
+        let Some(kelvin) = self.night_light else {
+            return profile;
+        };
+        let profile_id = profile.as_ref().map(|profile| profile.id);
+        if let Some((built_for, lut)) = self.night_light_luts.get(&profile_id) {
+            if *built_for == kelvin {
+                return Some(lut.clone());
+            }
+        }
+        let lut = std::sync::Arc::new(crate::color::night_light::lut(kelvin, profile.as_deref()));
+        self.night_light_luts.insert(profile_id, (kelvin, lut.clone()));
+        Some(lut)
     }
 
     pub fn schedule_redraw(&mut self) {

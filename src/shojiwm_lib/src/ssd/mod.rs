@@ -52,8 +52,8 @@ pub use popup::{
     set_popup_viewports,
 };
 pub use window_model::{
-    GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, LayerKindSnapshot, LayerPositionSnapshot,
-    ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode,
+    GesturePinchEventSnapshot, GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, LayerKindSnapshot, LayerPositionSnapshot,
+    ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode, spring_position, spring_settle_seconds,
     ManagedWindowAnimationSnapshot, ManagedWindowPointAnimationSnapshot,
     ManagedWindowPointSnapshot, ManagedWindowRectAnimationSnapshot, ManagedWindowRectSnapshot,
     HdmiLinkSnapshot, ManagedWindowScalarAnimationSnapshot, ManagedWindowState, OutputModeSnapshot,
@@ -1514,8 +1514,14 @@ pub struct DecorationStyle {
     pub justify_content: Option<JustifyContent>,
     pub align_items: Option<AlignItems>,
     pub background: Option<Color>,
+    /// A linear gradient painted as the background (over `background`).
+    pub background_gradient: Option<LinearGradient>,
     pub color: Option<Color>,
     pub opacity: Option<f32>,
+    /// Standard deviation (logical px) of a blur of the node's text and
+    /// images and everything inside it; layout makes it the node's own
+    /// combined with its ancestors'.
+    pub blur: Option<f32>,
     pub border: Option<BorderStyle>,
     pub border_top: Option<BorderStyle>,
     pub border_right: Option<BorderStyle>,
@@ -1539,6 +1545,45 @@ pub struct DecorationStyle {
     pub paint: Option<PaintShader>,
     /// Painted above the node's children.
     pub overlay: Option<PaintShader>,
+}
+
+/// A CSS-like `linear-gradient`: `angle` in degrees (0 runs to the top, 90
+/// to the right, as CSS) through up to [`LinearGradient::MAX_STOPS`] colour
+/// stops, each at an offset from 0 to 1 along it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearGradient {
+    pub angle: f32,
+    pub stops: Vec<GradientStop>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    pub offset: f32,
+    pub color: Color,
+}
+
+impl LinearGradient {
+    /// The stops the built-in paint program draws; more are dropped.
+    pub const MAX_STOPS: usize = 4;
+
+    /// `colors` spread evenly from start to end.
+    pub fn new(angle: f32, colors: impl IntoIterator<Item = Color>) -> Self {
+        let colors: Vec<Color> = colors.into_iter().collect();
+        let last = colors.len().saturating_sub(1).max(1) as f32;
+        Self {
+            angle,
+            stops: colors
+                .into_iter()
+                .enumerate()
+                .map(|(index, color)| GradientStop { offset: index as f32 / last, color })
+                .collect(),
+        }
+    }
+
+    /// Whether it draws anything.
+    pub fn is_visible(&self) -> bool {
+        self.stops.iter().any(|stop| stop.color.a > 0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1708,6 +1753,65 @@ impl Color {
 }
 
 impl DecorationStyle {
+    /// Multiply every length (sizes, offsets, spacing, borders, radii,
+    /// shadows, translation and text metrics) by `factor`: a decoration
+    /// authored in UI points drawn at a UI scale. Ratios such as flex
+    /// factors, opacity and the transform's scale are unchanged, and so is
+    /// paint shader geometry, which the layout resolves.
+    pub fn scale_lengths(&mut self, factor: f64) {
+        let scale = |value: &mut Option<f64>| {
+            if let Some(value) = value {
+                *value *= factor;
+            }
+        };
+        for value in [
+            &mut self.width,
+            &mut self.height,
+            &mut self.min_width,
+            &mut self.min_height,
+            &mut self.max_width,
+            &mut self.max_height,
+            &mut self.gap,
+            &mut self.inset.top,
+            &mut self.inset.right,
+            &mut self.inset.bottom,
+            &mut self.inset.left,
+            &mut self.border_radius,
+            &mut self.font_size,
+            &mut self.line_height,
+        ] {
+            scale(value);
+        }
+        for edges in [&mut self.padding, &mut self.margin] {
+            edges.top *= factor;
+            edges.right *= factor;
+            edges.bottom *= factor;
+            edges.left *= factor;
+        }
+        for border in [
+            &mut self.border,
+            &mut self.border_top,
+            &mut self.border_right,
+            &mut self.border_bottom,
+            &mut self.border_left,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            border.width *= factor;
+        }
+        for shadow in &mut self.box_shadow {
+            shadow.offset_x *= factor;
+            shadow.offset_y *= factor;
+            shadow.blur *= factor;
+            shadow.spread *= factor;
+        }
+        if let Some(transform) = &mut self.transform {
+            transform.translate_x *= factor as f32;
+            transform.translate_y *= factor as f32;
+        }
+    }
+
     fn is_absolute_positioned(&self) -> bool {
         matches!(self.position, Some(StylePosition::Absolute))
     }
@@ -2072,7 +2176,28 @@ pub(super) fn layout_node_with_scale(
         round_half_up(rect.width as f64 * frame.scale) + root_extra_px.0,
         round_half_up(rect.height as f64 * frame.scale) + root_extra_px.1,
     );
-    layout_node_resolved(node, root_rect, None, window_slot_size, frame, root_rect)
+    let mut root = layout_node_resolved(node, root_rect, None, window_slot_size, frame, root_rect)?;
+    inherit_group_style(&mut root, 1.0, 0.0);
+    Ok(root)
+}
+
+/// Opacity and blur apply to a node and everything inside it, but each node
+/// paints with its own style only: so a node's opacity becomes its own times
+/// its ancestors' (text and icons in a fading container fade with it), and
+/// its blur its own combined with theirs (as Gaussians combine).
+fn inherit_group_style(node: &mut ComputedDecorationNode, opacity: f32, blur: f32) {
+    let effective = node.style.opacity.unwrap_or(1.0).clamp(0.0, 1.0) * opacity;
+    if node.style.opacity.is_some() || opacity < 1.0 {
+        node.style.opacity = Some(effective);
+    }
+    let own = node.style.blur.unwrap_or(0.0).max(0.0);
+    let blurred = (own * own + blur * blur).sqrt();
+    if node.style.blur.is_some() || blur > 0.0 {
+        node.style.blur = Some(blurred);
+    }
+    for child in &mut node.children {
+        inherit_group_style(child, effective, blurred);
+    }
 }
 
 fn layout_node_resolved(
@@ -2197,6 +2322,15 @@ pub(super) fn reapply_tree_preserving_layout(
     node: &DecorationNode,
     inherited_clip: Option<ResolvedDecorationClip>,
 ) {
+    reapply_node_preserving_layout(computed, node, inherited_clip);
+    inherit_group_style(computed, 1.0, 0.0);
+}
+
+fn reapply_node_preserving_layout(
+    computed: &mut ComputedDecorationNode,
+    node: &DecorationNode,
+    inherited_clip: Option<ResolvedDecorationClip>,
+) {
     let frame = computed.frame;
     let scale = frame.scale;
     computed.stable_id = node.stable_id.clone();
@@ -2222,7 +2356,7 @@ pub(super) fn reapply_tree_preserving_layout(
         } else {
             computed.resolved_effective_clip
         };
-        reapply_tree_preserving_layout(computed_child, node_child, inherited_clip);
+        reapply_node_preserving_layout(computed_child, node_child, inherited_clip);
     }
 }
 
@@ -2795,6 +2929,7 @@ impl DecorationNode {
                     text_overflow: None,
                     line_height: Some(line_height),
                     raster_scale: 1.0,
+                    blur: 0.0,
                 };
                 let (width, height) = measure_label_intrinsic(&spec);
                 Some((
@@ -3667,6 +3802,41 @@ mod tests {
     }
 
     #[test]
+    fn opacity_multiplies_into_descendants() {
+        let half = || DecorationStyle { opacity: Some(0.5), ..Default::default() };
+        let root = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Column,
+        }))
+        .with_children(vec![
+            DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                direction: LayoutDirection::Column,
+            }))
+            .with_style(half())
+            .with_children(vec![
+                DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                    direction: LayoutDirection::Column,
+                }))
+                .with_style(half()),
+                DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                    direction: LayoutDirection::Column,
+                })),
+            ]),
+            DecorationNode::new(DecorationNodeKind::WindowSlot),
+        ]);
+
+        let layout = DecorationTree::new(root)
+            .layout(LogicalRect::new(0, 0, 100, 50))
+            .expect("layout should succeed");
+        let faded = &layout.root.children[0];
+
+        assert_eq!(layout.root.style.opacity, None);
+        assert_eq!(faded.style.opacity, Some(0.5));
+        assert_eq!(faded.children[0].style.opacity, Some(0.25));
+        assert_eq!(faded.children[1].style.opacity, Some(0.5));
+        assert_eq!(layout.root.children[1].style.opacity, None);
+    }
+
+    #[test]
     fn rectangular_parent_clip_preserves_nested_window_border_radius() {
         let root = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
             direction: LayoutDirection::Column,
@@ -4304,6 +4474,52 @@ mod tests {
         );
 
         assert!(!left.layout_equivalent(&right));
+    }
+
+    #[test]
+    fn scale_lengths_scales_lengths_and_keeps_ratios() {
+        let mut style = DecorationStyle {
+            width: Some(100.0),
+            min_height: Some(10.0),
+            flex_grow: Some(1.0),
+            padding: Edges { top: 1.0, right: 2.0, bottom: 3.0, left: 4.0 },
+            gap: Some(6.0),
+            inset: PositionOffsets { top: Some(8.0), left: Some(-2.0), ..Default::default() },
+            opacity: Some(0.5),
+            border: Some(BorderStyle { width: 1.0, color: Color::rgba(0, 0, 0, 255) }),
+            border_radius: Some(12.0),
+            font_size: Some(13.0),
+            line_height: Some(17.0),
+            box_shadow: vec![BoxShadow {
+                offset_x: 0.0,
+                offset_y: 2.0,
+                blur: 8.0,
+                spread: -1.0,
+                color: Color::rgba(0, 0, 0, 64),
+                inset: false,
+            }],
+            transform: Some(NodeTransform { translate_x: 4.0, translate_y: 0.0, scale_x: 0.5, scale_y: 0.5 }),
+            ..Default::default()
+        };
+        style.scale_lengths(1.5);
+        assert_eq!(style.width, Some(150.0));
+        assert_eq!(style.min_height, Some(15.0));
+        assert_eq!(style.height, None);
+        assert_eq!(style.flex_grow, Some(1.0));
+        assert_eq!(style.padding, Edges { top: 1.5, right: 3.0, bottom: 4.5, left: 6.0 });
+        assert_eq!(style.gap, Some(9.0));
+        assert_eq!(style.inset.top, Some(12.0));
+        assert_eq!(style.inset.left, Some(-3.0));
+        assert_eq!(style.inset.right, None);
+        assert_eq!(style.opacity, Some(0.5));
+        assert_eq!(style.border.unwrap().width, 1.5);
+        assert_eq!(style.border_radius, Some(18.0));
+        assert_eq!(style.font_size, Some(19.5));
+        assert_eq!(style.line_height, Some(25.5));
+        let shadow = style.box_shadow[0];
+        assert_eq!((shadow.offset_y, shadow.blur, shadow.spread), (3.0, 12.0, -1.5));
+        let transform = style.transform.unwrap();
+        assert_eq!((transform.translate_x, transform.scale_x), (6.0, 0.5));
     }
 
     #[test]

@@ -44,6 +44,8 @@ pub struct CachedDecorationIcon {
     pub clip_rect_precise: Option<PreciseLogicalRect>,
     pub clip_radius_precise: Option<f32>,
     pub buffer: MemoryRenderBuffer,
+    /// The node's opacity (its ancestors' included), applied when drawn.
+    pub opacity: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +71,10 @@ pub struct IconSpec {
     /// Exact rasterization scale (the layout scale), so the buffer maps
     /// one-to-one onto the node's physical pixels.
     pub raster_scale: f64,
+    /// The `blur` style (logical px). When set, `rect` is the node's rect
+    /// grown by [`crate::backend::blur::padding`] on every side, the image
+    /// drawn inside.
+    pub blur: f32,
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +93,8 @@ struct IconCacheKey {
     source: String,
     width: i32,
     height: i32,
+    /// The blur's bits.
+    blur: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -147,7 +155,10 @@ impl IconRasterizer {
     }
 
     pub fn render_icon_pixels(&mut self, spec: &IconSpec) -> Option<RenderedIconPixels> {
-        let (key, target_width, target_height, _) = icon_cache_key_for_spec(spec)?;
+        let (key, full_width, full_height, raster_scale) = icon_cache_key_for_spec(spec)?;
+        // A blurred icon is drawn inside room for the blur.
+        let pad = (crate::backend::blur::padding(spec.blur) as f64 * raster_scale).round() as i32;
+        let (target_width, target_height) = ((full_width - 2 * pad).max(1), (full_height - 2 * pad).max(1));
 
         let rgba = if let Some(asset_path) = spec.asset_path.as_deref() {
             let fit = spec.image_fit.unwrap_or(ImageFit::Contain);
@@ -169,7 +180,18 @@ impl IconRasterizer {
             return None;
         };
 
-        let pixels = rgba_to_argb8888(&rgba);
+        let mut pixels = rgba_to_argb8888(&rgba);
+        if pad > 0 || spec.blur > 0.0 {
+            let mut padded = vec![0u8; (full_width * full_height * 4) as usize];
+            for row in 0..target_height {
+                let from = (row * target_width * 4) as usize;
+                let to = (((row + pad) * full_width + pad) * 4) as usize;
+                padded[to..to + (target_width * 4) as usize].copy_from_slice(&pixels[from..from + (target_width * 4) as usize]);
+            }
+            crate::backend::blur::blur_premultiplied(&mut padded, full_width, full_height, spec.blur * raster_scale as f32);
+            pixels = padded;
+        }
+        let (target_width, target_height) = (full_width, full_height);
         let buffer = MemoryRenderBuffer::from_slice(
             &pixels,
             Fourcc::Argb8888,
@@ -312,6 +334,7 @@ pub fn hash_icon_spec(spec: &IconSpec) -> u64 {
         })
         .hash(&mut hasher);
     spec.raster_scale.to_bits().hash(&mut hasher);
+    spec.blur.to_bits().hash(&mut hasher);
     spec.app_id.hash(&mut hasher);
     spec.asset_path.hash(&mut hasher);
     spec.fallback_asset_path.hash(&mut hasher);
@@ -359,6 +382,7 @@ fn icon_cache_key_for_spec(spec: &IconSpec) -> Option<(IconCacheKey, i32, i32, f
             source,
             width: target_width,
             height: target_height,
+            blur: spec.blur.to_bits(),
         },
         target_width,
         target_height,
@@ -378,6 +402,7 @@ fn cached_icon_from_buffer(spec: &IconSpec, buffer: MemoryRenderBuffer) -> Cache
         clip_rect_precise: None,
         clip_radius_precise: None,
         buffer,
+        opacity: 1.0,
     }
 }
 
@@ -554,7 +579,7 @@ pub(crate) fn memory_icon_element(
         renderer,
         physical.loc.to_f64(),
         &icon.buffer,
-        Some(alpha.clamp(0.0, 1.0)),
+        Some((alpha * icon.opacity).clamp(0.0, 1.0)),
         None,
         None,
         Kind::Unspecified,
@@ -1189,6 +1214,7 @@ mod tests {
             image_fit: Some(ImageFit::Contain),
             fallback_asset_path: None,
             raster_scale: 1.0,
+            blur: 0.0,
         };
         let mut cover = base.clone();
         cover.image_fit = Some(ImageFit::Cover);
@@ -1218,6 +1244,7 @@ mod tests {
             image_fit: None,
             fallback_asset_path: Some(path.to_string_lossy().into_owned()),
             raster_scale: 1.0,
+            blur: 0.0,
         };
         let without_fallback = IconSpec {
             fallback_asset_path: None,
@@ -1268,6 +1295,7 @@ mod tests {
             image_fit: Some(ImageFit::Contain),
             fallback_asset_path: None,
             raster_scale: 2.0,
+            blur: 0.0,
         };
 
         let rendered = rasterizer.render_icon(&spec);

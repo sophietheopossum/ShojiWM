@@ -1018,6 +1018,11 @@ pub fn init_winit(
         winit_render_mode(&output).expect("winit output has a mode right after creation");
     let mut damage_tracker = OutputDamageTracker::from_mode_source(initial_render_mode.clone());
     let mut blink_damage_tracker = OutputDamageTracker::from_mode_source(initial_render_mode);
+    // Night light's encode pass (`hdr_pipeline`), as on a TTY output.
+    let mut encode_pipeline: Option<crate::backend::hdr_pipeline::HdrPipeline> = None;
+    // Tests that drive a nested session with synthesized input set this, so
+    // the host's pointer and keys passing over its window change nothing.
+    let ignore_host_input = std::env::var_os("SHOJI_IGNORE_HOST_INPUT").is_some_and(|value| value == "1");
     event_loop
         .handle()
         .insert_source(winit, move |event, _, state| {
@@ -1032,8 +1037,14 @@ pub fn init_winit(
                         None,
                         None,
                     );
+                    // A locked session's surfaces take the new size too.
+                    state.configure_session_lock_surfaces();
                 }
-                WinitEvent::Input(event) => state.process_input_event(event),
+                WinitEvent::Input(event) => {
+                    if !ignore_host_input {
+                        state.process_input_event(event);
+                    }
+                }
                 WinitEvent::Redraw => {
                     let mut backend = backend.borrow_mut();
                     timescope::scope!("winit redraw");
@@ -1366,16 +1377,64 @@ pub fn init_winit(
                                     .unwrap_or(Duration::ZERO);
                             state.pre_repaint(&output, frame_target);
 
+                            let output_lut = state.output_lut(&output.name());
+                            if output_lut.is_none() {
+                                encode_pipeline = None;
+                            }
+                            bind_default_framebuffer_before_surface();
                             let render_started_at = Instant::now();
                             let render_output_result = {
                                 timescope::scope!("winit render_output");
-                                damage_tracker.render_output(
-                                    renderer,
-                                    &mut framebuffer,
-                                    0,
-                                    &elements,
-                                    [0.1, 0.1, 0.1, 1.0],
-                                )
+                                match output_lut {
+                                    // Composite into the intermediate, then draw it through
+                                    // the LUT; the states are the composite's, so clients
+                                    // still get their frame callbacks and feedback.
+                                    Some(lut) => match crate::backend::hdr_pipeline::render_hdr_pipeline(
+                                        renderer,
+                                        &mut encode_pipeline,
+                                        &output,
+                                        &elements,
+                                        [0.1, 0.1, 0.1, 1.0],
+                                        crate::backend::hdr_pipeline::OutputEncoding::Icc(lut),
+                                        smithay::backend::allocator::Fourcc::Abgr8888,
+                                    ) {
+                                        Ok(Some((encode, states))) => {
+                                            bind_default_framebuffer_before_surface();
+                                            damage_tracker
+                                                .render_output(
+                                                    renderer,
+                                                    &mut framebuffer,
+                                                    0,
+                                                    &[encode],
+                                                    [0.0, 0.0, 0.0, 1.0],
+                                                )
+                                                .map(|mut result| {
+                                                    result.states = states;
+                                                    result
+                                                })
+                                        }
+                                        result => {
+                                            if let Err(error) = result {
+                                                warn!(?error, "night light encode pass failed");
+                                            }
+                                            encode_pipeline = None;
+                                            damage_tracker.render_output(
+                                                renderer,
+                                                &mut framebuffer,
+                                                0,
+                                                &elements,
+                                                [0.1, 0.1, 0.1, 1.0],
+                                            )
+                                        }
+                                    },
+                                    None => damage_tracker.render_output(
+                                        renderer,
+                                        &mut framebuffer,
+                                        0,
+                                        &elements,
+                                        [0.1, 0.1, 0.1, 1.0],
+                                    ),
+                                }
                             };
                             timing.render_elapsed_ms =
                                 render_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -2288,7 +2347,7 @@ fn backdrop_shader_elements_for_window(
                         local_sample_rect,
                         local_capture_rect,
                         &cached.shader,
-                        alpha,
+                        alpha * cached.opacity,
                         scale.x as f32,
                         [0.0, 0.0],
                         clip_rect,
@@ -2543,7 +2602,7 @@ fn backdrop_shader_elements_for_window(
                 local_sample_rect,
                 local_capture_rect,
                 &cached.shader,
-                alpha,
+                alpha * cached.opacity,
                 scale.x as f32,
                 [0.0, 0.0],
                 clip_rect,
@@ -4821,6 +4880,7 @@ fn capture_live_snapshot_for_window(
             .into_iter()
             .map(WinitRenderElements::Window),
     );
+    let content = snapshot::content_commits(window);
 
     let existing = state.live_window_snapshots.remove(&snapshot_id);
     let live_tracker = state
@@ -4843,6 +4903,9 @@ fn capture_live_snapshot_for_window(
         scale,
         &elements,
     )? {
+        let mut snapshot = snapshot;
+        snapshot.content = content;
+        snapshot.captured_at = Some(std::time::Instant::now());
         state
             .live_window_snapshots
             .insert(snapshot_id.clone(), snapshot);
@@ -6111,15 +6174,12 @@ fn winit_window_stack_elements(
                 .window_decorations
                 .get(window)
                 .map(|decoration| {
-                    state
-                        .live_window_snapshots
-                        .get(&decoration.snapshot.id)
-                        .map(|snapshot| {
-                            snapshot.rect.width != decoration.client_rect.width
-                                || snapshot.rect.height
-                                    != decoration.client_rect.height
-                        })
-                        .unwrap_or(true)
+                    snapshot::live_snapshot_stale(
+                        state.live_window_snapshots.get(&decoration.snapshot.id),
+                        decoration.client_rect,
+                        &snapshot::content_commits(window),
+                        std::time::Instant::now(),
+                    )
                 })
                 .unwrap_or(false);
             if should_refresh_snapshot
@@ -6145,6 +6205,26 @@ fn winit_window_stack_elements(
             }
 
         }
+    }
+}
+
+/// Offscreen work while the scene is built (effect pipelines, snapshots)
+/// can leave the context current without a surface and with an offscreen
+/// framebuffer bound. Making the window surface current again from that
+/// state leaves the surface's draw and read buffers at `GL_NONE` on NVIDIA:
+/// the frame's clear and first draws go nowhere until something else makes
+/// the surface current, and the rest of the frame lands on an old one. The
+/// Island's and the dock's shadows showed drawn twice for a frame whenever
+/// the dock changed size. Binding the default framebuffer first avoids it.
+/// A raw call, so the context stays as it is; with the surface current it
+/// binds what is already bound.
+fn bind_default_framebuffer_before_surface() {
+    type BindFramebuffer = unsafe extern "C" fn(u32, u32);
+    const FRAMEBUFFER: u32 = 0x8D40;
+    unsafe {
+        let bind: BindFramebuffer =
+            std::mem::transmute(smithay::backend::egl::get_proc_address("glBindFramebuffer"));
+        bind(FRAMEBUFFER, 0);
     }
 }
 

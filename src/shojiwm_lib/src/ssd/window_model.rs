@@ -178,7 +178,7 @@ pub struct WindowResizePointSnapshot {
     pub y: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PointerModifierStateSnapshot {
     #[serde(rename = "super")]
@@ -225,6 +225,8 @@ pub struct PointerMoveEventSnapshot {
 pub struct GestureSwipeEventSnapshot {
     pub phase: GestureSwipePhaseSnapshot,
     pub fingers: u32,
+    /// The keyboard modifiers held (Hyprland's gesture `mods`).
+    pub modifiers: PointerModifierStateSnapshot,
     pub position: Option<PointerMovePointSnapshot>,
     pub delta_x: f64,
     pub delta_y: f64,
@@ -234,6 +236,25 @@ pub struct GestureSwipeEventSnapshot {
     pub velocity_y: f64,
     pub output_name: Option<String>,
     pub device: Option<crate::runtime_input::RuntimeInputDeviceSnapshot>,
+    pub timestamp: u64,
+}
+
+/// A touchpad pinch: `scale` is the fingers' spread relative to the start
+/// (1 at the start, above 1 spreading), `rotation` the change in angle since
+/// the last update in degrees, clockwise positive.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GesturePinchEventSnapshot {
+    pub phase: GestureSwipePhaseSnapshot,
+    pub fingers: u32,
+    /// The keyboard modifiers held.
+    pub modifiers: PointerModifierStateSnapshot,
+    pub scale: f64,
+    pub rotation: f64,
+    pub delta_x: f64,
+    pub delta_y: f64,
+    pub position: Option<PointerMovePointSnapshot>,
+    pub output_name: Option<String>,
     pub timestamp: u64,
 }
 
@@ -409,6 +430,77 @@ pub enum ManagedWindowAnimationEasingSnapshot {
     #[default]
     Linear,
     CubicBezier { x1: f64, y1: f64, x2: f64, y2: f64 },
+    /// A damped spring from rest at 0 to rest at 1, as Hyprland's spring
+    /// curves are given: the animation's progress runs over the spring's
+    /// settle time ([`spring_settle_seconds`]), so a duration of that length
+    /// plays it in real time (a shorter one speeds it up).
+    Spring { stiffness: f64, damping: f64, mass: f64 },
+}
+
+/// How close to rest a spring counts as settled: its distance from the
+/// target, as a share of the whole move (half a pixel of a 500 px move).
+const SPRING_REST: f64 = 0.001;
+
+fn spring_shape(stiffness: f64, damping: f64, mass: f64) -> (f64, f64) {
+    let (stiffness, mass) = (stiffness.max(1e-6), mass.max(1e-6));
+    let natural = (stiffness / mass).sqrt();
+    let ratio = (damping.max(0.0) / (2.0 * (stiffness * mass).sqrt())).max(1e-3);
+    (natural, ratio)
+}
+
+/// Where a spring released from rest at 0 is after `t` seconds, towards 1.
+pub fn spring_position(stiffness: f64, damping: f64, mass: f64, t: f64) -> f64 {
+    let (natural, ratio) = spring_shape(stiffness, damping, mass);
+    let t = t.max(0.0);
+    if ratio < 1.0 {
+        let decay = ratio * natural;
+        let damped = natural * (1.0 - ratio * ratio).sqrt();
+        1.0 - (-decay * t).exp() * ((damped * t).cos() + decay / damped * (damped * t).sin())
+    } else if ratio == 1.0 {
+        1.0 - (-natural * t).exp() * (1.0 + natural * t)
+    } else {
+        let root = (ratio * ratio - 1.0).sqrt();
+        let (fast, slow) = (-natural * (ratio + root), -natural * (ratio - root));
+        1.0 + (slow * (fast * t).exp() - fast * (slow * t).exp()) / (fast - slow)
+    }
+}
+
+/// How long a spring takes to come to rest ([`SPRING_REST`]), in seconds.
+pub fn spring_settle_seconds(stiffness: f64, damping: f64, mass: f64) -> f64 {
+    let (natural, ratio) = spring_shape(stiffness, damping, mass);
+    if ratio < 1.0 {
+        // The oscillation stays inside this envelope.
+        let envelope = 1.0 / (1.0 - ratio * ratio).sqrt();
+        return ((envelope / SPRING_REST).ln() / (ratio * natural)).max(0.0);
+    }
+    // No overshoot: the first time it is that close.
+    let (mut low, mut high) = (0.0, 1.0);
+    while 1.0 - spring_position(stiffness, damping, mass, high) > SPRING_REST && high < 60.0 {
+        high *= 2.0;
+    }
+    for _ in 0..40 {
+        let mid = 0.5 * (low + high);
+        if 1.0 - spring_position(stiffness, damping, mass, mid) > SPRING_REST {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    high
+}
+
+impl ManagedWindowAnimationEasingSnapshot {
+    /// Eased progress for a spring: its position at this share of its
+    /// settle time, exactly 1 at the end.
+    pub fn spring_progress(stiffness: f64, damping: f64, mass: f64, progress: f64) -> f64 {
+        if progress <= 0.0 {
+            return 0.0;
+        }
+        if progress >= 1.0 {
+            return 1.0;
+        }
+        spring_position(stiffness, damping, mass, progress * spring_settle_seconds(stiffness, damping, mass))
+    }
 }
 
 
@@ -768,6 +860,11 @@ pub struct ManagedWindowState {
     pub allow_tearing: Option<bool>,
     #[serde(default)]
     pub z_index: Option<i32>,
+    /// Whether a press on the window gives it the keyboard. A config's own
+    /// surfaces (an island, a dock) turn it off, so a click on them leaves
+    /// the user's app focused.
+    #[serde(default = "default_true")]
+    pub keyboard_focus: bool,
     #[serde(default)]
     pub transform: WindowTransform,
     /// Rendering policy for the window's client surface tree from
@@ -792,6 +889,7 @@ impl Default for ManagedWindowState {
             tiled: false,
             allow_tearing: None,
             z_index: None,
+            keyboard_focus: true,
             transform: WindowTransform::default(),
             surface_policy: None,
         }

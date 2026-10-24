@@ -4443,10 +4443,10 @@ fn render_surface(
             .map(|color| color.mode),
         Some(crate::color::OutputColorMode::Hdr10 { .. })
     );
-    // An SDR output with a monitor ICC profile goes through the encode stage
-    // too, with the profile's LUT instead of the PQ encode.
+    // An SDR output with a monitor ICC profile or night light goes through
+    // the encode stage too, with their LUT instead of the PQ encode.
     let output_icc = (!output_is_hdr)
-        .then(|| state.output_icc.get(output.name().as_str()).cloned())
+        .then(|| state.output_lut(output.name().as_str()))
         .flatten();
     let output_encoded = output_is_hdr || output_icc.is_some();
     let intermediate_fp16 = output_icc.is_some() && hdr_render_supports_fp16(state, node);
@@ -8859,7 +8859,7 @@ fn backdrop_shader_elements_for_window(
                             local_sample_rect,
                             local_capture_rect,
                             &cached.shader,
-                            alpha,
+                            alpha * cached.opacity,
                             scale.x as f32,
                             [0.0, 0.0],
                             clip_rect,
@@ -9211,7 +9211,7 @@ fn backdrop_shader_elements_for_window(
                 local_sample_rect,
                 local_capture_rect,
                 &cached.shader,
-                alpha,
+                alpha * cached.opacity,
                 scale.x as f32,
                 [0.0, 0.0],
                 clip_rect,
@@ -11682,6 +11682,7 @@ fn capture_live_snapshot_for_window(
         .into_iter()
         .map(TtyRenderElements::Window)
         .collect::<Vec<_>>();
+    let content = snapshot::content_commits(window);
 
     let existing = live_window_snapshots.remove(&snapshot_id);
     let live_tracker = live_window_snapshot_trackers
@@ -11703,6 +11704,9 @@ fn capture_live_snapshot_for_window(
         scale,
         &elements,
     )? {
+        let mut snapshot = snapshot;
+        snapshot.content = content;
+        snapshot.captured_at = Some(Instant::now());
         live_window_snapshots.insert(snapshot_id.clone(), snapshot);
     }
 
@@ -16656,13 +16660,12 @@ fn tty_window_stack_elements(
                 && window_decorations
                 .get(window)
                 .map(|decoration| {
-                    live_window_snapshots
-                        .get(&decoration.snapshot.id)
-                        .map(|snapshot| {
-                            snapshot.rect.width != decoration.client_rect.width
-                                || snapshot.rect.height != decoration.client_rect.height
-                        })
-                        .unwrap_or(true)
+                    snapshot::live_snapshot_stale(
+                        live_window_snapshots.get(&decoration.snapshot.id),
+                        decoration.client_rect,
+                        &snapshot::content_commits(window),
+                        Instant::now(),
+                    )
                 })
                 .unwrap_or(false);
             if should_seed_close_snapshot {

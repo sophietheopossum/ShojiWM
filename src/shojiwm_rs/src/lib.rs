@@ -91,7 +91,7 @@ pub mod prelude {
         COMPOSITOR, ConfigBuilder, run_config,
         animation::{
             Animation, AnimationOptions, Easing, PollHandle, PollOutput, Repeat, TimerHandle,
-            create_poll, create_poll_for_each_output, cubic_bezier, now_ms, set_interval,
+            create_poll, create_poll_for_each_output, cubic_bezier, now_ms, set_interval, spring,
             set_timeout,
         },
         compositor::{
@@ -129,22 +129,24 @@ pub mod prelude {
             Get, Memo, Prop, ReadSignal, Scope, Signal, batch, derive, effect, memo, on_cleanup,
             signal, untrack,
         },
-        style::{Border, FontWeight, Style, Transform2D, hex, inset_shadow, rgba, shadow},
+        style::{Border, FontWeight, Style, Transform2D, hex, inset_shadow, linear_gradient, rgba, shadow},
         view::{
             AppIcon, Button, Child, ClientWindow, Composition, Direction, Element, Flex, Image,
-            Label, ManagedTransform, ManagedWindow, Popup, PopupTrigger, Rect, ShaderEffect, WindowBorder,
+            Label, ManagedTransform, ManagedWindow, Popup, PopupTrigger, Rect, ScrollEvent, ShaderEffect, WindowBorder,
         },
         window::{AnimationMode, ManagedAnimation, Window, WindowStateKey},
         window_stack::{Placement, WindowStack},
     };
     pub use shojiwm_lib::ssd::{
-        AlignItems, BlendMode, BoxShadow, Color, EffectRegion, ImageFit, JustifyContent, Overflow,
+        AlignItems, BlendMode, BoxShadow, Color, EffectRegion, GradientStop, ImageFit, JustifyContent, LinearGradient, Overflow,
         PointerEvents, PopupAlign, PopupCollision, PopupDismissReason, PopupLayer, PopupPlacement, PopupMode,
         StylePosition, WindowAction,
     };
 }
 
 pub use shojiwm_lib::run;
+/// Frames a second an output presents (see the fps counter).
+pub use shojiwm_lib::backend::fps_counter::present_rate as output_present_rate;
 pub use shojiwm_lib::runtime_api::{self, *};
 /// Data types a config reads (snapshots) and builds (decoration trees,
 /// effect configs).

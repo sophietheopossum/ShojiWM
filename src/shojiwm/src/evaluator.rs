@@ -4531,6 +4531,7 @@ COMPOSITOR.event.onWindowResize(() => {});
 
         let gesture = GestureSwipeEventSnapshot {
             phase: GestureSwipePhaseSnapshot::Update,
+            modifiers: Default::default(),
             fingers: 3,
             position: Some(pointer.position),
             delta_x: 2.0,
@@ -5468,6 +5469,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
                      timestamp: u64| {
             GestureSwipeEventSnapshot {
                 phase,
+                modifiers: Default::default(),
                 fingers: 3,
                 position: None,
                 delta_x,
@@ -5643,6 +5645,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             let delta_x = if phase == GestureSwipePhaseSnapshot::Update { 15.0 } else { 0.0 };
             GestureSwipeEventSnapshot {
                 phase,
+                modifiers: Default::default(),
                 fingers: 3,
                 position: None,
                 delta_x,
@@ -5754,6 +5757,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
                      timestamp: u64| {
             GestureSwipeEventSnapshot {
                 phase,
+                modifiers: Default::default(),
                 fingers: 3,
                 position: None,
                 delta_x,
@@ -5859,6 +5863,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
                      timestamp: u64| {
             GestureSwipeEventSnapshot {
                 phase,
+                modifiers: Default::default(),
                 fingers: 3,
                 position: None,
                 delta_x,
@@ -5966,6 +5971,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
                      timestamp: u64| {
             GestureSwipeEventSnapshot {
                 phase,
+                modifiers: Default::default(),
                 fingers: 3,
                 position: None,
                 delta_x,
@@ -6087,6 +6093,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
                      timestamp: u64| {
             GestureSwipeEventSnapshot {
                 phase,
+                modifiers: Default::default(),
                 fingers: 3,
                 position: None,
                 delta_x,
@@ -6480,13 +6487,13 @@ COMPOSITOR.event.onDisable((event) => event.persist("layouts", layouts));
         evaluator.lifecycle_enable("initial", None).unwrap();
         for (index, name) in [(0, "English (US)"), (1, "Russian"), (1, "German")] {
             assert!(evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
-                index, name: name.into(),
+                index, name: name.into(), ..Default::default()
             }));
             // Other runtime traffic must not consume the pending layout update.
             evaluator.evaluate_window(&make_window(false), 0).unwrap();
             evaluator.scheduler_tick(1.0, None, &[]).unwrap();
             assert!(!evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
-                index, name: name.into(),
+                index, name: name.into(), ..Default::default()
             }));
             evaluator.scheduler_tick(2.0, None, &[]).unwrap();
             // A full state payload must not re-emit an unchanged layout either.
@@ -6494,10 +6501,10 @@ COMPOSITOR.event.onDisable((event) => event.persist("layouts", layouts));
             evaluator.scheduler_tick(3.0, None, &[]).unwrap();
         }
         evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
-            index: 0, name: "English (US)".into(),
+            index: 0, name: "English (US)".into(), ..Default::default()
         });
         evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
-            index: 1, name: "German".into(),
+            index: 1, name: "German".into(), ..Default::default()
         });
         evaluator.scheduler_tick(4.0, None, &[]).unwrap();
         let state = evaluator.lifecycle_disable("reload").unwrap();

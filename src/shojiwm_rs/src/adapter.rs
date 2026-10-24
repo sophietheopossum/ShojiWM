@@ -49,6 +49,7 @@ pub struct ConfigBuilder {
     name: &'static str,
     setup: Rc<dyn Fn()>,
     asset_root: Option<PathBuf>,
+    start_locked: bool,
 }
 
 impl ConfigBuilder {
@@ -57,6 +58,7 @@ impl ConfigBuilder {
             name: "rust",
             setup: Rc::new(setup),
             asset_root: None,
+            start_locked: false,
         }
     }
 
@@ -69,6 +71,14 @@ impl ConfigBuilder {
     /// Directory relative shader and image paths are resolved against.
     pub fn asset_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.asset_root = Some(root.into());
+        self
+    }
+
+    /// Start with the session locked: nothing is drawn but session-lock
+    /// surfaces until a locker locks and unlocks (the config starts one).
+    /// With automatic login, the lock screen becomes the login screen.
+    pub fn start_locked(mut self, locked: bool) -> Self {
+        self.start_locked = locked;
         self
     }
 
@@ -89,6 +99,10 @@ impl RuntimeLauncher for ConfigBuilder {
             self.asset_root.clone(),
             context,
         ))
+    }
+
+    fn start_locked(&self) -> bool {
+        self.start_locked
     }
 }
 
@@ -246,6 +260,7 @@ fn create_window(snapshot: &WaylandWindowSnapshot) -> Rc<WindowEntry> {
             let id = id.clone();
             Rc::new(move || runtime::mark_window_dirty(&id))
         },
+        ui_scale: Rc::new(Cell::new(1.0)),
     };
     let effects_observer = scope.run(|| {
         let context = context.clone();
@@ -584,8 +599,29 @@ macro_rules! mutation_reply {
 }
 
 fn invoke_handler(window_id: &str, handler_id: &str) -> DecorationHandlerInvocation {
+    // "{node}#drop:{lines}": what was dropped goes alongside the handler.
+    if let Some((node, payload)) = handler_id.split_once("#drop:") {
+        let lines: Vec<String> = payload.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).map(str::to_owned).collect();
+        crate::view::DROPPED.with(|dropped| *dropped.borrow_mut() = lines);
+        let handler = runtime::window_entry(window_id).and_then(|entry| entry.context.handlers.borrow().get(&format!("{node}#drop")).cloned());
+        return handler_invocation(handler.is_some_and(|handler| {
+            batch(|| handler());
+            true
+        }));
+    }
+    // A node that takes drops: its click handler without the marker.
+    let handler_id = handler_id.strip_suffix(shojiwm_lib::dnd::DROP_SUFFIX).unwrap_or(handler_id);
+    // "{node}#scroll:{payload}": the event goes alongside the handler.
+    let (handler_id, scroll) = match handler_id.split_once("#scroll:") {
+        Some((node, payload)) => (format!("{node}#scroll"), crate::view::ScrollEvent::parse(payload)),
+        None => (handler_id.to_owned(), None),
+    };
+    if handler_id.ends_with("#scroll") && scroll.is_none() {
+        return handler_invocation(false);
+    }
+    crate::view::SCROLL.with(|slot| *slot.borrow_mut() = scroll);
     let handler = runtime::window_entry(window_id)
-        .and_then(|entry| entry.context.handlers.borrow().get(handler_id).cloned());
+        .and_then(|entry| entry.context.handlers.borrow().get(&handler_id).cloned());
     let invoked = match handler {
         Some(handler) => {
             batch(|| handler());
@@ -1096,6 +1132,9 @@ impl ConfigRuntime for ReactiveRuntime {
                 RuntimeEvent::GestureSwipe(event) => {
                     let invoked = batch(|| emit(|listeners| listeners.gesture_swipe_async.clone(), |listener| listener(&event)));
                     runtime::send(HostMessage::PointerHookResult(pointer_hook(invoked)));
+                }
+                RuntimeEvent::GesturePinch(event) => {
+                    batch(|| emit(|listeners| listeners.gesture_pinch_async.clone(), |listener| listener(&event)));
                 }
             }
             Ok(())
