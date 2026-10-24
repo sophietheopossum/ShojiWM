@@ -1,5 +1,5 @@
 //! Compositor control socket behind `shoji_wm --quit` / `--reload` /
-//! `--frame-stats`.
+//! `--frame-stats` / `--frame-debug` / `--perf-option`.
 //!
 //! The same two escape hatches as `Super+Shift+Q` / `Super+Shift+R`, reachable
 //! from a terminal, a status bar's click handler or a config keybinding that
@@ -12,6 +12,8 @@
 //!
 //! ```text
 //! client -> server   "quit\n" | "reload\n" | "key <chord> [<hold-ms>]\n" | "frame-stats\n"
+//!                    | "frame-debug on\n" | "frame-debug off\n" | "frame-debug\n"
+//!                    | "perf-option NAME on\n" | "perf-option NAME off\n" | "perf-options\n"
 //! server -> client   "ok\n" | "<one line of JSON>\n" | "error: <message>\n"
 //! ```
 //!
@@ -21,8 +23,11 @@
 //! holds it for 800 ms before the release, long enough for key repeat. The
 //! answer comes once the event loop has pressed the chord.
 //!
-//! `frame-stats` is answered from this socket's thread with the per-output
-//! counters ([`crate::frame_stats`]), never the event loop's.
+//! `frame-stats` and `frame-debug` are answered from this socket's thread
+//! ([`crate::frame_stats`]), never the event loop's: the per-output counters,
+//! and turning frame debugging on or off or taking what it collected. So are
+//! `perf-option` ([`crate::perf_options`]), which then asks the event loop
+//! for a redraw, and `perf-options`.
 
 use std::{
     ffi::OsStr,
@@ -58,9 +63,23 @@ pub enum Command {
         hold_ms: u32,
     },
     FrameStats,
+    FrameDebugOn,
+    FrameDebugOff,
+    FrameDebugTake,
+    /// Turn a rendering shortcut on (`true`) or off.
+    PerfOption(crate::perf_options::PerfOption, bool),
+    PerfOptions,
 }
 
 impl Command {
+    /// Answered from the socket's thread, with JSON.
+    fn answers_with_json(&self) -> bool {
+        matches!(
+            self,
+            Self::FrameStats | Self::FrameDebugTake | Self::PerfOptions
+        )
+    }
+
     fn to_line(&self) -> String {
         match self {
             Self::Quit => "quit".into(),
@@ -68,6 +87,17 @@ impl Command {
             Self::Key { chord, hold_ms: 0 } => format!("key {chord}"),
             Self::Key { chord, hold_ms } => format!("key {chord} {hold_ms}"),
             Self::FrameStats => "frame-stats".into(),
+            Self::FrameDebugOn => "frame-debug on".into(),
+            Self::FrameDebugOff => "frame-debug off".into(),
+            Self::FrameDebugTake => "frame-debug".into(),
+            Self::PerfOption(option, on) => {
+                format!(
+                    "perf-option {} {}",
+                    option.name(),
+                    if *on { "on" } else { "off" }
+                )
+            }
+            Self::PerfOptions => "perf-options".into(),
         }
     }
 
@@ -77,7 +107,23 @@ impl Command {
             "quit" => Some(Self::Quit),
             "reload" => Some(Self::Reload),
             "frame-stats" => Some(Self::FrameStats),
+            "frame-debug on" => Some(Self::FrameDebugOn),
+            "frame-debug off" => Some(Self::FrameDebugOff),
+            "frame-debug" => Some(Self::FrameDebugTake),
+            "perf-options" => Some(Self::PerfOptions),
             _ => {
+                if let Some(option) = line.strip_prefix("perf-option ") {
+                    let (name, state) = option.split_once(' ')?;
+                    let on = match state {
+                        "on" => true,
+                        "off" => false,
+                        _ => return None,
+                    };
+                    return Some(Self::PerfOption(
+                        crate::perf_options::PerfOption::parse(name)?,
+                        on,
+                    ));
+                }
                 let mut words = line.strip_prefix("key ")?.split_whitespace();
                 let chord = words.next()?.to_string();
                 let hold_ms = match words.next() {
@@ -153,7 +199,16 @@ pub fn start(
                     Ok(())
                 }
                 Command::Key { chord, hold_ms } => state.inject_key_chord(&chord, hold_ms),
-                Command::FrameStats => Ok(()),
+                // Switched on the socket's thread; draw with it now.
+                Command::PerfOption(..) => {
+                    state.schedule_redraw();
+                    Ok(())
+                }
+                Command::FrameStats
+                | Command::FrameDebugOn
+                | Command::FrameDebugOff
+                | Command::FrameDebugTake
+                | Command::PerfOptions => Ok(()),
             };
             let _ = reply.send(result);
         }
@@ -184,7 +239,17 @@ fn serve(listener: UnixListener, sender: Sender<Request>) {
         };
         let reply = match read_command(&stream) {
             Ok(Command::FrameStats) => crate::frame_stats::json(),
+            Ok(Command::FrameDebugTake) => crate::frame_stats::take_debug_json(),
+            Ok(command @ (Command::FrameDebugOn | Command::FrameDebugOff)) => {
+                crate::frame_stats::set_debugging(command == Command::FrameDebugOn);
+                info!(command = command.to_line(), "control socket command");
+                "ok".to_string()
+            }
+            Ok(Command::PerfOptions) => crate::perf_options::json(),
             Ok(command) => {
+                if let Command::PerfOption(option, on) = command {
+                    option.set(on);
+                }
                 let (reply_sender, reply_receiver) = mpsc::channel();
                 if sender.send((command, reply_sender)).is_err() {
                     // The event loop is gone: the compositor is shutting down.
@@ -242,7 +307,9 @@ pub fn send(command: Command) -> Result<Option<String>, String> {
     match reply.trim() {
         "ok" => Ok(None),
         "" => Err("the compositor closed the connection without answering".to_string()),
-        json if command == Command::FrameStats && json.starts_with('{') => Ok(Some(json.to_string())),
+        json if command == Command::FrameStats && json.starts_with('{') => {
+            Ok(Some(json.to_string()))
+        }
         other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
     }
 }
@@ -264,12 +331,20 @@ mod tests {
                 chord: "XF86AudioRaiseVolume".into(),
                 hold_ms: 800,
             },
+            Command::FrameStats,
+            Command::FrameDebugOn,
+            Command::FrameDebugOff,
+            Command::FrameDebugTake,
+            Command::PerfOption(crate::perf_options::PerfOption::TargetedRedraw, false),
+            Command::PerfOption(crate::perf_options::PerfOption::FrameGate, true),
+            Command::PerfOptions,
         ] {
             assert_eq!(
                 Command::parse(&format!("{}\n", command.to_line())),
                 Some(command)
             );
         }
+        assert_eq!(Command::parse("frame-debug maybe"), None);
     }
 
     #[test]
