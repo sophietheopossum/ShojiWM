@@ -79,6 +79,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     backend::damage,
     backend::damage_blink,
+    backend::frame_gate::FrameGate,
     backend::decoration,
     backend::snapshot,
     backend::visual::{
@@ -1130,6 +1131,9 @@ struct SurfaceData {
     target: SurfaceTarget,
     available_modes: Vec<smithay::reexports::drm::control::Mode>,
     blink_damage_tracker: OutputDamageTracker,
+    /// Keeps a redraw with nothing new from repainting the swapchain; see
+    /// [`FrameGate`]. Keyed by the clear color and frame flags drawn with.
+    frame_gate: FrameGate<([f32; 4], FrameFlags), TtyRenderFrameResult>,
     frame_pending: bool,
     /// Latency diagnostic (`SHOJI_LATENCY_TRACE`): see [`LatencyInFlight`].
     latency_in_flight: Option<LatencyInFlight>,
@@ -2101,6 +2105,7 @@ impl SurfaceData {
             target,
             available_modes,
             blink_damage_tracker: OutputDamageTracker::from_output(&output),
+            frame_gate: FrameGate::new(OutputDamageTracker::from_output(&output)),
             frame_pending: false,
             latency_in_flight: None,
             queued_at: None,
@@ -2420,6 +2425,8 @@ fn render_ahead_allowed(surface: &SurfaceData, policy_allows: bool) -> bool {
 }
 
 fn drop_ahead_frame(surface: &mut SurfaceData) {
+    // Every path that drops a rendered frame unshown comes through here.
+    surface.frame_gate.forget();
     // Every caller drops the deferred frame too, so a frame still on the render GPU is
     // dropped whichever it was.
     if let Some(staging) = surface.cross_gpu_staging.take()
@@ -2562,6 +2569,7 @@ fn power_on_surface(surface: &mut SurfaceData) {
     surface.power_cleared = false;
     // The swapchain contents predate the dark period; render the first frame from scratch.
     surface.target.reset_buffers();
+    surface.frame_gate.forget();
     if let Some(target) = surface.cross_gpu.as_mut() {
         target.reset(&surface.output);
     }
@@ -2637,6 +2645,23 @@ struct TtyRenderFrameResult {
     /// The fence of a frame composited into the swapchain, which the commit
     /// must wait for (`render_surface`).
     sync: Option<SyncPoint>,
+}
+
+impl TtyRenderFrameResult {
+    /// This frame, standing in for a later one that changes nothing.
+    fn unchanged(&self) -> Self {
+        Self {
+            is_empty: true,
+            primary_scanout: self.primary_scanout,
+            primary_plane_kind: self.primary_plane_kind,
+            overlay_plane_count: self.overlay_plane_count,
+            overlay_details: self.overlay_details.clone(),
+            cursor_plane_assigned: self.cursor_plane_assigned,
+            states: self.states.clone(),
+            cross_gpu_pending: None,
+            sync: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4103,6 +4128,8 @@ fn submit_deferred_frame(
             // no-damage replacement the redraw is one empty render.
             surface.frame_pending = false;
             surface.redraw_state = TtyRedrawState::Idle;
+            // Its elements still have to reach the screen.
+            surface.frame_gate.forget();
             // The staged frame is dropped and will never flip, so no flip releases its hold,
             // and a later empty render does not replace it: an idle output would pin those
             // client buffers indefinitely. Nothing waits for the render here. It was submitted
@@ -4301,6 +4328,8 @@ fn finish_cross_gpu_frame(
                 ?error,
                 "failed to stage the cross-gpu frame; rendering a new one"
             );
+            // Its elements still have to reach the screen.
+            surface.frame_gate.forget();
             if staging.ahead {
                 surface.ahead_submit = None;
                 surface.ahead_held_client_buffers.clear();
@@ -6734,13 +6763,22 @@ fn render_surface(
         // alternating async game frames with vblank-bound cursor frames produces visibly uneven
         // cursor motion even when both the game and the output are otherwise running fast.
         let mut fullscreen_root_buffer_details = None;
+        // Nothing new since the frame drawn last: it stays on screen, unrepainted.
+        let gate_key = (frame_clear_color, frame_flags);
+        let unchanged_frame = surface
+            .frame_gate
+            .unchanged(&elements, &gate_key)
+            .filter(|_| !crate::env_flag!("SHOJI_DISABLE_FRAME_GATE"))
+            .map(TtyRenderFrameResult::unchanged);
+        let gated = unchanged_frame.is_some();
         let render_frame_result: Result<TtyRenderFrameResult, Box<dyn std::error::Error>> =
-            match &mut surface.target {
-                SurfaceTarget::Headless(headless) => {
+            match (unchanged_frame, &mut surface.target) {
+                (Some(unchanged_frame), _) => Ok(unchanged_frame),
+                (None, SurfaceTarget::Headless(headless)) => {
                     timescope::scope!("tty render_frame headless");
                     headless.render_frame(&output, &elements)
                 }
-                SurfaceTarget::Drm(drm_output) => {
+                (None, SurfaceTarget::Drm(drm_output)) => {
                     if let Some(scanout_renderer) = cross_gpu_scanout_renderer
                         && let Some(target) = surface.cross_gpu.as_mut()
                     {
@@ -6937,6 +6975,11 @@ fn render_surface(
                 return Err(err);
             }
         };
+        if gated {
+            crate::frame_stats::record(&output.name(), |frames| frames.unchanged += 1);
+        } else {
+            surface.frame_gate.drawn(gate_key, result.unchanged());
+        }
         fps_counter.record_present(output.name().as_str());
         if !result.is_empty {
             // Submitted (now or deferred): hold until `frame_finish`. An empty frame is not
@@ -7407,6 +7450,7 @@ fn render_surface(
                             );
                             return Ok(RenderSurfaceOutcome::CommitFailed);
                         }
+                        surface.frame_gate.forget();
                         return Err(Box::new(err));
                     }
                 }
