@@ -3298,6 +3298,7 @@ impl EmbeddedRuntime {
             NativeInteractionRequest::WindowResize { .. } => "windowResize",
             NativeInteractionRequest::PointerRegion { .. } => "pointerRegion",
             NativeInteractionRequest::InputGrab { .. } => "inputGrab",
+            NativeInteractionRequest::Dnd { .. } => "dnd",
         });
         self.send(BridgeRequest::Interaction(request), kind, None)
     }
