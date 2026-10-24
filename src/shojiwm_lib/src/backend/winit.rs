@@ -2096,24 +2096,29 @@ fn backdrop_shader_elements_for_window(
         root_subpixel_offset: crate::backend::visual::RootSubpixelEdges,
         shader_buffers: Vec<crate::backend::shader_effect::CachedShaderEffect>,
     }
-    let Some(decoration) = state.window_decorations.get(window).map(|decoration| BackdropDecoration {
-        id: decoration.snapshot.id.clone(),
-        title: decoration.snapshot.title.clone(),
-        app_id: decoration.snapshot.app_id.clone(),
-        root_rect: decoration.layout.root.rect,
-        visual_transform: decoration.visual_transform,
-        root_subpixel_offset: decoration.root_subpixel_offset,
-        shader_buffers: decoration
-            .shader_buffers
-            .iter()
-            .filter(|cached| {
-                cached.shader.is_texture_backed()
-                    && (!prefer_framebuffer_backdrops
-                        || !cached.shader.supports_framebuffer_backdrop())
+    let Some(decoration) =
+        state
+            .window_decorations
+            .get(window)
+            .map(|decoration| BackdropDecoration {
+                id: decoration.snapshot.id.clone(),
+                title: decoration.snapshot.title.clone(),
+                app_id: decoration.snapshot.app_id.clone(),
+                root_rect: decoration.layout.root.rect,
+                visual_transform: decoration.visual_transform,
+                root_subpixel_offset: decoration.root_subpixel_offset,
+                shader_buffers: decoration
+                    .shader_buffers
+                    .iter()
+                    .filter(|cached| {
+                        cached.shader.is_texture_backed()
+                            && (!prefer_framebuffer_backdrops
+                                || !cached.shader.supports_framebuffer_backdrop())
+                    })
+                    .cloned()
+                    .collect(),
             })
-            .cloned()
-            .collect(),
-    }) else {
+    else {
         return Vec::new();
     };
     let lower_windows = windows_top_to_bottom
@@ -4323,13 +4328,18 @@ fn configured_background_effect_elements_for_window(
         root_rect: crate::ssd::LogicalRect,
         visual_transform: crate::ssd::WindowTransform,
     }
-    let Some(decoration) = state.window_decorations.get(window).map(|decoration| EffectDecoration {
-        id: decoration.snapshot.id.clone(),
-        title: decoration.snapshot.title.clone(),
-        app_id: decoration.snapshot.app_id.clone(),
-        root_rect: decoration.layout.root.rect,
-        visual_transform: decoration.visual_transform,
-    }) else {
+    let Some(decoration) =
+        state
+            .window_decorations
+            .get(window)
+            .map(|decoration| EffectDecoration {
+                id: decoration.snapshot.id.clone(),
+                title: decoration.snapshot.title.clone(),
+                app_id: decoration.snapshot.app_id.clone(),
+                root_rect: decoration.layout.root.rect,
+                visual_transform: decoration.visual_transform,
+            })
+    else {
         return Vec::new();
     };
     let lower_windows = windows_top_to_bottom
@@ -4854,7 +4864,7 @@ fn window_scene_elements_for_capture(
             for element in clipped {
                 match element {
                     window_render::WindowClipElement::Clipped(element)
-                    | window_render::WindowClipElement::ColorConverted(element) => {
+                    | window_render::WindowClipElement::Subsurface(element) => {
                         clipped_elements.push(element);
                     }
                     window_render::WindowClipElement::Raw(element) => {
@@ -5866,7 +5876,7 @@ fn winit_window_stack_elements(
                 if crate::env_flag!("SHOJI_GAP_DEBUG") {
                     let first_geometry = clipped.first().map(|element| match element {
                         window_render::WindowClipElement::Clipped(element)
-                        | window_render::WindowClipElement::ColorConverted(element) => {
+                        | window_render::WindowClipElement::Subsurface(element) => {
                             smithay::backend::renderer::element::Element::geometry(element, scale)
                         }
                         window_render::WindowClipElement::Raw(element) => {
@@ -5981,7 +5991,7 @@ fn winit_window_stack_elements(
                         .into_iter()
                         .flat_map(|element| match element {
                             window_render::WindowClipElement::Clipped(element)
-                            | window_render::WindowClipElement::ColorConverted(element) => {
+                            | window_render::WindowClipElement::Subsurface(element) => {
                                 transform_clipped_elements(vec![element], composition_visual)
                             }
                             window_render::WindowClipElement::Raw(element) => {
@@ -6047,7 +6057,7 @@ fn winit_window_stack_elements(
                     .into_iter()
                     .flat_map(|element| match element {
                         window_render::WindowClipElement::Clipped(element)
-                        | window_render::WindowClipElement::ColorConverted(element) => {
+                        | window_render::WindowClipElement::Subsurface(element) => {
                             transform_clipped_elements(vec![element], composition_visual)
                         }
                         window_render::WindowClipElement::Raw(element) => {
