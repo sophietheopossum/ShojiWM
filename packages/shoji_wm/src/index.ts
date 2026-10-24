@@ -444,6 +444,7 @@ export {
 export { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
 export { SESSION_CONTROLLER, sessionStartLocked } from "./session";
 export { ENV_CONTROLLER, drainPendingEnvUpdates } from "./env";
+export { readTextFile } from "./fs";
 export {
   CURSOR_CONTROLLER,
   currentCursorConfig,
