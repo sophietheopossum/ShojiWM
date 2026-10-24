@@ -78,8 +78,8 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     backend::damage,
     backend::damage_blink,
-    backend::frame_gate::FrameGate,
     backend::decoration,
+    backend::frame_gate::FrameGate,
     backend::snapshot,
     backend::visual::{
         WindowVisualState, is_identity_visual_geometry, requires_full_window_snapshot,
@@ -3898,15 +3898,52 @@ impl RenderElement<GlesRenderer> for ProfiledTtyRenderElement<'_> {
             self.draw_label,
             (dst.size.w, dst.size.h),
         );
-        let result = RenderElement::<GlesRenderer>::draw(
-            self.inner,
-            frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        );
+        let draw = |frame: &mut GlesFrame<'_, '_>| {
+            RenderElement::<GlesRenderer>::draw(
+                self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            )
+        };
+        // The main thread's time per element kind, for ShojiWM's profiler.
+        let result = match self.draw_label {
+            "tty-element-window-draw" => {
+                timescope::scope!("tty draw window");
+                draw(frame)
+            }
+            "tty-element-clipped-draw" => {
+                timescope::scope!("tty draw clipped window");
+                draw(frame)
+            }
+            "tty-element-text-draw" => {
+                timescope::scope!("tty draw text");
+                draw(frame)
+            }
+            "tty-element-snapshot-draw" => {
+                timescope::scope!("tty draw snapshot");
+                draw(frame)
+            }
+            "tty-element-decoration-draw" => {
+                timescope::scope!("tty draw decoration");
+                draw(frame)
+            }
+            "tty-element-backdrop-draw" => {
+                timescope::scope!("tty draw backdrop");
+                draw(frame)
+            }
+            "tty-element-cursor-draw" => {
+                timescope::scope!("tty draw cursor");
+                draw(frame)
+            }
+            _ => {
+                timescope::scope!("tty draw other");
+                draw(frame)
+            }
+        };
         crate::backend::shader_effect::end_gpu_timing_frame_span(frame, timing);
         result
     }
@@ -3922,6 +3959,7 @@ impl RenderElement<GlesRenderer> for ProfiledTtyRenderElement<'_> {
         dst: Rectangle<i32, Physical>,
         cache: &UserDataMap,
     ) -> Result<(), GlesError> {
+        timescope::scope!("tty capture framebuffer");
         let timing = crate::backend::shader_effect::begin_gpu_timing_frame_span(
             frame,
             "tty-element-framebuffer-capture",
@@ -5509,8 +5547,8 @@ fn render_surface(
         let gated = unchanged_frame.is_some();
         let render_frame_result: Result<TtyRenderFrameResult, Box<dyn std::error::Error>> =
             if let Some(unchanged_frame) = unchanged_frame {
-            Ok(unchanged_frame)
-        } else if let Some(scanout_renderer) = cross_gpu_scanout_renderer.as_deref_mut()
+                Ok(unchanged_frame)
+            } else if let Some(scanout_renderer) = cross_gpu_scanout_renderer.as_deref_mut()
                 && let Some(target) = surface.cross_gpu.as_mut()
             {
                 timescope::scope!("tty render_frame cross-gpu");
@@ -5548,7 +5586,10 @@ fn render_surface(
                                 element.id(),
                             ));
                         }
-                        if crate::backend::shader_effect::gpu_element_timing_debug_enabled() {
+                        // Also while ShojiWM's profiler runs, which times each element kind.
+                        if crate::backend::shader_effect::gpu_element_timing_debug_enabled()
+                            || timescope::is_profile_enabled()
+                        {
                             let profiled_elements = elements
                                 .iter()
                                 .map(ProfiledTtyRenderElement::new)
@@ -8672,24 +8713,27 @@ fn backdrop_shader_elements_for_window(
         root_subpixel_offset: crate::backend::visual::RootSubpixelEdges,
         shader_buffers: Vec<crate::backend::shader_effect::CachedShaderEffect>,
     }
-    let Some(decoration) = window_decorations.get(window).map(|decoration| BackdropDecoration {
-        id: decoration.snapshot.id.clone(),
-        title: decoration.snapshot.title.clone(),
-        app_id: decoration.snapshot.app_id.clone(),
-        root_rect: decoration.layout.root.rect,
-        visual_transform: decoration.visual_transform,
-        root_subpixel_offset: decoration.root_subpixel_offset,
-        shader_buffers: decoration
-            .shader_buffers
-            .iter()
-            .filter(|cached| {
-                cached.shader.is_texture_backed()
-                    && (!prefer_framebuffer_backdrops
-                        || !cached.shader.supports_framebuffer_backdrop())
-            })
-            .cloned()
-            .collect(),
-    }) else {
+    let Some(decoration) = window_decorations
+        .get(window)
+        .map(|decoration| BackdropDecoration {
+            id: decoration.snapshot.id.clone(),
+            title: decoration.snapshot.title.clone(),
+            app_id: decoration.snapshot.app_id.clone(),
+            root_rect: decoration.layout.root.rect,
+            visual_transform: decoration.visual_transform,
+            root_subpixel_offset: decoration.root_subpixel_offset,
+            shader_buffers: decoration
+                .shader_buffers
+                .iter()
+                .filter(|cached| {
+                    cached.shader.is_texture_backed()
+                        && (!prefer_framebuffer_backdrops
+                            || !cached.shader.supports_framebuffer_backdrop())
+                })
+                .cloned()
+                .collect(),
+        })
+    else {
         return Vec::new();
     };
     let lower_windows = windows_top_to_bottom
