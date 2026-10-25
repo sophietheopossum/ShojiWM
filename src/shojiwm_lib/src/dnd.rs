@@ -21,7 +21,7 @@ use std::{
     os::fd::OwnedFd,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -267,9 +267,45 @@ pub enum DragViewCommand {
 /// A `Source` that records the action the target settles on, so the config
 /// can show it.
 struct TrackedSource<S> {
-    inner: S,
+    inner: Arc<S>,
     chosen: Arc<AtomicU8>,
+    capture: Arc<DropCapture>,
 }
+
+/// A drop on a decoration that takes drops (`Element::on_drop`): no client
+/// accepts it, so smithay cancels the source; instead the compositor asks
+/// the source for its links, as a target would, and hands them to the
+/// decoration's handler.
+#[derive(Default)]
+pub(crate) struct DropCapture {
+    /// The window (runtime id) and drop handler under the pointer now.
+    target: std::sync::Mutex<Option<(String, String)>>,
+    /// Smithay calls Source::cancel before telling us whether this was a drop
+    /// or a cancelled grab. Defer native acceptance until that distinction.
+    cancelled: std::sync::Mutex<Option<Box<dyn FnOnce(bool) -> bool + Send>>>,
+    /// Drops whose data is on its way: read on the event loop.
+    pending: std::sync::Mutex<Vec<PendingDrop>>,
+}
+
+impl std::fmt::Debug for DropCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DropCapture")
+    }
+}
+
+pub(crate) struct PendingDrop {
+    window_id: String,
+    handler_id: String,
+    read: std::io::PipeReader,
+    /// Tell the source the transfer is done (dnd_finished).
+    finish: Box<dyn FnOnce() + Send>,
+}
+
+/// A Button that takes drops carries this on its click handler's id.
+pub const DROP_SUFFIX: &str = "+drop";
+
+/// What a decoration that takes drops asks for, best first.
+const DROP_MIME_TYPES: [&str; 3] = ["text/uri-list", "text/plain;charset=utf-8", "text/plain"];
 
 impl<S: Source> IsAlive for TrackedSource<S> {
     fn alive(&self) -> bool {
@@ -301,9 +337,55 @@ impl<S: Source> Source for TrackedSource<S> {
     }
 
     fn cancel(&self) {
-        self.inner.cancel();
+        let target = self
+            .capture
+            .target
+            .lock()
+            .ok()
+            .and_then(|mut target| target.take());
+        let Some((window_id, handler_id)) = target else {
+            self.inner.cancel();
+            return;
+        };
+        let inner = self.inner.clone();
+        let capture = Arc::downgrade(&self.capture);
+        if let Ok(mut slot) = self.capture.cancelled.lock() {
+            *slot = Some(Box::new(move |dropped| {
+                if dropped
+                    && let Some(capture) = capture.upgrade()
+                    && let Some(mime) = inner
+                        .metadata()
+                        .filter(|metadata| {
+                            metadata.dnd_actions.is_empty()
+                                || metadata.dnd_actions.contains(&DndAction::Copy)
+                        })
+                        .and_then(|metadata| {
+                            DROP_MIME_TYPES
+                                .into_iter()
+                                .find(|mime| metadata.mime_types.iter().any(|m| m == mime))
+                        })
+                    && let Ok((read, write)) = std::io::pipe()
+                {
+                    inner.choose_action(DndAction::Copy);
+                    inner.send(mime, OwnedFd::from(write));
+                    inner.drop_performed();
+                    if let Ok(mut pending) = capture.pending.lock() {
+                        pending.push(PendingDrop {
+                            window_id,
+                            handler_id,
+                            read,
+                            finish: Box::new(move || inner.finished()),
+                        });
+                        return true;
+                    }
+                }
+                inner.cancel();
+                false
+            }));
+        } else {
+            self.inner.cancel();
+        }
     }
-
     fn finished(&self) {
         self.inner.finished();
     }
@@ -410,6 +492,9 @@ pub(crate) struct ScaledDragViewLayout {
 
 #[derive(Debug, Default)]
 pub struct DndState {
+    /// The drag in progress's capture (see [`DropCapture`]).
+    pub(crate) capture: Option<Arc<DropCapture>>,
+    copy_request: Option<u64>,
     next_drag_id: u64,
     next_generation: u64,
     pub(crate) active: Option<ActiveDrag>,
@@ -614,7 +699,135 @@ impl DndState {
     }
 }
 
+/// In-memory offers from native controls. File contents are never read by the
+/// compositor: Files supplies only a URI list. Writes run off the event loop and
+/// expire if a receiver stops reading.
+struct CopySource {
+    mime_type: String,
+    data: Arc<[u8]>,
+    alive: AtomicBool,
+}
+impl IsAlive for CopySource {
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+}
+impl Source for CopySource {
+    fn metadata(&self) -> Option<SourceMetadata> {
+        Some(SourceMetadata {
+            mime_types: vec![self.mime_type.clone()],
+            dnd_actions: [DndAction::Copy].into_iter().collect(),
+        })
+    }
+    fn choose_action(&self, _: DndAction) {}
+    fn send(&self, mime_type: &str, fd: OwnedFd) {
+        if mime_type != self.mime_type || !self.alive() {
+            return;
+        }
+        let data = self.data.clone();
+        std::thread::spawn(move || {
+            use smithay::reexports::rustix::{fs, io};
+            let Ok(flags) = fs::fcntl_getfl(&fd) else {
+                return;
+            };
+            if fs::fcntl_setfl(&fd, flags | fs::OFlags::NONBLOCK).is_err() {
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut offset = 0;
+            while offset < data.len() && Instant::now() < deadline {
+                match io::write(&fd, &data[offset..]) {
+                    Ok(0) => break,
+                    Ok(n) => offset += n,
+                    Err(io::Errno::INTR) => {}
+                    Err(io::Errno::AGAIN) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    fn drop_performed(&self) {}
+    fn cancel(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
+    fn finished(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
 impl ShojiWM {
+    pub(crate) fn start_copy_drag(&mut self, id: u64, mime_type: String, data: Vec<u8>) {
+        if self.session_lock_active
+            || self.dnd.active.is_some()
+            || mime_type.is_empty()
+            || mime_type.len() > 256
+            || data.len() > 1 << 20
+        {
+            return;
+        }
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        if pointer
+            .grab_start_data()
+            .is_none_or(|start| start.button != 272)
+        {
+            return;
+        }
+        self.start_drag(
+            CopySource {
+                mime_type,
+                data: data.into(),
+                alive: AtomicBool::new(true),
+            },
+            None,
+            self.seat.clone(),
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+            GrabType::Pointer,
+        );
+        self.dnd.copy_request = Some(id);
+        // The motion that crossed the native control's boundary ran under its
+        // input grab. Re-hit-test now so a release without another motion still
+        // offers the data to the application under the pointer.
+        self.loop_handle.insert_idle(move |state| {
+            if state.dnd.copy_request == Some(id) {
+                let location = state.seat.get_pointer().unwrap().current_location();
+                // The first event enters the new client; the second delivers
+                // motion so GTK can resolve the widget under that position
+                // before a release with no further physical movement.
+                for _ in 0..2 {
+                    state.synthetic_pointer(crate::runtime_api::SyntheticPointerInput {
+                        x: location.x,
+                        y: location.y,
+                        button: None,
+                        pressed: false,
+                    });
+                }
+            }
+        });
+    }
+    pub(crate) fn cancel_copy_drag(&mut self, id: u64) {
+        if self.dnd.copy_request != Some(id) {
+            return;
+        }
+        // TrackedSource::cancel also handles a drop on a native control. An
+        // explicit cancellation must never turn into a transfer there.
+        if let Some(capture) = &self.dnd.capture {
+            if let Ok(mut target) = capture.target.lock() {
+                *target = None;
+            }
+        }
+        if let Some(pointer) = self.seat.get_pointer() {
+            pointer.unset_grab(
+                self,
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+                smithay::backend::input::InputTime::from_millis(
+                    std::time::Duration::from(self.clock.now()).as_millis() as u32,
+                ),
+            );
+        }
+        self.dnd.copy_request = None;
+    }
     /// `wl_data_device.start_drag` (see `WaylandDndGrabHandler`).
     pub(crate) fn start_drag<S: Source>(
         &mut self,
@@ -647,9 +860,12 @@ impl ShojiWM {
             .as_ref()
             .map(|window| self.snapshot_window(window));
         let chosen = Arc::new(AtomicU8::new(DragAction::encode(DndAction::None)));
+        let capture = Arc::new(DropCapture::default());
+        self.dnd.capture = Some(capture.clone());
         let tracked = TrackedSource {
-            inner: source,
+            inner: Arc::new(source),
             chosen: chosen.clone(),
+            capture,
         };
 
         // A drag still running is cancelled by the new grab, but its end
@@ -720,8 +936,11 @@ impl ShojiWM {
         let Some(drag_id) = self.dnd.active.as_ref().map(|active| active.id) else {
             return;
         };
+        let native = self.dnd.capture.as_ref()
+            .and_then(|capture| capture.cancelled.lock().ok().and_then(|mut slot| slot.take()))
+            .is_some_and(|finish| finish(kind == DragEndKind::Dropped));
         self.loop_handle.insert_idle(move |state| {
-            state.end_drag(drag_id, kind, accepted, position);
+            state.end_drag(drag_id, kind, accepted || native, position);
         });
     }
 
@@ -742,6 +961,8 @@ impl ShojiWM {
             return;
         }
         self.sync_drag_state();
+        self.dnd.copy_request=None;
+        self.read_captured_drops();
         let Some(active) = self.dnd.end(Instant::now()) else {
             return;
         };
@@ -783,7 +1004,69 @@ impl ShojiWM {
         }
     }
 
+    /// The decoration under the pointer, if it takes drops: what a drop
+    /// there would go to.
+    fn update_drop_target(&mut self) {
+        let Some(capture) = self.dnd.capture.clone() else {
+            return;
+        };
+        let location = self.seat.get_pointer().map(|pointer| pointer.current_location());
+        let target = location.and_then(|location| match self.decoration_under(location) {
+            Some((window, crate::ssd::DecorationHitTestResult::Action(crate::ssd::WindowAction::RuntimeHandler(id))))
+                if id.ends_with(DROP_SUFFIX) =>
+            {
+                let node = id.rsplit_once('#').map_or(id.as_str(), |(node, _)| node);
+                Some((self.window_runtime_id(&window), format!("{node}#drop")))
+            }
+            _ => None,
+        });
+        if let Ok(mut slot) = capture.target.lock() {
+            *slot = target;
+        }
+    }
+
+    /// Read what captured drops send, on the event loop; each goes to its
+    /// decoration's handler when the source has written it all.
+    fn read_captured_drops(&mut self) {
+        let Some(capture) = self.dnd.capture.take() else {
+            return;
+        };
+        let drops = capture.pending.lock().map(|mut pending| std::mem::take(&mut *pending)).unwrap_or_default();
+        for drop in drops {
+            let PendingDrop { window_id, handler_id, read, finish } = drop;
+            let mut bytes = Vec::new();
+            let mut finish = Some(finish);
+            let source = calloop::generic::Generic::new(read, calloop::Interest::READ, calloop::Mode::Level);
+            let inserted = self.loop_handle.insert_source(source, move |_, read, state| {
+                use std::io::Read;
+                let mut chunk = [0u8; 8192];
+                // SAFETY: the reader stays owned by the source.
+                let count = unsafe { read.get_mut() }.read(&mut chunk).unwrap_or(0);
+                if count > 0 && bytes.len() + count <= 1 << 20 {
+                    bytes.extend_from_slice(&chunk[..count]);
+                    return Ok(calloop::PostAction::Continue);
+                }
+                if let Some(finish) = finish.take() {
+                    finish();
+                }
+                // Never dispatch a truncated URI or a lossy filename.
+                if count > 0 { return Ok(calloop::PostAction::Remove); }
+                let Ok(text) = String::from_utf8(bytes.clone()) else { return Ok(calloop::PostAction::Remove); };
+                let text = text.replace('\r', "");
+                let window = state.space.elements().find(|window| state.window_runtime_id(window) == window_id).cloned();
+                if let Some(window) = window {
+                    state.invoke_decoration_handler(&window, &format!("{handler_id}:{text}"));
+                }
+                Ok(calloop::PostAction::Remove)
+            });
+            if let Err(error) = inserted {
+                warn!(%error, "could not read a drop");
+            }
+        }
+    }
+
     fn refresh_active_drag_fields(&mut self) {
+        self.update_drop_target();
         let target_window_id = self
             .pointer_contents
             .surface
@@ -811,8 +1094,9 @@ impl ShojiWM {
         if icon.is_some() {
             active.icon = icon;
         }
-        active.action = DragAction::decode(active.chosen.load(Ordering::Acquire));
-        active.target_window_id = target_window_id;
+        let native_target = self.dnd.capture.as_ref().and_then(|capture| capture.target.lock().ok().and_then(|target| target.as_ref().map(|(window, _)| window.clone())));
+        active.action = if native_target.is_some() { DragAction::Copy } else { DragAction::decode(active.chosen.load(Ordering::Acquire)) };
+        active.target_window_id = native_target.or(target_window_id);
     }
 
     fn send_dnd_event(&mut self, event: DndEventSnapshot) {
@@ -971,6 +1255,67 @@ impl ShojiWM {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct SourceCalls {
+        sent: AtomicBool,
+        dropped: AtomicBool,
+        cancelled: AtomicBool,
+        finished: AtomicBool,
+    }
+    struct ProbeSource(Arc<SourceCalls>);
+    impl IsAlive for ProbeSource {
+        fn alive(&self) -> bool {
+            true
+        }
+    }
+    impl Source for ProbeSource {
+        fn metadata(&self) -> Option<SourceMetadata> {
+            Some(SourceMetadata {
+                mime_types: vec!["text/uri-list".into()],
+                dnd_actions: [DndAction::Copy].into_iter().collect(),
+            })
+        }
+        fn choose_action(&self, _: DndAction) {}
+        fn send(&self, _: &str, _: OwnedFd) {
+            self.0.sent.store(true, Ordering::Relaxed);
+        }
+        fn drop_performed(&self) {
+            self.0.dropped.store(true, Ordering::Relaxed);
+        }
+        fn cancel(&self) {
+            self.0.cancelled.store(true, Ordering::Relaxed);
+        }
+        fn finished(&self) {
+            self.0.finished.store(true, Ordering::Relaxed);
+        }
+    }
+    #[test]
+    fn a_cancelled_grab_over_a_native_target_never_transfers_data() {
+        for dropped in [false, true] {
+            let calls = Arc::new(SourceCalls::default());
+            let capture = Arc::new(DropCapture::default());
+            *capture.target.lock().unwrap() = Some(("window".into(), "handler".into()));
+            let source = TrackedSource {
+                inner: Arc::new(ProbeSource(calls.clone())),
+                chosen: Arc::new(AtomicU8::new(0)),
+                capture: capture.clone(),
+            };
+            source.cancel();
+            assert!(
+                !calls.sent.load(Ordering::Relaxed),
+                "wait for Smithay's drop/cancel result"
+            );
+            let finish = capture.cancelled.lock().unwrap().take().unwrap();
+            assert_eq!(finish(dropped), dropped);
+            assert_eq!(calls.sent.load(Ordering::Relaxed), dropped);
+            assert_eq!(calls.dropped.load(Ordering::Relaxed), dropped);
+            assert_eq!(calls.cancelled.load(Ordering::Relaxed), !dropped);
+            for pending in capture.pending.lock().unwrap().drain(..) {
+                (pending.finish)();
+            }
+            assert_eq!(calls.finished.load(Ordering::Relaxed), dropped);
+        }
+    }
     fn drag(id_hint: u64) -> ActiveDrag {
         ActiveDrag {
             id: id_hint,

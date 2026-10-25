@@ -936,6 +936,8 @@ impl InputMethodHandler for ShojiWM {
     }
 }
 
+impl smithay::wayland::text_input::TextInputActivation for ShojiWM {}
+
 impl KdeDecorationHandler for ShojiWM {
     fn kde_decoration_state(
         &self,
@@ -1079,6 +1081,12 @@ impl WaylandDndGrabHandler for ShojiWM {
 impl PrimarySelectionHandler for ShojiWM {
     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
         &mut self.primary_selection_state
+    }
+}
+
+impl smithay::wayland::selection::ext_data_control::DataControlHandler for ShojiWM {
+    fn data_control_state(&mut self) -> &mut smithay::wayland::selection::ext_data_control::DataControlState {
+        &mut self.ext_data_control_state
     }
 }
 

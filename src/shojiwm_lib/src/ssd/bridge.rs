@@ -63,6 +63,7 @@ pub struct WireProps {
     pub mode: Option<String>,
     pub close_on_escape: Option<bool>,
     pub close_on_outside_press: Option<bool>,
+    pub moves_window: Option<bool>,
     pub on_open_change: Option<WirePopupDismissHandlers>,
     pub on_interest_change: Option<WireStateChangeHandler>,
     pub on_anchor_press: Option<WireRuntimeHandler>,
@@ -380,6 +381,7 @@ pub struct WireStyle {
     pub background: Option<String>,
     pub color: Option<String>,
     pub opacity: Option<f32>,
+    pub blur: Option<f32>,
     pub border: Option<WireBorderValue>,
     pub border_top: Option<WireBorderValue>,
     pub border_right: Option<WireBorderValue>,
@@ -582,6 +584,7 @@ impl TryFrom<WireDecorationNode> for DecorationNode {
                     .map(TryInto::try_into)
                     .transpose()?,
                 popup: popup_handlers,
+                size_change: None,
             },
             window_border_interaction,
             kind,
@@ -1296,8 +1299,11 @@ impl TryFrom<WireStyle> for DecorationStyle {
                 .transpose()?,
             align_items: value.align_items.map(parse_align_items).transpose()?,
             background: value.background.map(|s| parse_color(&s)).transpose()?,
+            // The TypeScript style has no gradients yet.
+            background_gradient: None,
             color: value.color.map(|s| parse_color(&s)).transpose()?,
             opacity: value.opacity,
+            blur: value.blur,
             border: value.border.map(parse_border).transpose()?,
             border_top: value.border_top.map(parse_border).transpose()?,
             border_right: value.border_right.map(parse_border).transpose()?,
@@ -1511,6 +1517,7 @@ fn parse_popup(props: &WireProps) -> Result<PopupNode, DecorationBridgeError> {
         close_on_outside_press: props
             .close_on_outside_press
             .unwrap_or(defaults.close_on_outside_press),
+        moves_window: props.moves_window.unwrap_or(defaults.moves_window),
     })
 }
 

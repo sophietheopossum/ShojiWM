@@ -172,6 +172,46 @@ impl From<Element> for Child {
     }
 }
 
+/// Scrolling over a node with [`Element::on_scroll`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrollEvent {
+    /// Logical pixels; positive is right / down.
+    pub delta_x: f64,
+    pub delta_y: f64,
+    /// Wheel clicks × 120, when the device reports them.
+    pub discrete_x: Option<f64>,
+    pub discrete_y: Option<f64>,
+    /// `"wheel"`, `"finger"`, `"continuous"` or `"wheelTilt"`.
+    pub source: String,
+    /// The fingers lifted: a touchpad scroll ended.
+    pub stop: bool,
+}
+
+impl ScrollEvent {
+    /// The payload after `#scroll:` in a scroll handler id:
+    /// `dx:dy:discrete_x:discrete_y:source:stop`.
+    pub(crate) fn parse(payload: &str) -> Option<Self> {
+        let mut parts = payload.split(':');
+        let number = |text: Option<&str>| text.and_then(|text| text.parse::<f64>().ok());
+        let delta_x = number(parts.next())?;
+        let delta_y = number(parts.next())?;
+        let discrete_x = number(parts.next());
+        let discrete_y = number(parts.next());
+        let source = parts.next()?.to_owned();
+        let stop = parts.next()? == "1";
+        Some(Self { delta_x, delta_y, discrete_x, discrete_y, source, stop })
+    }
+}
+
+thread_local! {
+    /// What was dropped, for an `on_drop` handler.
+    pub(crate) static DROPPED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The scroll being delivered to an `on_scroll` handler.
+    pub(crate) static SCROLL: std::cell::RefCell<Option<ScrollEvent>> = const { std::cell::RefCell::new(None) };
+    /// The laid-out size being delivered to an `on_size` handler, unscaled.
+    pub(crate) static SIZE: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
+}
+
 /// A decoration node under construction.
 #[derive(Clone)]
 pub struct Element {
@@ -179,8 +219,12 @@ pub struct Element {
     style: Box<Style>,
     key: Option<String>,
     on_click: Option<ClickAction>,
+    on_secondary_click: Option<Rc<dyn Fn()>>,
+    on_scroll: Option<Rc<dyn Fn(&ScrollEvent)>>,
+    on_drop: Option<Rc<dyn Fn(&[String])>>,
     on_hover_change: Option<Rc<dyn Fn(bool)>>,
     on_active_change: Option<Rc<dyn Fn(bool)>>,
+    on_size: Option<Rc<dyn Fn(f64, f64)>>,
     paint: Option<Box<PaintShader>>,
     overlay: Option<Box<PaintShader>>,
     children: Vec<Child>,
@@ -193,8 +237,12 @@ impl Element {
             style: Box::default(),
             key: None,
             on_click: None,
+            on_secondary_click: None,
+            on_scroll: None,
+            on_drop: None,
             on_hover_change: None,
             on_active_change: None,
+            on_size: None,
             paint: None,
             overlay: None,
             children: Vec::new(),
@@ -319,6 +367,13 @@ impl Element {
         })
     }
 
+    /// Whether a press on an interactive [`Popup`] away from its buttons
+    /// moves its window, like a title bar drawn over the client (default
+    /// `false`).
+    pub fn moves_window(self, value: bool) -> Self {
+        self.popup_option("moves_window", |popup| popup.moves_window = value)
+    }
+
     fn popup_callbacks(mut self, name: &str, set: impl FnOnce(&mut PopupCallbacks)) -> Self {
         match &mut self.kind {
             ElementKind::Popup { callbacks, .. } => set(callbacks),
@@ -435,6 +490,28 @@ impl Element {
         self
     }
 
+    /// Run `f` on a right click. Only [`Button`]s are hit by the pointer.
+    pub fn on_secondary_click(mut self, f: impl Fn() + 'static) -> Self {
+        self.on_secondary_click = Some(Rc::new(f));
+        self
+    }
+
+    /// Take scrolling over this node (a [`Button`]) from the client under
+    /// it: wheel clicks and touchpad scrolls, then a `stop` when the fingers
+    /// lift.
+    pub fn on_scroll(mut self, f: impl Fn(&ScrollEvent) + 'static) -> Self {
+        self.on_scroll = Some(Rc::new(f));
+        self
+    }
+
+    /// Take what is dropped on this node (a [`Button`]): the dragged data's
+    /// lines, `file://` links for files. The compositor asks for a copy, so
+    /// the source keeps its files.
+    pub fn on_drop(mut self, f: impl Fn(&[String]) + 'static) -> Self {
+        self.on_drop = Some(Rc::new(f));
+        self
+    }
+
     pub fn on_hover_change(mut self, f: impl Fn(bool) + 'static) -> Self {
         self.on_hover_change = Some(Rc::new(f));
         self
@@ -442,6 +519,14 @@ impl Element {
 
     pub fn on_active_change(mut self, f: impl Fn(bool) + 'static) -> Self {
         self.on_active_change = Some(Rc::new(f));
+        self
+    }
+
+    /// Be told this node's laid-out size, in this view's lengths, whenever
+    /// it changes: the compositor lays the tree out, so this comes a frame
+    /// after the change.
+    pub fn on_size(mut self, f: impl Fn(f64, f64) + 'static) -> Self {
+        self.on_size = Some(Rc::new(f));
         self
     }
 }
@@ -672,6 +757,7 @@ pub struct ManagedWindow {
     tiled: Option<Prop<bool>>,
     allow_tearing: Option<Prop<bool>>,
     z_index: Option<Prop<i32>>,
+    keyboard_focus: Option<Prop<bool>>,
     opacity: Option<Prop<f64>>,
     transform: Option<Prop<ManagedTransform>>,
     children: Vec<Child>,
@@ -707,6 +793,10 @@ managed_props! {
     /// Allow tearing page flips while the window is scanned out directly.
     allow_tearing: bool,
     z_index: i32,
+    /// Whether a press on the window gives it the keyboard (default true):
+    /// a config's own surfaces turn it off, so a click on them leaves the
+    /// user's app focused.
+    keyboard_focus: bool,
     opacity: f64,
     transform: ManagedTransform,
 }
@@ -762,6 +852,7 @@ impl ManagedWindow {
             tiled: read(&self.tiled).unwrap_or(false),
             allow_tearing: read(&self.allow_tearing),
             z_index: read(&self.z_index),
+            keyboard_focus: read(&self.keyboard_focus).unwrap_or(true),
             transform: WindowTransform {
                 origin: TransformOrigin {
                     x: transform.origin_x,
@@ -1005,10 +1096,44 @@ impl MountedNode {
         if let Some(ClickAction::Handler(handler)) = &element.on_click {
             context.register_handler(format!("{id}#click"), handler.clone());
         }
-        if let ElementKind::Popup {
-            popup, callbacks, ..
-        } = &element.kind
-        {
+        if let Some(handler) = &element.on_secondary_click {
+            context.register_handler(format!("{id}#secondary"), handler.clone());
+        }
+        if let Some(handler) = &element.on_drop {
+            let handler = handler.clone();
+            context.register_handler(
+                format!("{id}#drop"),
+                Rc::new(move || {
+                    let lines = DROPPED.with(|dropped| dropped.borrow().clone());
+                    handler(&lines);
+                }),
+            );
+        }
+        if let Some(handler) = &element.on_scroll {
+            let handler = handler.clone();
+            context.register_handler(
+                format!("{id}#scroll"),
+                Rc::new(move || {
+                    if let Some(event) = SCROLL.with(|scroll| scroll.borrow().clone()) {
+                        handler(&event);
+                    }
+                }),
+            );
+        }
+        if let Some(handler) = &element.on_size {
+            let handler = handler.clone();
+            let ui_scale = context.ui_scale.clone();
+            context.register_handler(
+                format!("{id}#size"),
+                Rc::new(move || {
+                    if let Some((width, height)) = SIZE.with(Cell::take) {
+                        let scale = ui_scale.get();
+                        handler(width / scale, height / scale);
+                    }
+                }),
+            );
+        }
+        if let ElementKind::Popup { popup, callbacks, .. } = &element.kind {
             register_popup_handlers(context, &id, popup, callbacks);
         }
         for (name, handler) in [
@@ -1151,10 +1276,15 @@ impl MountedNode {
                 ElementKind::Button => DecorationNodeKind::Button(ButtonNode {
                     action: match &element.on_click {
                         Some(ClickAction::Window(action)) => action.clone(),
-                        Some(ClickAction::Handler(_)) => {
-                            WindowAction::RuntimeHandler(format!("{id}#click"))
-                        }
-                        None => WindowAction::RuntimeHandler(format!("{id}#none")),
+                        // A node that takes drops says so on its id.
+                        Some(ClickAction::Handler(_)) => WindowAction::RuntimeHandler(format!(
+                            "{id}#click{}",
+                            if element.on_drop.is_some() { shojiwm_lib::dnd::DROP_SUFFIX } else { "" }
+                        )),
+                        None => WindowAction::RuntimeHandler(format!(
+                            "{id}#none{}",
+                            if element.on_drop.is_some() { shojiwm_lib::dnd::DROP_SUFFIX } else { "" }
+                        )),
                     },
                 }),
                 ElementKind::AppIcon => DecorationNodeKind::AppIcon(Default::default()),
@@ -1200,6 +1330,7 @@ impl MountedNode {
                 } => popup_handlers(&id, popup, callbacks),
                 _ => None,
             },
+            size_change: element.on_size.as_ref().map(|_| format!("{id}#size")),
         };
         let window_border_interaction = match &element.kind {
             ElementKind::WindowBorder { interaction } => *interaction,
@@ -1573,5 +1704,19 @@ mod tests {
         assert!(!at(2.0, 12, 12) && at(2.0, 22, 22) && at(2.0, 55, 55) && !at(2.0, 65, 65));
         // At 1.5: 15..45.
         assert!(!at(1.5, 12, 12) && at(1.5, 17, 17) && at(1.5, 43, 43) && !at(1.5, 48, 48));
+    }
+}
+
+#[cfg(test)]
+mod scroll_event_tests {
+    use super::ScrollEvent;
+
+    #[test]
+    fn payloads_parse() {
+        let event = ScrollEvent::parse("-12.5:0:-120::finger:0").unwrap();
+        assert_eq!((event.delta_x, event.delta_y, event.discrete_x, event.discrete_y), (-12.5, 0.0, Some(-120.0), None));
+        assert_eq!((event.source.as_str(), event.stop), ("finger", false));
+        assert!(ScrollEvent::parse("0:0:::finger:1").unwrap().stop);
+        assert!(ScrollEvent::parse("x").is_none());
     }
 }

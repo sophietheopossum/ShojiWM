@@ -52,7 +52,8 @@ pub(crate) use popup_input::PopupInputState;
 pub use window_model::{
     GesturePinchEventSnapshot, GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
     HdmiLinkSnapshot, LayerKindSnapshot, LayerPositionSnapshot,
-    ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode,
+    ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode, spring_position,
+    spring_settle_seconds,
     ManagedWindowAnimationSnapshot, ManagedWindowPointAnimationSnapshot,
     ManagedWindowPointSnapshot, ManagedWindowRectAnimationSnapshot, ManagedWindowRectSnapshot,
     ManagedWindowScalarAnimationSnapshot, ManagedWindowState, OutputModeSnapshot,
@@ -288,9 +289,17 @@ impl ComputedDecorationTree {
         let point = self.root.frame.layout_point(x, y);
         // Interactive popups sit above everything else of the window.
         if let Some(hit) = popup::popup_hit(&self.root, point) {
+            let moves_window = matches!(
+                &hit.popup.kind,
+                DecorationNodeKind::Popup(popup) if popup.moves_window
+            );
             return find_button_action(hit.popup, point)
                 .map(DecorationHitTestResult::Action)
-                .unwrap_or(DecorationHitTestResult::Popup);
+                .unwrap_or(if moves_window {
+                    DecorationHitTestResult::Move
+                } else {
+                    DecorationHitTestResult::Popup
+                });
         }
         if let Some(action) = find_button_action(&self.root, point) {
             return DecorationHitTestResult::Action(action);
@@ -410,15 +419,16 @@ impl ComputedDecorationTree {
     /// the client's input region has a hole, since the decoration under the
     /// client shows through it.
     pub fn takes_input_over_client_at(&self, x: f64, y: f64) -> bool {
+        let point = self.root.frame.layout_point(x, y);
+        if popup::popup_hit(&self.root, point).is_some() {
+            return true;
+        }
         if matches!(
             self.hit_test_at(x, y),
-            DecorationHitTestResult::Action(_)
-                | DecorationHitTestResult::Popup
-                | DecorationHitTestResult::Resize(_)
+            DecorationHitTestResult::Action(_) | DecorationHitTestResult::Resize(_)
         ) {
             return true;
         }
-        let point = self.root.frame.layout_point(x, y);
         has_interaction_target_beside_client(&self.root, point)
     }
 
@@ -772,6 +782,9 @@ pub struct DecorationInteractionHandlers {
     pub active_change: Option<DecorationStateChangeHandler>,
     /// `<Popup>` nodes only.
     pub popup: Option<Box<popup::PopupHandlers>>,
+    /// Told the node's laid-out size whenever it changes, as
+    /// `"{handler}:{width}:{height}"` (logical pixels).
+    pub size_change: Option<String>,
 }
 
 impl DecorationInteractionHandlers {
@@ -1512,8 +1525,14 @@ pub struct DecorationStyle {
     pub justify_content: Option<JustifyContent>,
     pub align_items: Option<AlignItems>,
     pub background: Option<Color>,
+    /// A linear gradient painted as the background (over `background`).
+    pub background_gradient: Option<LinearGradient>,
     pub color: Option<Color>,
     pub opacity: Option<f32>,
+    /// Standard deviation (logical px) of a blur of the node's text and
+    /// images and everything inside it; layout makes it the node's own
+    /// combined with its ancestors'.
+    pub blur: Option<f32>,
     pub border: Option<BorderStyle>,
     pub border_top: Option<BorderStyle>,
     pub border_right: Option<BorderStyle>,
@@ -1537,6 +1556,45 @@ pub struct DecorationStyle {
     pub paint: Option<PaintShader>,
     /// Painted above the node's children.
     pub overlay: Option<PaintShader>,
+}
+
+/// A CSS-like `linear-gradient`: `angle` in degrees (0 runs to the top, 90
+/// to the right, as CSS) through up to [`LinearGradient::MAX_STOPS`] colour
+/// stops, each at an offset from 0 to 1 along it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearGradient {
+    pub angle: f32,
+    pub stops: Vec<GradientStop>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    pub offset: f32,
+    pub color: Color,
+}
+
+impl LinearGradient {
+    /// The stops the built-in paint program draws; more are dropped.
+    pub const MAX_STOPS: usize = 4;
+
+    /// `colors` spread evenly from start to end.
+    pub fn new(angle: f32, colors: impl IntoIterator<Item = Color>) -> Self {
+        let colors: Vec<Color> = colors.into_iter().collect();
+        let last = colors.len().saturating_sub(1).max(1) as f32;
+        Self {
+            angle,
+            stops: colors
+                .into_iter()
+                .enumerate()
+                .map(|(index, color)| GradientStop { offset: index as f32 / last, color })
+                .collect(),
+        }
+    }
+
+    /// Whether it draws anything.
+    pub fn is_visible(&self) -> bool {
+        self.stops.iter().any(|stop| stop.color.a > 0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2142,7 +2200,28 @@ pub(super) fn layout_node_with_scale(
         round_half_up(rect.width as f64 * frame.scale) + root_extra_px.0,
         round_half_up(rect.height as f64 * frame.scale) + root_extra_px.1,
     );
-    layout_node_resolved(node, root_rect, None, window_slot_size, frame, root_rect)
+    let mut root = layout_node_resolved(node, root_rect, None, window_slot_size, frame, root_rect)?;
+    inherit_group_style(&mut root, 1.0, 0.0);
+    Ok(root)
+}
+
+/// Opacity and blur apply to a node and everything inside it, but each node
+/// paints with its own style only: so a node's opacity becomes its own times
+/// its ancestors' (text and icons in a fading container fade with it), and
+/// its blur its own combined with theirs (as Gaussians combine).
+fn inherit_group_style(node: &mut ComputedDecorationNode, opacity: f32, blur: f32) {
+    let effective = node.style.opacity.unwrap_or(1.0).clamp(0.0, 1.0) * opacity;
+    if node.style.opacity.is_some() || opacity < 1.0 {
+        node.style.opacity = Some(effective);
+    }
+    let own = node.style.blur.unwrap_or(0.0).max(0.0);
+    let blurred = (own * own + blur * blur).sqrt();
+    if node.style.blur.is_some() || blur > 0.0 {
+        node.style.blur = Some(blurred);
+    }
+    for child in &mut node.children {
+        inherit_group_style(child, effective, blurred);
+    }
 }
 
 fn layout_node_resolved(
@@ -2258,11 +2337,20 @@ fn layout_node_resolved(
         children,
     };
 
-    apply_node_transform(&mut computed);
+    apply_node_transform(&mut computed, inherited_clip);
     Ok(computed)
 }
 
 pub(super) fn reapply_tree_preserving_layout(
+    computed: &mut ComputedDecorationNode,
+    node: &DecorationNode,
+    inherited_clip: Option<ResolvedDecorationClip>,
+) {
+    reapply_node_preserving_layout(computed, node, inherited_clip);
+    inherit_group_style(computed, 1.0, 0.0);
+}
+
+fn reapply_node_preserving_layout(
     computed: &mut ComputedDecorationNode,
     node: &DecorationNode,
     inherited_clip: Option<ResolvedDecorationClip>,
@@ -2292,7 +2380,7 @@ pub(super) fn reapply_tree_preserving_layout(
         } else {
             computed.resolved_effective_clip
         };
-        reapply_tree_preserving_layout(computed_child, node_child, inherited_clip);
+        reapply_node_preserving_layout(computed_child, node_child, inherited_clip);
     }
 }
 
@@ -2691,7 +2779,7 @@ fn layout_popup(
     layout_node_resolved(node, rect, None, window_slot_size, frame, rect)
 }
 
-fn apply_node_transform(node: &mut ComputedDecorationNode) {
+fn apply_node_transform(node: &mut ComputedDecorationNode, inherited_clip: Option<ResolvedDecorationClip>) {
     let Some(transform) = node.style.transform else {
         return;
     };
@@ -2704,6 +2792,36 @@ fn apply_node_transform(node: &mut ComputedDecorationNode) {
         node.resolved_rect.y.raw() as f64 + node.resolved_rect.height.raw() as f64 * 0.5,
     );
     transform_subtree(node, origin, transform);
+    // A clip from outside the node (a scrolling area, say) stays where it
+    // is: transformed with the node, a translation would have carried it
+    // along and a scale moved its edges in over the node. The node's and its
+    // descendants' own clips are taken again from their transformed boxes.
+    reclip_transformed(node, inherited_clip);
+}
+
+/// `node`'s clip and its descendants', from their (transformed) content
+/// rects under `inherited_clip`; corner radii shrink with the scale.
+fn reclip_transformed(node: &mut ComputedDecorationNode, inherited_clip: Option<ResolvedDecorationClip>) {
+    let frame = node.frame;
+    let own = node_style_clips_children(&node.style).then(|| {
+        let radius = (node.style.resolved_border_radius(frame.scale) - node.style.resolved_border_width(frame.scale))
+            .max(ResolvedLayoutValue::ZERO);
+        let factor = node.transform_scale.0.min(node.transform_scale.1);
+        ResolvedDecorationClip {
+            rect: node.resolved_content_rect,
+            radius: ResolvedLayoutValue::from_raw((radius.raw() as f64 * factor).round() as i32),
+        }
+    });
+    node.resolved_effective_clip = match (inherited_clip, own) {
+        (Some(parent), Some(current)) => Some(clip_within(parent, current)),
+        (Some(parent), None) => Some(parent),
+        (None, current) => current,
+    };
+    node.effective_clip = node.resolved_effective_clip.map(|clip| clip.to_logical_clip(frame));
+    let clip = node.resolved_effective_clip;
+    for child in &mut node.children {
+        reclip_transformed(child, clip);
+    }
 }
 
 fn transform_subtree(
@@ -2867,6 +2985,7 @@ impl DecorationNode {
                     text_overflow: None,
                     line_height: Some(line_height),
                     raster_scale: 1.0,
+                    blur: 0.0,
                 };
                 let (width, height) = measure_label_intrinsic(&spec);
                 Some((
@@ -3600,7 +3719,7 @@ fn effective_clip_for_node_resolved(
     });
 
     match (inherited_clip, node_clip) {
-        (Some(parent), Some(current)) => intersect_resolved_decoration_clips(parent, current),
+        (Some(parent), Some(current)) => Some(clip_within(parent, current)),
         (Some(parent), None) => Some(parent),
         (None, Some(current)) => Some(current),
         (None, None) => None,
@@ -3608,12 +3727,27 @@ fn effective_clip_for_node_resolved(
 }
 
 fn node_clips_children(node: &DecorationNode) -> bool {
+    node_style_clips_children(&node.style)
+}
+
+fn node_style_clips_children(style: &DecorationStyle) -> bool {
     // A container border defines the visible inner edge for its descendants.
     // `overflow: visible` is the explicit escape hatch. WindowSlot is filtered
     // separately when the client-surface clip is derived, because it is a leaf
     // placement marker rather than an SSD container.
-    node.style.clips_children()
-        || (node.style.has_border() && !matches!(node.style.overflow, Some(Overflow::Visible)))
+    style.clips_children()
+        || (style.has_border() && !matches!(style.overflow, Some(Overflow::Visible)))
+}
+
+/// A node's clip, `current`, inside its ancestors', `parent`. Empty where
+/// they do not meet: a node moved wholly outside its clip (transformed, or
+/// a scrolled page's row) shows nothing and takes no hits, where no clip at
+/// all would draw it in full.
+fn clip_within(parent: ResolvedDecorationClip, current: ResolvedDecorationClip) -> ResolvedDecorationClip {
+    intersect_resolved_decoration_clips(parent, current).unwrap_or(ResolvedDecorationClip {
+        rect: ResolvedLogicalRect { width: ResolvedLayoutValue::ZERO, height: ResolvedLayoutValue::ZERO, ..parent.rect },
+        radius: ResolvedLayoutValue::ZERO,
+    })
 }
 
 fn intersect_resolved_decoration_clips(
@@ -3722,6 +3856,42 @@ mod tests {
     }
 
     #[test]
+    fn a_clipped_node_scrolled_out_of_its_clip_shows_and_takes_nothing() {
+        let column = || DecorationNode::new(DecorationNodeKind::Box(BoxNode { direction: LayoutDirection::Column }));
+        // A page's row, its title clipped, scrolled above the room it is
+        // seen through (50 to 90).
+        let button = DecorationNode::new(DecorationNodeKind::Button(ButtonNode { action: WindowAction::Close }))
+            .with_style(DecorationStyle { width: Some(20.0), height: Some(20.0), ..Default::default() });
+        let row = column()
+            .with_style(DecorationStyle {
+                width: Some(100.0),
+                height: Some(30.0),
+                position: Some(StylePosition::Absolute),
+                inset: PositionOffsets { top: Some(-45.0), left: Some(0.0), ..Default::default() },
+                overflow: Some(Overflow::Hidden),
+                ..Default::default()
+            })
+            .with_children(vec![button]);
+        let room = column()
+            .with_style(DecorationStyle {
+                height: Some(40.0),
+                margin: Edges { top: 50.0, ..Default::default() },
+                position: Some(StylePosition::Relative),
+                overflow: Some(Overflow::Hidden),
+                ..Default::default()
+            })
+            .with_children(vec![row]);
+        let layout = DecorationTree::new(column().with_children(vec![room, DecorationNode::new(DecorationNodeKind::WindowSlot)]))
+            .layout(LogicalRect::new(0, 0, 100, 200))
+            .expect("layout should succeed");
+        let row = &layout.root.children[0].children[0];
+        assert_eq!(row.rect.y, 5, "the row sits above the room");
+        let clip = row.effective_clip.expect("a clip, if an empty one");
+        assert_eq!((clip.rect.width, clip.rect.height), (0, 0));
+        assert_eq!(layout.hit_test(LogicalPoint::new(10, 10)), DecorationHitTestResult::Move, "its button takes no press");
+    }
+
+    #[test]
     fn window_border_insets_content_by_border_width() {
         let mut root = DecorationNode::new(DecorationNodeKind::WindowBorder);
         root.style.border = Some(BorderStyle {
@@ -3738,6 +3908,41 @@ mod tests {
             layout.window_slot_rect(),
             Some(LogicalRect::new(2, 2, 96, 46))
         );
+    }
+
+    #[test]
+    fn opacity_multiplies_into_descendants() {
+        let half = || DecorationStyle { opacity: Some(0.5), ..Default::default() };
+        let root = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Column,
+        }))
+        .with_children(vec![
+            DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                direction: LayoutDirection::Column,
+            }))
+            .with_style(half())
+            .with_children(vec![
+                DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                    direction: LayoutDirection::Column,
+                }))
+                .with_style(half()),
+                DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                    direction: LayoutDirection::Column,
+                })),
+            ]),
+            DecorationNode::new(DecorationNodeKind::WindowSlot),
+        ]);
+
+        let layout = DecorationTree::new(root)
+            .layout(LogicalRect::new(0, 0, 100, 50))
+            .expect("layout should succeed");
+        let faded = &layout.root.children[0];
+
+        assert_eq!(layout.root.style.opacity, None);
+        assert_eq!(faded.style.opacity, Some(0.5));
+        assert_eq!(faded.children[0].style.opacity, Some(0.25));
+        assert_eq!(faded.children[1].style.opacity, Some(0.5));
+        assert_eq!(layout.root.children[1].style.opacity, None);
     }
 
     #[test]
@@ -3839,6 +4044,56 @@ mod tests {
             .expect("child should inherit rounded clip");
 
         assert_eq!(clip.radius.raw(), 18);
+    }
+
+    #[test]
+    fn a_transformed_child_keeps_its_parents_clip_where_it_is() {
+        // A scrolling area (overflow hidden) around content scaled to half:
+        // the area's clip must not shrink around the content's middle.
+        let root = DecorationNode::new(DecorationNodeKind::Box(BoxNode { direction: LayoutDirection::Column }))
+            .with_style(DecorationStyle { overflow: Some(Overflow::Hidden), ..Default::default() })
+            .with_children(vec![
+                DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
+                    .with_style(DecorationStyle {
+                        width: Some(100.0),
+                        height: Some(100.0),
+                        transform: Some(NodeTransform { translate_x: 0.0, translate_y: 0.0, scale_x: 0.5, scale_y: 0.5 }),
+                        ..Default::default()
+                    })
+                    .with_children(vec![DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
+                        .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)])]),
+            ]);
+        let layout = DecorationTree::new(root).layout(LogicalRect::new(0, 0, 100, 100)).expect("layout should succeed");
+        let area = layout.root.resolved_effective_clip.expect("the area clips").rect;
+        let content = &layout.root.children[0];
+        assert_eq!(content.resolved_effective_clip.expect("inherited").rect, area);
+        assert_eq!(content.children[0].resolved_effective_clip.expect("inherited").rect, area);
+        assert_eq!(content.transform_scale, (0.5, 0.5));
+    }
+
+    #[test]
+    fn a_clipping_child_moved_outside_its_parents_clip_shows_nothing() {
+        // Scrolled out of view: its own clip and the area's do not meet.
+        let root = DecorationNode::new(DecorationNodeKind::Box(BoxNode { direction: LayoutDirection::Column }))
+            .with_style(DecorationStyle { overflow: Some(Overflow::Hidden), ..Default::default() })
+            .with_children(vec![
+                DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
+                    .with_style(DecorationStyle {
+                        width: Some(100.0),
+                        height: Some(100.0),
+                        overflow: Some(Overflow::Hidden),
+                        transform: Some(NodeTransform { translate_x: 0.0, translate_y: 150.0, scale_x: 1.0, scale_y: 1.0 }),
+                        ..Default::default()
+                    })
+                    .with_children(vec![DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
+                        .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)])]),
+            ]);
+        let layout = DecorationTree::new(root).layout(LogicalRect::new(0, 0, 100, 100)).expect("layout should succeed");
+        let moved = &layout.root.children[0];
+        let clip = moved.resolved_effective_clip.expect("an empty clip, not none");
+        assert_eq!((clip.rect.width.raw(), clip.rect.height.raw()), (0, 0));
+        let inner = moved.children[0].resolved_effective_clip.expect("inherited");
+        assert_eq!((inner.rect.width.raw(), inner.rect.height.raw()), (0, 0));
     }
 
     #[test]
@@ -6093,6 +6348,65 @@ mod tests {
         assert_eq!(ids(center(item)), ["item", "anchor"]);
         assert_eq!(ids(below_item), ["anchor"]);
         assert_eq!(ids(center(anchor)), ["anchor"]);
+    }
+
+    #[test]
+    fn a_popup_that_moves_its_window_is_a_title_bar_over_the_client() {
+        set_popup_viewports(Vec::new());
+        let layout = |moves_window: bool| {
+            let mut close = sized(
+                DecorationNodeKind::Button(ButtonNode {
+                    action: WindowAction::Close,
+                }),
+                20.0,
+                20.0,
+            );
+            close.stable_id = Some("close".into());
+            // On top, offset by minus its height: over the client's top edge.
+            let mut bar = DecorationNode::new(DecorationNodeKind::Popup(PopupNode {
+                placement: PopupPlacement::Top,
+                offset: -30.0,
+                collision: PopupCollision::None,
+                layer: PopupLayer::Window,
+                mode: PopupMode::Manual,
+                moves_window,
+                ..PopupNode::default()
+            }))
+            .with_children(vec![
+                sized(DecorationNodeKind::Box(BoxNode::default()), 120.0, 30.0)
+                    .with_children(vec![close]),
+            ]);
+            bar.stable_id = Some("bar".into());
+            let root = DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
+                .with_style(DecorationStyle {
+                    position: Some(StylePosition::Relative),
+                    ..Default::default()
+                })
+                .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot), bar]);
+            DecorationTree::new(root)
+                .layout(LogicalRect::new(100, 100, 200, 150))
+                .expect("layout")
+        };
+
+        let layout_moving = layout(true);
+        let bar = find_by_id(&layout_moving.root, "bar").unwrap().rect;
+        assert_eq!((bar.x, bar.y), (140, 100), "over the top of the client");
+        let close = center(find_by_id(&layout_moving.root, "close").unwrap().rect);
+        let background = (bar.x as f64 + 100.0, bar.y as f64 + 15.0);
+        let below = (bar.x as f64 + 100.0, bar.y as f64 + 80.0);
+        for (layout, off_buttons) in [
+            (layout_moving, DecorationHitTestResult::Move),
+            (layout(false), DecorationHitTestResult::Popup),
+        ] {
+            assert_eq!(
+                layout.hit_test_at(close.0, close.1),
+                DecorationHitTestResult::Action(WindowAction::Close)
+            );
+            assert_eq!(layout.hit_test_at(background.0, background.1), off_buttons);
+            assert!(layout.takes_input_over_client_at(background.0, background.1));
+            assert_eq!(layout.hit_test_at(below.0, below.1), DecorationHitTestResult::ClientArea);
+            assert!(!layout.takes_input_over_client_at(below.0, below.1));
+        }
     }
 
     #[test]

@@ -975,6 +975,45 @@ fn init_winit_dmabuf(backend: &mut winit::WinitGraphicsBackend<GlesRenderer>, st
     state.dmabuf_global = Some(global);
 }
 
+/// `SHOJI_WINIT_PHANTOM_OUTPUT=WxH`: a second output, `winit-phantom` (after
+/// `winit` in automatic placement), to the right of the
+/// window's, for testing what spans displays in a nested session. Windows,
+/// decorations and the runtime see it as any other output; it is never
+/// drawn (nor can it be captured), so what is on it is checked through the
+/// runtime, and what leaves it through the window's output.
+fn phantom_output(state: &mut ShojiWM, window_width: i32) -> Option<Output> {
+    let value = std::env::var("SHOJI_WINIT_PHANTOM_OUTPUT").ok()?;
+    let (w, h) = value.split_once('x')?;
+    let size = (w.trim().parse::<i32>().ok()?, h.trim().parse::<i32>().ok()?);
+    if size.0 <= 0 || size.1 <= 0 {
+        warn!(%value, "SHOJI_WINIT_PHANTOM_OUTPUT wants WxH");
+        return None;
+    }
+    let output = Output::new(
+        "winit-phantom".to_string(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Smithay".into(),
+            model: "Phantom".into(),
+            serial_number: "Unknown".into(),
+        },
+    );
+    let mode = Mode { size: size.into(), refresh: 60_000 };
+    output.change_current_state(Some(mode), Some(Transform::Normal), None, None);
+    output.set_preferred(mode);
+    let _global = state.create_output_global(&output);
+    place_phantom_output(state, &output, window_width);
+    info!(?size, "phantom output for tests");
+    Some(output)
+}
+
+fn place_phantom_output(state: &mut ShojiWM, phantom: &Output, window_width: i32) {
+    phantom.change_current_state(None, None, None, Some((window_width, 0).into()));
+    state.space.map_output(phantom, (window_width, 0));
+    state.notify_runtime_outputs_changed();
+}
+
 pub fn init_winit(
     event_loop: &mut EventLoop<ShojiWM>,
     state: &mut ShojiWM,
@@ -1023,11 +1062,17 @@ pub fn init_winit(
     let _global = state.create_output_global(&output);
 
     state.space.map_output(&output, (0, 0));
+    let phantom = phantom_output(state, mode.size.w);
 
     let initial_render_mode =
         winit_render_mode(&output).expect("winit output has a mode right after creation");
     let mut damage_tracker = OutputDamageTracker::from_mode_source(initial_render_mode.clone());
     let mut blink_damage_tracker = OutputDamageTracker::from_mode_source(initial_render_mode);
+    // Night light's encode pass (`hdr_pipeline`), as on a TTY output.
+    let mut encode_pipeline: Option<crate::backend::hdr_pipeline::HdrPipeline> = None;
+    // Tests that drive a nested session with synthesized input set this, so
+    // the host's pointer and keys passing over its window change nothing.
+    let ignore_host_input = std::env::var_os("SHOJI_IGNORE_HOST_INPUT").is_some_and(|value| value == "1");
     event_loop
         .handle()
         .insert_source(winit, move |event, _, state| {
@@ -1042,10 +1087,17 @@ pub fn init_winit(
                         None,
                         None,
                     );
+                    if let Some(phantom) = &phantom {
+                        place_phantom_output(state, phantom, size.w);
+                    }
                     // A locked session's surfaces take the new size too.
                     state.configure_session_lock_surfaces();
                 }
-                WinitEvent::Input(event) => state.process_input_event(event),
+                WinitEvent::Input(event) => {
+                    if !ignore_host_input {
+                        state.process_input_event(event);
+                    }
+                }
                 WinitEvent::Redraw => {
                     let mut backend = backend.borrow_mut();
                     timescope::scope!("winit redraw");
@@ -1060,6 +1112,12 @@ pub fn init_winit(
                             state.refresh_window_decorations_for_output(Some(output.name().as_str()))
                         {
                             warn!(error = ?err, "failed to refresh window decorations for winit");
+                        }
+                        // Never drawn, but decorated (and laid out) all the same.
+                        if let Some(phantom) = &phantom
+                            && let Err(err) = state.refresh_window_decorations_for_output(Some(phantom.name().as_str()))
+                        {
+                            warn!(error = ?err, "failed to refresh window decorations for the phantom output");
                         }
                     }
                     state.refresh_drag_views();
@@ -1210,7 +1268,7 @@ pub fn init_winit(
                         }
                         let scene_elements = built.elements;
                         let composition_presentation = built.presentation;
-                        let mut overlay_below_layers = built.below_layers;
+                        let overlay_below_layers = built.below_layers;
 
                         let computed_damage = if state.damage_blink_enabled {
                             match blink_damage_tracker.damage_output(1, &scene_elements) {
@@ -1236,12 +1294,6 @@ pub fn init_winit(
                         }
 
                         let mut content_elements: Vec<WinitRenderElements> = Vec::new();
-                        content_elements.extend(
-                            damage::elements_for_output(&extra_damage, output_geo)
-                                .into_iter()
-                                .map(WinitRenderElements::Damage),
-                        );
-                        overlay_below_layers += content_elements.len();
                         content_elements.extend(scene_elements);
                         if !state.session_lock_active {
                             state.output_overlays.render(renderer, &output,
@@ -1277,6 +1329,15 @@ pub fn init_winit(
                         }
 
                         let mut elements: Vec<WinitRenderElements> = Vec::new();
+                        // The output's damage element, topmost so that it never
+                        // moves in the stack (`damage::element_for_output`).
+                        if !state.session_lock_active {
+                            elements.push(WinitRenderElements::Damage(damage::element_for_output(
+                                &output.name(),
+                                &extra_damage,
+                                output_geo,
+                            )));
+                        }
                         let error_text_elements = crate::config_error::text_elements_for_output(
                             renderer,
                             &mut state.text_rasterizer,
@@ -1377,20 +1438,79 @@ pub fn init_winit(
                                     .map(|mode| Duration::from_secs_f64(1_000f64 / mode.refresh as f64))
                                     .unwrap_or(Duration::ZERO);
                             state.pre_repaint(&output, frame_target);
+                            // Frame debugging: the frame's damage as an age-1 tracker would see it.
+                            if let Some(damaged) = crate::frame_stats::probe_frame(&output, &elements) {
+                                crate::frame_stats::record(&output.name(), |frames| {
+                                    if damaged {
+                                        frames.committed += 1;
+                                    } else {
+                                        frames.empty += 1;
+                                    }
+                                });
+                            }
 
+                            let output_lut = state.output_lut(&output.name());
+                            if output_lut.is_none() {
+                                encode_pipeline = None;
+                            }
+                            bind_default_framebuffer_before_surface();
                             let render_started_at = Instant::now();
                             let render_output_result = {
                                 timescope::scope!("winit render_output");
-                                damage_tracker.render_output(
-                                    renderer,
-                                    &mut framebuffer,
-                                    0,
-                                    &elements,
-                                    [0.1, 0.1, 0.1, 1.0],
-                                )
+                                match output_lut {
+                                    // Composite into the intermediate, then draw it through
+                                    // the LUT; the states are the composite's, so clients
+                                    // still get their frame callbacks and feedback.
+                                    Some(lut) => match crate::backend::hdr_pipeline::render_hdr_pipeline(
+                                        renderer,
+                                        &mut encode_pipeline,
+                                        &output,
+                                        &elements,
+                                        [0.1, 0.1, 0.1, 1.0],
+                                        crate::backend::hdr_pipeline::OutputEncoding::Icc(lut),
+                                        smithay::backend::allocator::Fourcc::Abgr8888,
+                                    ) {
+                                        Ok(Some((encode, states))) => {
+                                            bind_default_framebuffer_before_surface();
+                                            damage_tracker
+                                                .render_output(
+                                                    renderer,
+                                                    &mut framebuffer,
+                                                    0,
+                                                    &[encode],
+                                                    [0.0, 0.0, 0.0, 1.0],
+                                                )
+                                                .map(|mut result| {
+                                                    result.states = states;
+                                                    result
+                                                })
+                                        }
+                                        result => {
+                                            if let Err(error) = result {
+                                                warn!(?error, "night light encode pass failed");
+                                            }
+                                            encode_pipeline = None;
+                                            damage_tracker.render_output(
+                                                renderer,
+                                                &mut framebuffer,
+                                                0,
+                                                &elements,
+                                                [0.1, 0.1, 0.1, 1.0],
+                                            )
+                                        }
+                                    },
+                                    None => damage_tracker.render_output(
+                                        renderer,
+                                        &mut framebuffer,
+                                        0,
+                                        &elements,
+                                        [0.1, 0.1, 0.1, 1.0],
+                                    ),
+                                }
                             };
                             timing.render_elapsed_ms =
                                 render_started_at.elapsed().as_secs_f64() * 1000.0;
+                            debug_dump_presented_frame(size);
                             if let Ok(render_output_result) = render_output_result {
                                 // Only a frame that renders is submitted, so only it is dumped.
                                 debug_dump_presented_frame(size);
@@ -2026,7 +2146,36 @@ fn backdrop_shader_elements_for_window(
             return Vec::new();
         }
     }
-    let Some(decoration) = state.window_decorations.get(window).cloned() else {
+    // The few fields the backdrops read, copied out: they update the window's
+    // backdrop cache below, so they cannot borrow it, and cloning the whole state
+    // (its tree, layout and buffers) every frame cost more than drawing them.
+    struct BackdropDecoration {
+        id: String,
+        title: String,
+        app_id: Option<String>,
+        root_rect: crate::ssd::LogicalRect,
+        visual_transform: crate::ssd::WindowTransform,
+        root_subpixel_offset: crate::backend::visual::RootSubpixelEdges,
+        shader_buffers: Vec<crate::backend::shader_effect::CachedShaderEffect>,
+    }
+    let Some(decoration) = state.window_decorations.get(window).map(|decoration| BackdropDecoration {
+        id: decoration.snapshot.id.clone(),
+        title: decoration.snapshot.title.clone(),
+        app_id: decoration.snapshot.app_id.clone(),
+        root_rect: decoration.layout.root.rect,
+        visual_transform: decoration.visual_transform,
+        root_subpixel_offset: decoration.root_subpixel_offset,
+        shader_buffers: decoration
+            .shader_buffers
+            .iter()
+            .filter(|cached| {
+                cached.shader.is_texture_backed()
+                    && (!prefer_framebuffer_backdrops
+                        || !cached.shader.supports_framebuffer_backdrop())
+            })
+            .cloned()
+            .collect(),
+    }) else {
         return Vec::new();
     };
     let lower_windows = windows_top_to_bottom
@@ -2045,24 +2194,18 @@ fn backdrop_shader_elements_for_window(
 
     decoration
         .shader_buffers
-        .clone()
         .iter()
-        .filter(|cached| {
-            cached.shader.is_texture_backed()
-                && (!prefer_framebuffer_backdrops
-                    || !cached.shader.supports_framebuffer_backdrop())
-        })
         .filter_map(|cached| {
             let uses_backdrop = cached.shader.uses_backdrop_input();
             let uses_xray = cached.shader.uses_xray_backdrop_input();
             let render_as_backdrop = uses_backdrop || uses_xray;
-            let root_rect = decoration.layout.root.rect;
+            let root_rect = decoration.root_rect;
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             cached.stable_key.hash(&mut hasher);
             let display_rect = if apply_visual_transform {
                 crate::backend::visual::transformed_rect(
                     cached.rect,
-                    decoration.layout.root.rect,
+                    decoration.root_rect,
                     decoration.visual_transform,
                 )
             } else {
@@ -2074,7 +2217,7 @@ fn backdrop_shader_elements_for_window(
                     if apply_visual_transform {
                         crate::backend::visual::transformed_precise_rect(
                             rect,
-                            decoration.layout.root.rect,
+                            decoration.root_rect,
                             decoration.visual_transform,
                         )
                     } else {
@@ -2169,9 +2312,9 @@ fn backdrop_shader_elements_for_window(
 
             if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                 tracing::info!(
-                    window_id = %decoration.snapshot.id,
-                    title = %decoration.snapshot.title,
-                    app_id = ?decoration.snapshot.app_id,
+                    window_id = %decoration.id,
+                    title = %decoration.title,
+                    app_id = ?decoration.app_id,
                     stable_key = %cached.stable_key,
                     source_effect_rect = ?source_effect_rect,
                     display_rect = ?display_rect,
@@ -2213,7 +2356,7 @@ fn backdrop_shader_elements_for_window(
                                 if apply_visual_transform {
                                     crate::backend::visual::transformed_precise_rect(
                                         clip,
-                                        decoration.layout.root.rect,
+                                        decoration.root_rect,
                                         decoration.visual_transform,
                                     )
                                 } else {
@@ -2237,7 +2380,7 @@ fn backdrop_shader_elements_for_window(
                                 let transformed_clip = if apply_visual_transform {
                                     crate::backend::visual::transformed_rect(
                                         clip_rect,
-                                        decoration.layout.root.rect,
+                                        decoration.root_rect,
                                         decoration.visual_transform,
                                     )
                                 } else {
@@ -2297,7 +2440,7 @@ fn backdrop_shader_elements_for_window(
                         local_sample_rect,
                         local_capture_rect,
                         &cached.shader,
-                        alpha,
+                        alpha * cached.opacity,
                         scale.x as f32,
                         [0.0, 0.0],
                         clip_rect,
@@ -2306,16 +2449,16 @@ fn backdrop_shader_elements_for_window(
                             .unwrap_or(cached.clip_radius as f32),
                         format!(
                             "window-backdrop:{}:{}",
-                            decoration.snapshot.id, cached.stable_key
+                            decoration.id, cached.stable_key
                         ),
                     )
                     .ok()
                     .map(|element| {
                         if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                             tracing::info!(
-                                window_id = %decoration.snapshot.id,
-                                title = %decoration.snapshot.title,
-                                app_id = ?decoration.snapshot.app_id,
+                                window_id = %decoration.id,
+                                title = %decoration.title,
+                                app_id = ?decoration.app_id,
                                 stable_key = %cached.stable_key,
                                 local_rect = ?local_rect,
                                 local_sample_rect = ?local_sample_rect,
@@ -2426,7 +2569,7 @@ fn backdrop_shader_elements_for_window(
                 renderer,
                 format!(
                     "winit:window-backdrop:{}:{}",
-                    decoration.snapshot.id, cached.stable_key
+                    decoration.id, cached.stable_key
                 ),
                 input_texture,
                 xray_texture,
@@ -2478,7 +2621,7 @@ fn backdrop_shader_elements_for_window(
                         if apply_visual_transform {
                             crate::backend::visual::transformed_precise_rect(
                                 clip,
-                                decoration.layout.root.rect,
+                                decoration.root_rect,
                                 decoration.visual_transform,
                             )
                         } else {
@@ -2502,7 +2645,7 @@ fn backdrop_shader_elements_for_window(
                         let transformed_clip = if apply_visual_transform {
                             crate::backend::visual::transformed_rect(
                                 clip_rect,
-                                decoration.layout.root.rect,
+                                decoration.root_rect,
                                 decoration.visual_transform,
                             )
                         } else {
@@ -2552,7 +2695,7 @@ fn backdrop_shader_elements_for_window(
                 local_sample_rect,
                 local_capture_rect,
                 &cached.shader,
-                alpha,
+                alpha * cached.opacity,
                 scale.x as f32,
                 [0.0, 0.0],
                 clip_rect,
@@ -2561,16 +2704,16 @@ fn backdrop_shader_elements_for_window(
                     .unwrap_or(cached.clip_radius as f32),
                 format!(
                     "window-backdrop:{}:{}",
-                    decoration.snapshot.id, cached.stable_key
+                    decoration.id, cached.stable_key
                 ),
             )
             .ok()
             .map(|element| {
                 if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                     tracing::info!(
-                        window_id = %decoration.snapshot.id,
-                        title = %decoration.snapshot.title,
-                        app_id = ?decoration.snapshot.app_id,
+                        window_id = %decoration.id,
+                        title = %decoration.title,
+                        app_id = ?decoration.app_id,
                         stable_key = %cached.stable_key,
                         local_rect = ?local_rect,
                         local_sample_rect = ?local_sample_rect,
@@ -4228,13 +4371,29 @@ fn configured_background_effect_elements_for_window(
     let Some(config) = state.configured_background_effect.clone() else {
         return Vec::new();
     };
-    let Some(decoration) = state.window_decorations.get(window).cloned() else {
-        return Vec::new();
-    };
     let rects = protocol_background_effect_rects_for_window(state, window);
     if rects.is_empty() {
         return Vec::new();
     }
+    // What the effect reads of the decoration, copied out: it updates the
+    // window's backdrop cache below, and this ran for every window, every frame,
+    // as a clone of the whole state.
+    struct EffectDecoration {
+        id: String,
+        title: String,
+        app_id: Option<String>,
+        root_rect: crate::ssd::LogicalRect,
+        visual_transform: crate::ssd::WindowTransform,
+    }
+    let Some(decoration) = state.window_decorations.get(window).map(|decoration| EffectDecoration {
+        id: decoration.snapshot.id.clone(),
+        title: decoration.snapshot.title.clone(),
+        app_id: decoration.snapshot.app_id.clone(),
+        root_rect: decoration.layout.root.rect,
+        visual_transform: decoration.visual_transform,
+    }) else {
+        return Vec::new();
+    };
     let lower_windows = windows_top_to_bottom
         .iter()
         .skip(window_index + 1)
@@ -4261,7 +4420,7 @@ fn configured_background_effect_elements_for_window(
             let effect_rect = if apply_visual_transform {
                 crate::backend::visual::transformed_rect(
                     rect,
-                    decoration.layout.root.rect,
+                    decoration.root_rect,
                     decoration.visual_transform,
                 )
             } else {
@@ -4350,8 +4509,8 @@ fn configured_background_effect_elements_for_window(
                 {
                     let local_rect = Rectangle::new(
                         smithay::utils::Point::from((
-                            effect_rect.x - decoration.layout.root.rect.x,
-                            effect_rect.y - decoration.layout.root.rect.y,
+                            effect_rect.x - decoration.root_rect.x,
+                            effect_rect.y - decoration.root_rect.y,
                         )),
                         (effect_rect.width, effect_rect.height).into(),
                     );
@@ -4365,7 +4524,7 @@ fn configured_background_effect_elements_for_window(
                     let geometry =
                         crate::backend::visual::relative_physical_rect_from_root_global_origin_size(
                             effect_rect,
-                            decoration.layout.root.rect,
+                            decoration.root_rect,
                             output_geo,
                             scale,
                         );
@@ -4384,7 +4543,7 @@ fn configured_background_effect_elements_for_window(
                         [0.0, 0.0],
                         None,
                         0.0,
-                        format!("protocol-window:{}:{}", decoration.snapshot.id, stable_key),
+                        format!("protocol-window:{}:{}", decoration.id, stable_key),
                     )
                     .ok()
                     .map(|element| (index, element));
@@ -4448,12 +4607,12 @@ fn configured_background_effect_elements_for_window(
             );
             if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                 tracing::info!(
-                    window_id = %decoration.snapshot.id,
-                    title = %decoration.snapshot.title,
-                    app_id = ?decoration.snapshot.app_id,
+                    window_id = %decoration.id,
+                    title = %decoration.title,
+                    app_id = ?decoration.app_id,
                     stable_key = %stable_key,
                     effect_rect = ?effect_rect,
-                    root_rect = ?decoration.layout.root.rect,
+                    root_rect = ?decoration.root_rect,
                     output_geo = ?output_geo,
                     blur_padding,
                     capture_geo = ?capture_geo,
@@ -4463,8 +4622,8 @@ fn configured_background_effect_elements_for_window(
                     output_size = ?output_size,
                     local_rect = ?Rectangle::<i32, Logical>::new(
                         smithay::utils::Point::from((
-                            effect_rect.x - decoration.layout.root.rect.x,
-                            effect_rect.y - decoration.layout.root.rect.y,
+                            effect_rect.x - decoration.root_rect.x,
+                            effect_rect.y - decoration.root_rect.y,
                         )),
                         (effect_rect.width, effect_rect.height).into(),
                     ),
@@ -4477,7 +4636,7 @@ fn configured_background_effect_elements_for_window(
                     ),
                     geometry = ?crate::backend::visual::relative_physical_rect_from_root_global_origin_size(
                         effect_rect,
-                        decoration.layout.root.rect,
+                        decoration.root_rect,
                         output_geo,
                         scale,
                     ),
@@ -4488,7 +4647,7 @@ fn configured_background_effect_elements_for_window(
                 renderer,
                 format!(
                     "winit:protocol-window:{}:{}",
-                    decoration.snapshot.id, stable_key
+                    decoration.id, stable_key
                 ),
                 input_texture,
                 xray_texture,
@@ -4527,8 +4686,8 @@ fn configured_background_effect_elements_for_window(
             }
             let local_rect = Rectangle::new(
                 smithay::utils::Point::from((
-                    effect_rect.x - decoration.layout.root.rect.x,
-                    effect_rect.y - decoration.layout.root.rect.y,
+                    effect_rect.x - decoration.root_rect.x,
+                    effect_rect.y - decoration.root_rect.y,
                 )),
                 (effect_rect.width, effect_rect.height).into(),
             );
@@ -4542,7 +4701,7 @@ fn configured_background_effect_elements_for_window(
             let geometry =
                 crate::backend::visual::relative_physical_rect_from_root_global_origin_size(
                     effect_rect,
-                    decoration.layout.root.rect,
+                    decoration.root_rect,
                     output_geo,
                     scale,
                 );
@@ -4571,7 +4730,7 @@ fn configured_background_effect_elements_for_window(
                 [0.0, 0.0],
                 None,
                 0.0,
-                format!("protocol-window:{}:{}", decoration.snapshot.id, stable_key),
+                format!("protocol-window:{}:{}", decoration.id, stable_key),
             )
             .ok()
             .map(|element| (index, element))
@@ -4757,7 +4916,7 @@ fn window_scene_elements_for_capture(
             for element in clipped {
                 match element {
                     window_render::WindowClipElement::Clipped(element)
-                    | window_render::WindowClipElement::ColorConverted(element) => {
+                    | window_render::WindowClipElement::Subsurface(element) => {
                         clipped_elements.push(element);
                     }
                     window_render::WindowClipElement::Raw(element) => {
@@ -4878,6 +5037,7 @@ fn capture_live_snapshot_for_window(
             .into_iter()
             .map(WinitRenderElements::Window),
     );
+    let content = snapshot::content_commits(window);
 
     let existing = state.live_window_snapshots.remove(&snapshot_id);
     let live_tracker = state
@@ -4900,6 +5060,9 @@ fn capture_live_snapshot_for_window(
         scale,
         &elements,
     )? {
+        let mut snapshot = snapshot;
+        snapshot.content = content;
+        snapshot.captured_at = Some(std::time::Instant::now());
         state
             .live_window_snapshots
             .insert(snapshot_id.clone(), snapshot);
@@ -5767,15 +5930,13 @@ fn winit_window_stack_elements(
                 .unwrap_or_default();
                 let bypass_clip = crate::env_flag!("SHOJI_GAP_BYPASS_CLIP");
                 if crate::env_flag!("SHOJI_GAP_DEBUG") {
-                    let first_geometry = clipped.first().map(|element| match element {
-                        window_render::WindowClipElement::Clipped(element)
-                        | window_render::WindowClipElement::ColorConverted(element) => {
-                            smithay::backend::renderer::element::Element::geometry(element, scale)
-                        }
-                        window_render::WindowClipElement::Raw(element) => {
-                            smithay::backend::renderer::element::Element::geometry(element, scale)
-                        }
-                    });
+                    let first_geometry = clipped
+                        .first()
+                        .map(|element| match element {
+                            window_render::WindowClipElement::Clipped(element)
+                            | window_render::WindowClipElement::Subsurface(element) => smithay::backend::renderer::element::Element::geometry(element, scale),
+                            window_render::WindowClipElement::Raw(element) => smithay::backend::renderer::element::Element::geometry(element, scale),
+                        });
                     let window_geometry = window.geometry();
                     let decoration_client_rect = state
                         .window_decorations
@@ -5884,7 +6045,7 @@ fn winit_window_stack_elements(
                         .into_iter()
                         .flat_map(|element| match element {
                             window_render::WindowClipElement::Clipped(element)
-                            | window_render::WindowClipElement::ColorConverted(element) => {
+                            | window_render::WindowClipElement::Subsurface(element) => {
                                 transform_clipped_elements(vec![element], composition_visual)
                             }
                             window_render::WindowClipElement::Raw(element) => {
@@ -5950,7 +6111,7 @@ fn winit_window_stack_elements(
                     .into_iter()
                     .flat_map(|element| match element {
                         window_render::WindowClipElement::Clipped(element)
-                        | window_render::WindowClipElement::ColorConverted(element) => {
+                        | window_render::WindowClipElement::Subsurface(element) => {
                             transform_clipped_elements(vec![element], composition_visual)
                         }
                         window_render::WindowClipElement::Raw(element) => {
@@ -6122,19 +6283,17 @@ fn winit_window_stack_elements(
             }
             let should_refresh_snapshot = primary
                 && state
-                    .window_decorations
-                    .get(window)
-                    .map(|decoration| {
-                        state
-                            .live_window_snapshots
-                            .get(&decoration.snapshot.id)
-                            .map(|snapshot| {
-                                snapshot.rect.width != decoration.client_rect.width
-                                    || snapshot.rect.height != decoration.client_rect.height
-                            })
-                            .unwrap_or(true)
-                    })
-                    .unwrap_or(false);
+                .window_decorations
+                .get(window)
+                .map(|decoration| {
+                    snapshot::live_snapshot_stale(
+                        state.live_window_snapshots.get(&decoration.snapshot.id),
+                        decoration.client_rect,
+                        &snapshot::content_commits(window),
+                        std::time::Instant::now(),
+                    )
+                })
+                .unwrap_or(false);
             if should_refresh_snapshot
                 && capture_live_snapshot_for_window(
                     renderer,
@@ -6157,6 +6316,26 @@ fn winit_window_stack_elements(
                 state.snapshot_dirty_window_ids.remove(snapshot_id);
             }
         }
+    }
+}
+
+/// Offscreen work while the scene is built (effect pipelines, snapshots)
+/// can leave the context current without a surface and with an offscreen
+/// framebuffer bound. Making the window surface current again from that
+/// state leaves the surface's draw and read buffers at `GL_NONE` on NVIDIA:
+/// the frame's clear and first draws go nowhere until something else makes
+/// the surface current, and the rest of the frame lands on an old one. The
+/// Island's and the dock's shadows showed drawn twice for a frame whenever
+/// the dock changed size. Binding the default framebuffer first avoids it.
+/// A raw call, so the context stays as it is; with the surface current it
+/// binds what is already bound.
+fn bind_default_framebuffer_before_surface() {
+    type BindFramebuffer = unsafe extern "C" fn(u32, u32);
+    const FRAMEBUFFER: u32 = 0x8D40;
+    unsafe {
+        let bind: BindFramebuffer =
+            std::mem::transmute(smithay::backend::egl::get_proc_address("glBindFramebuffer"));
+        bind(FRAMEBUFFER, 0);
     }
 }
 

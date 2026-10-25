@@ -22,7 +22,7 @@ mod message;
 use std::{collections::BTreeMap, ffi::OsStr, path::PathBuf};
 
 pub use handle::RuntimeHandle;
-pub use host::{HostMessage, RuntimeConfigDelta, RuntimeHost, RuntimeSchedule};
+pub use host::{HostMessage, RuntimeConfigDelta, RuntimeHost, RuntimeSchedule, SyntheticPointerInput};
 pub use message::{
     CompositionPatch, DecorationRequest, EffectRequest, InputRequest, OVERLAY_STAGE_INDEX,
     PAINT_STAGE_INDEX, RuntimeEvent, RuntimeReply, RuntimeRequest, SHADER_INPUT_STAGE_INDEX,

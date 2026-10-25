@@ -70,6 +70,7 @@ use smithay::{
         selection::{
             data_device::DataDeviceState, primary_selection::PrimarySelectionState,
             wlr_data_control::DataControlState,
+            ext_data_control::DataControlState as ExtDataControlState,
         },
         session_lock::{LockSurface, SessionLockManagerState},
         shell::kde::decoration::KdeDecorationState,
@@ -158,6 +159,27 @@ fn runtime_dirty_debug_enabled() -> bool {
             .or_else(|| std::env::var_os("SHOJI_SSD_SUPPRESSION_DEBUG"))
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
+}
+
+/// A frame the tty backend is rendering, from the runtime tick and the
+/// decoration refreshes at its start, which it draws (`open`), to its end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FramePreparation {
+    pub output: String,
+    pub open: bool,
+    /// A change was left to this frame instead of asking for another one: if
+    /// the frame does not get drawn, the output still needs one.
+    pub changes_left: bool,
+}
+
+impl FramePreparation {
+    /// Whether this frame draws a change shown on `output`, which then needs
+    /// no frame of its own.
+    pub fn takes_change(&mut self, output: &str) -> bool {
+        let takes = self.open && self.output == output;
+        self.changes_left |= takes;
+        takes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +364,7 @@ pub struct ShojiWM {
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub data_control_state: DataControlState,
+    pub ext_data_control_state: ExtDataControlState,
     pub popups: PopupManager,
 
     pub seat: Seat<Self>,
@@ -354,6 +377,9 @@ pub struct ShojiWM {
     /// The GPU clients render with (the one the linux-dmabuf global advertises). Never closed.
     pub tty_render_node: Option<DrmNode>,
     pub window_decorations: HashMap<Window, WindowDecorationState>,
+    /// The sizes last told to each window's nodes that asked for theirs
+    /// (`DecorationInteractionHandlers::size_change`), by handler.
+    pub decoration_size_reports: HashMap<Window, HashMap<String, (i32, i32)>>,
     pub window_decoration_negotiations: crate::window_decoration::WindowDecorationNegotiationMap,
     pub window_primary_output_names: HashMap<Window, String>,
     pub windows_ready_for_decoration: HashSet<String>,
@@ -421,9 +447,10 @@ pub struct ShojiWM {
     pub damage_blink_capture_suppression: HashMap<String, u8>,
     pub runtime_poll_dirty: bool,
     pub runtime_dirty_window_ids: std::collections::HashSet<String>,
-    /// Windows marked dirty while a decoration refresh pass runs (by a host
-    /// message it drains, say): the pass must not clear them with the
-    /// windows it processed earlier, or their changes are never refreshed.
+    /// Windows marked dirty while a decoration refresh pass runs (a hover
+    /// handler, say): the pass must not clear them with the windows it
+    /// processed earlier, or their changes are never refreshed. Kept by the
+    /// outermost pass when one runs inside another.
     pub runtime_dirty_marked_during_refresh: Option<std::collections::HashSet<String>>,
     pub runtime_managed_only_window_ids: std::collections::HashSet<String>,
     pub runtime_node_only_window_ids: std::collections::HashSet<String>,
@@ -460,6 +487,11 @@ pub struct ShojiWM {
     pub pending_output_redraws: std::collections::HashSet<String>,
     /// A redraw of every output is pending (`schedule_redraw`).
     pub redraw_all_outputs: bool,
+    /// The frame the tty backend is rendering (`schedule_window_redraw`).
+    pub frame_in_preparation: Option<FramePreparation>,
+    /// The windows each output's last frame drew from its own stack, so a
+    /// window that leaves an output still redraws it once.
+    pub output_drawn_windows: HashMap<String, Vec<Window>>,
     /// Per-output frame pacing from the config (`COMPOSITOR.rendering.framePacing`).
     pub frame_pacing: crate::frame_pacing::FramePacingConfig,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
@@ -476,6 +508,13 @@ pub struct ShojiWM {
     pub output_icc: HashMap<String, std::sync::Arc<crate::color::icc::IccLut>>,
     /// What the log last said about each configured profile (by `IccLut::id`).
     pub output_icc_status: HashMap<String, (u64, crate::backend::tty::IccProfileStatus)>,
+    /// Night light's colour temperature in kelvin
+    /// (`COMPOSITOR.output.set_night_light`); `None` while it is off.
+    pub night_light: Option<f32>,
+    /// The LUTs night light runs, by the profile they are composed with (by
+    /// `IccLut::id`; `None` for outputs without one, which share theirs),
+    /// with the temperature each was built for.
+    pub night_light_luts: HashMap<Option<u64>, (f32, std::sync::Arc<crate::color::icc::IccLut>)>,
     pub managed_window_animations: HashMap<String, BTreeMap<String, ActiveManagedWindowAnimation>>,
     pub managed_window_animation_sequence: u64,
     pub runtime_output_configs: std::collections::BTreeMap<String, RuntimeOutputConfig>,
@@ -507,6 +546,9 @@ pub struct ShojiWM {
     pub runtime_window_resize_modifier: Option<RuntimePointerModifier>,
     pub runtime_input_config: RuntimeInputConfig,
     pub runtime_applied_xkb_config: Option<crate::runtime_input::RuntimeKeyboardInputConfig>,
+    /// A virtual keyboard's keymap is currently installed on the seat
+    /// instead of the configured one; the next physical key restores it.
+    pub virtual_keyboard_keymap_active: bool,
     pub runtime_active_keyboard_device: Option<RuntimeInputDeviceSnapshot>,
     pub runtime_input_devices: BTreeMap<String, RuntimeInputDeviceSnapshot>,
     pub runtime_libinput_devices: HashMap<String, input::Device>,
@@ -770,6 +812,20 @@ impl ShojiWM {
         let layer = surface
             .as_ref()
             .and_then(|(surface, _)| self.layer_surface_for_hit_surface(surface));
+        // Native drop controls receive data in the compositor. Do not offer
+        // it to their transparent anchor client (which has no data device).
+        if !self.session_lock_active
+            && self.dnd.active.is_some()
+            && layer.is_none()
+            && matches!(
+                self.decoration_under(pos),
+                Some((_, crate::ssd::DecorationHitTestResult::Action(
+                    crate::ssd::WindowAction::RuntimeHandler(id)
+                ))) if id.ends_with(crate::dnd::DROP_SUFFIX)
+            )
+        {
+            return PointerContents::default();
+        }
         PointerContents { surface, layer }
     }
 
@@ -1659,6 +1715,10 @@ impl ShojiWM {
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
         let data_control_state =
             DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        // Both protocol generations share Smithay's seat selection. Modern
+        // clipboard clients (including Dux) use ext_data_control exclusively.
+        let ext_data_control_state =
+            ExtDataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
 
         // A seat is a group of keyboards, pointer and touch devices.
         // A seat typically has a pointer and maintains a keyboard focus and a pointer focus.
@@ -1811,6 +1871,7 @@ impl ShojiWM {
             data_device_state,
             primary_selection_state,
             data_control_state,
+            ext_data_control_state,
             popups,
             seat,
 
@@ -1819,6 +1880,7 @@ impl ShojiWM {
             tty_device_paths: HashMap::new(),
             tty_render_node: None,
             window_decorations: HashMap::new(),
+            decoration_size_reports: HashMap::new(),
             window_decoration_negotiations: HashMap::new(),
             window_primary_output_names: HashMap::new(),
             windows_ready_for_decoration: HashSet::new(),
@@ -1869,6 +1931,8 @@ impl ShojiWM {
             runtime_schedule_last_timer_tick_ms: None,
             pending_output_redraws: Default::default(),
             redraw_all_outputs: false,
+            frame_in_preparation: None,
+            output_drawn_windows: HashMap::new(),
             frame_pacing: Default::default(),
             runtime_scheduler_kick_generation: 0,
             runtime_scheduler_kick_active: false,
@@ -1880,6 +1944,8 @@ impl ShojiWM {
             hdr_cursor_caches: Default::default(),
             output_icc: Default::default(),
             output_icc_status: Default::default(),
+            night_light: None,
+            night_light_luts: Default::default(),
             managed_window_animations: Default::default(),
             managed_window_animation_sequence: 0,
             runtime_output_configs: Default::default(),
@@ -1901,6 +1967,7 @@ impl ShojiWM {
             runtime_window_resize_modifier: None,
             runtime_input_config: Default::default(),
             runtime_applied_xkb_config: None,
+            virtual_keyboard_keymap_active: false,
             runtime_active_keyboard_device: None,
             runtime_input_devices: Default::default(),
             runtime_libinput_devices: Default::default(),
@@ -2833,9 +2900,97 @@ impl ShojiWM {
     }
 
     /// Render `output_name` on the next pass, without redrawing the others.
+    #[track_caller]
     pub fn schedule_output_redraw(&mut self, output_name: &str) {
+        if crate::frame_stats::debugging() {
+            crate::frame_stats::record_redraw_request(
+                std::panic::Location::caller(),
+                [output_name.to_owned()],
+            );
+        }
         self.pending_output_redraws.insert(output_name.to_owned());
         self.needs_redraw = true;
+    }
+
+    /// Render the outputs that draw `window`, now or in their last frame, after
+    /// a change of it, instead of every output: a wallpaper step on one output
+    /// used to render the others too, and the output whose frame was drawing
+    /// the step once more after it. Every output while that is not known.
+    #[track_caller]
+    pub fn schedule_window_redraw(&mut self, window: &Window) {
+        if !crate::perf_options::PerfOption::TargetedRedraw.enabled() {
+            return self.schedule_redraw();
+        }
+        match self.window_redraw_outputs(window) {
+            Some(outputs) => self.schedule_change_redraw(outputs),
+            None => self.schedule_redraw(),
+        }
+    }
+
+    /// Redraw `outputs` after a change, except the one whose frame is being
+    /// prepared: that frame draws the change (`FramePreparation`).
+    #[track_caller]
+    fn schedule_change_redraw(&mut self, outputs: Vec<String>) {
+        if !crate::perf_options::PerfOption::TargetedRedraw.enabled() {
+            return self.schedule_redraw();
+        }
+        for output in outputs {
+            if !self
+                .frame_in_preparation
+                .as_mut()
+                .is_some_and(|frame| frame.takes_change(&output))
+            {
+                self.schedule_output_redraw(&output);
+            }
+        }
+    }
+
+    /// The outputs that draw `window` now or drew it in their last frame: the
+    /// ones it overlaps, as the renderer picks them, and the ones whose
+    /// composition picks it by id. `None` for a window not evaluated yet (it
+    /// has no id) or drawn nowhere.
+    fn window_redraw_outputs(&self, window: &Window) -> Option<Vec<String>> {
+        let id = &self.window_decorations.get(window)?.snapshot.id;
+        let outputs = self
+            .space
+            .outputs()
+            .filter(|output| {
+                let name = output.name();
+                self.window_intersects_output(window, output)
+                    || self
+                        .output_drawn_windows
+                        .get(&name)
+                        .is_some_and(|windows| windows.contains(window))
+                    || self.composition_windows.get(&name).is_some_and(|ids| ids.contains(id))
+                    || self
+                        .output_compositions
+                        .get(&name)
+                        .is_some_and(|plan| plan.picks_window(id))
+            })
+            .map(Output::name)
+            .collect::<Vec<_>>();
+        (!outputs.is_empty()).then_some(outputs)
+    }
+
+    /// The outputs that draw the windows `ids` names (`window_redraw_outputs`);
+    /// `None` when one of them is not a known window (a closing one, say).
+    fn windows_redraw_outputs<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a String>,
+    ) -> Option<Vec<String>> {
+        let mut outputs = Vec::new();
+        for id in ids {
+            let window = self
+                .window_decorations
+                .iter()
+                .find_map(|(window, decoration)| (decoration.snapshot.id == *id).then_some(window))?;
+            for output in self.window_redraw_outputs(window)? {
+                if !outputs.contains(&output) {
+                    outputs.push(output);
+                }
+            }
+        }
+        (!outputs.is_empty()).then_some(outputs)
     }
 
     /// Whether rendered frames are currently ticking the runtime scheduler, in which case
@@ -2940,13 +3095,30 @@ impl ShojiWM {
                 // not force layer/popup effect evaluation every frame.
                 self.layer_effect_evaluation_cache.clear();
             }
+            // The outputs drawing the dirty windows; every output for anything else
+            // (layers, the runtime as a whole, a window it cannot place).
+            let redraw_outputs = (!tick.runtime_dirty
+                && tick.dirty_layer_ids.is_empty()
+                && tick.dirty_layer_node_ids.is_empty())
+            .then(|| {
+                self.windows_redraw_outputs(
+                    tick.dirty_window_ids
+                        .iter()
+                        .chain(&tick.dirty_managed_window_ids)
+                        .chain(tick.dirty_window_node_ids.keys()),
+                )
+            })
+            .flatten();
             self.mark_runtime_dirty_windows(
                 tick.dirty_window_ids,
                 tick.dirty_managed_window_ids,
                 &tick.dirty_window_node_ids,
             );
             self.request_tty_maintenance("runtime-scheduler-dirty");
-            self.schedule_redraw();
+            match redraw_outputs {
+                Some(outputs) => self.schedule_change_redraw(outputs),
+                None => self.schedule_redraw(),
+            }
         }
 
         self.drain_runtime_host_messages();
@@ -3115,6 +3287,13 @@ impl ShojiWM {
                 HostMessage::OutputPower(request) => {
                     self.apply_runtime_output_power_request(request);
                 }
+                HostMessage::NightLight(kelvin) => {
+                    if self.night_light != kelvin {
+                        self.night_light = kelvin;
+                        self.night_light_luts.clear();
+                        self.schedule_redraw();
+                    }
+                }
                 HostMessage::PointerHookResult(invocation) => {
                     let loop_handle = self.loop_handle.clone();
                     self.handle_runtime_pointer_move_async_invocation(invocation, &loop_handle);
@@ -3131,6 +3310,7 @@ impl ShojiWM {
                     self.apply_output_compositions(compositions);
                 }
                 HostMessage::InputGrab(update) => self.apply_runtime_input_grab_update(update),
+                HostMessage::SyntheticPointer(input) => self.synthetic_pointer(input),
                 HostMessage::CursorPosition(target) => self.set_cursor_position(target),
                 HostMessage::CursorOverride(kind) => {
                     if self.config_cursor_override != kind {
@@ -3140,6 +3320,10 @@ impl ShojiWM {
                 }
                 HostMessage::DragView(command) => self.apply_drag_view_command(command),
                 HostMessage::StartLocked => self.start_session_locked(),
+                HostMessage::StartCopyDrag { id, mime_type, data } => {
+                    self.start_copy_drag(id, mime_type, data)
+                }
+                HostMessage::CancelCopyDrag(id) => self.cancel_copy_drag(id),
                 HostMessage::BackgroundEffect(config) => {
                     if self.configured_background_effect != config {
                         self.configured_background_effect = config;
@@ -3838,6 +4022,7 @@ impl ShojiWM {
             self.hdr_pipelines.remove(&name);
             self.hdr_cursor_caches.remove(&name);
             self.runtime_animation_outputs.remove(&name);
+            self.output_drawn_windows.remove(&name);
             self.layer_effect_evaluation_cache.remove(&name);
             self.popup_effect_evaluation_cache.remove(&name);
             self.session_lock_surfaces.remove(&name);
@@ -5258,8 +5443,33 @@ impl ShojiWM {
         self.full_damage_pending_outputs.remove(output_name) || self.force_full_damage
     }
 
+    /// The LUT the encode pass runs on SDR output `name`: night light's,
+    /// composed with the output's ICC profile, while night light is on, else
+    /// the profile's. `None` when neither applies.
+    pub fn output_lut(&mut self, name: &str) -> Option<std::sync::Arc<crate::color::icc::IccLut>> {
+        let profile = self.output_icc.get(name).cloned();
+        let Some(kelvin) = self.night_light else {
+            return profile;
+        };
+        let profile_id = profile.as_ref().map(|profile| profile.id);
+        if let Some((built_for, lut)) = self.night_light_luts.get(&profile_id) {
+            if *built_for == kelvin {
+                return Some(lut.clone());
+            }
+        }
+        let lut = std::sync::Arc::new(crate::color::night_light::lut(kelvin, profile.as_deref()));
+        self.night_light_luts.insert(profile_id, (kelvin, lut.clone()));
+        Some(lut)
+    }
+
+    /// `SHOJI_REDRAW_STATS` / `SHOJI_REDRAW_REASON_DEBUG` name the caller, as
+    /// does frame debugging ([`crate::frame_stats::debugging`]).
+    #[track_caller]
     pub fn schedule_redraw(&mut self) {
         let caller = std::panic::Location::caller();
+        if crate::frame_stats::debugging() {
+            crate::frame_stats::record_redraw_request(caller, self.space.outputs().map(Output::name));
+        }
         if std::env::var_os("SHOJI_REDRAW_STATS")
             .is_some_and(|value| value != "0" && !value.is_empty())
         {
@@ -5992,6 +6202,29 @@ fn process_command_for_pid(pid: i32) -> Option<String> {
     fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
         .map(|value| value.trim().to_owned())
+}
+
+#[cfg(test)]
+mod frame_preparation_tests {
+    use super::FramePreparation;
+
+    #[test]
+    fn an_open_frame_takes_the_changes_it_draws() {
+        let mut frame = FramePreparation {
+            output: "DP-1".to_owned(),
+            open: true,
+            changes_left: false,
+        };
+        assert!(!frame.takes_change("DP-2"));
+        assert!(!frame.changes_left);
+        assert!(frame.takes_change("DP-1"));
+        assert!(frame.changes_left);
+        // Past the tick and the refreshes (the scene, the next frame's
+        // pretick) a change needs a frame again.
+        frame.open = false;
+        assert!(!frame.takes_change("DP-1"));
+        assert!(frame.changes_left);
+    }
 }
 
 #[cfg(test)]

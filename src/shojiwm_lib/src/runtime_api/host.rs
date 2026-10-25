@@ -32,6 +32,18 @@ use crate::{
     ssd::{DecorationPointerMoveAsyncInvocation, RuntimeEventConfigUpdate},
 };
 
+/// Pointer input a config synthesizes: motion to `(x, y)` (global logical
+/// px), then `button` (a Linux code, `BTN_LEFT` = 272) pressed or released.
+/// It takes the same path as a device's: decorations, clients and grabs see
+/// it as real input. For tests, mostly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SyntheticPointerInput {
+    pub x: f64,
+    pub y: f64,
+    pub button: Option<u32>,
+    pub pressed: bool,
+}
+
 /// A side effect requested by the config runtime.
 #[derive(Debug, Clone)]
 pub enum HostMessage {
@@ -50,6 +62,9 @@ pub enum HostMessage {
     Cursor(RuntimeCursorConfigUpdate),
     /// Switch outputs on or off (`COMPOSITOR.output.setPower`).
     OutputPower(RuntimeOutputPowerRequest),
+    /// Warm every output's white point to this colour temperature in kelvin,
+    /// or stop (`COMPOSITOR.output.set_night_light`).
+    NightLight(Option<f32>),
     /// Result of a posted (fire-and-forget) pointer or gesture hook.
     PointerHookResult(DecorationPointerMoveAsyncInvocation),
     /// A hot reload prepared in the background is done. `Ok` makes the
@@ -73,6 +88,8 @@ pub enum HostMessage {
     /// Start or end the config's input grab (`COMPOSITOR.input.grab`). While
     /// it is held, input arrives as `InputRequest::InputGrab`.
     InputGrab(crate::runtime_input_grab::RuntimeInputGrabUpdate),
+    /// Synthetic pointer input (`COMPOSITOR.input.synthesize_pointer`).
+    SyntheticPointer(SyntheticPointerInput),
     /// `COMPOSITOR.effect.background_effect` changed after it was first read
     /// (one of its signals moved). Replaces the effect; `None` turns it off.
     BackgroundEffect(Option<crate::ssd::BackgroundEffectConfig>),
@@ -86,6 +103,9 @@ pub enum HostMessage {
     /// [`RuntimeLauncher::start_locked`](super::RuntimeLauncher::start_locked).
     /// Honored only while the config first loads, before any client runs.
     StartLocked,
+    /// Start a copy-only data offer from a native control during a pointer drag.
+    StartCopyDrag { id: u64, mime_type: String, data: Vec<u8> },
+    CancelCopyDrag(u64),
 }
 
 /// When a runtime that keeps a clock per output (see `SchedulerTickRequest`)

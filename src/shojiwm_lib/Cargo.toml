@@ -7,6 +7,12 @@ edition = "2024"
 [dependencies]
 bitflags = "2.11.0"
 thiserror = "2.0.12"
+# bea4dev's Smithay (its shojiwm branch) plus upstream fixes it lacks, picked
+# without changes: damage with empty opaque rects and back to front,
+# xdg-output instances freed, modifiers sent after the key, enter and down
+# for new pointers and touches, negative region sizes, the layer and lock
+# surface hooks after their role is gone, the X11 event loop leak and frame
+# throttling. The shoji-island branch of harveywuk/smithay.
 smithay = {
     git = "https://github.com/sophietheopossum/smithay.git",
     rev = "36d6aecc3bda7f3bf41d1d446fe4e960b22dae5e",
@@ -20,10 +26,12 @@ smithay-drm-extras = {
 }
 # xwayland-satellite, run in-process on its own thread (see
 # `xwayland_satellite.rs`). Renamed so the crate does not clash with that module.
+# bea4dev's fork merged with upstream main, plus upstream PR #454: an X window
+# keeps a monitor it is still on when it leaves the one it was placed on.
 satellite = {
     package = "xwayland-satellite",
-    git = "https://github.com/bea4dev/xwayland-satellite.git",
-    rev = "d995e79977d63e30e556302a347c6df8b7fd0961"
+    git = "https://github.com/harveywuk/xwayland-satellite.git",
+    rev = "9d5b258f9eebc0a302acdc8c7b650e1a6a09bea2"
 }
 wayland-protocols = { version = "0.32.12", features = ["server", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["server"] }

@@ -1,4 +1,5 @@
 pub mod async_assets;
+pub mod blur;
 pub mod clipped_memory;
 pub mod clipped_surface;
 pub mod composition;
@@ -9,6 +10,7 @@ pub mod damage_blink;
 pub mod decoration;
 pub mod dnd;
 pub mod fps_counter;
+pub mod frame_gate;
 pub mod hdr_cursor;
 pub mod hdr_pipeline;
 pub mod icon;

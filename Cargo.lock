@@ -687,14 +687,13 @@ dependencies = [
 
 [[package]]
 name = "calloop"
-version = "0.14.4"
+version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dbf9978365bac10f54d1d4b04f7ce4427e51f71d61f2fe15e3fed5166474df7"
+checksum = "43b32313e937c8721c9d17ee9bf60699a6402b4b7c2cb6ac1bee0ffcaa4b4e5e"
 dependencies = [
  "bitflags 2.11.0",
  "polling",
  "rustix 1.1.4",
- "slab",
  "tracing",
 ]
 
@@ -716,7 +715,7 @@ version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "138efcf0940a02ebf0cc8d1eff41a1682a46b431630f4c52450d6265876021fa"
 dependencies = [
- "calloop 0.14.4",
+ "calloop 0.14.5",
  "rustix 1.1.4",
  "wayland-backend",
  "wayland-client",
@@ -3328,7 +3327,7 @@ checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 [[package]]
 name = "macros"
 version = "0.1.0"
-source = "git+https://github.com/bea4dev/xwayland-satellite.git?rev=d995e79977d63e30e556302a347c6df8b7fd0961#d995e79977d63e30e556302a347c6df8b7fd0961"
+source = "git+https://github.com/harveywuk/xwayland-satellite.git?rev=9d5b258f9eebc0a302acdc8c7b650e1a6a09bea2#9d5b258f9eebc0a302acdc8c7b650e1a6a09bea2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4820,7 +4819,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81f3fedd2777cde52c1be5e572efbec485eac7b801c47820eda388d4f13b9c4b"
 dependencies = [
- "calloop 0.14.4",
+ "calloop 0.14.5",
  "enumflags2",
  "log",
  "rustix 1.1.4",
@@ -5170,7 +5169,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.11.0",
  "bumpalo",
- "calloop 0.14.4",
+ "calloop 0.14.5",
  "cgmath",
  "cosmic-text 0.17.2",
  "hashbrown 0.15.5",
@@ -5333,7 +5332,7 @@ dependencies = [
  "appendlist",
  "ash",
  "bitflags 2.11.0",
- "calloop 0.14.4",
+ "calloop 0.14.5",
  "cc",
  "cursor-icon",
  "downcast-rs",
@@ -5411,7 +5410,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0512da38f5e2b31201a93524adb8d3136276fa4fe4aafab4e1f727a82b534cc0"
 dependencies = [
  "bitflags 2.11.0",
- "calloop 0.14.4",
+ "calloop 0.14.5",
  "calloop-wayland-source 0.4.1",
  "cursor-icon",
  "libc",
@@ -5438,7 +5437,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74dc9ee14b0fdcb535f9556141bacac070c994a977d2240ee455d7438a617f00"
 dependencies = [
  "bitflags 2.11.0",
- "calloop 0.14.4",
+ "calloop 0.14.5",
  "calloop-wayland-source 0.4.1",
  "cursor-icon",
  "log",
@@ -7702,15 +7701,6 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
 version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
@@ -8103,7 +8093,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b64ceed06de0c45886eef05102106abe1413e703384e337bc57c7e95b71f803"
 dependencies = [
  "bitflags 2.11.0",
- "calloop 0.14.4",
+ "calloop 0.14.5",
  "cursor-icon",
  "dpi",
  "foldhash 0.2.0",
@@ -8173,7 +8163,7 @@ checksum = "bb5746cd907e514b7895491a1c6f7d0cb70077f9e16928cd74ae6f987ffd96aa"
 dependencies = [
  "bitflags 2.11.0",
  "bytemuck",
- "calloop 0.14.4",
+ "calloop 0.14.5",
  "cursor-icon",
  "dpi",
  "libc",
@@ -8304,7 +8294,7 @@ dependencies = [
 [[package]]
 name = "wl_drm"
 version = "0.1.0"
-source = "git+https://github.com/bea4dev/xwayland-satellite.git?rev=d995e79977d63e30e556302a347c6df8b7fd0961#d995e79977d63e30e556302a347c6df8b7fd0961"
+source = "git+https://github.com/harveywuk/xwayland-satellite.git?rev=9d5b258f9eebc0a302acdc8c7b650e1a6a09bea2#9d5b258f9eebc0a302acdc8c7b650e1a6a09bea2"
 dependencies = [
  "wayland-client",
  "wayland-scanner",
@@ -8470,8 +8460,8 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xwayland-satellite"
-version = "0.8.2"
-source = "git+https://github.com/bea4dev/xwayland-satellite.git?rev=d995e79977d63e30e556302a347c6df8b7fd0961#d995e79977d63e30e556302a347c6df8b7fd0961"
+version = "0.8.3"
+source = "git+https://github.com/harveywuk/xwayland-satellite.git?rev=9d5b258f9eebc0a302acdc8c7b650e1a6a09bea2#9d5b258f9eebc0a302acdc8c7b650e1a6a09bea2"
 dependencies = [
  "ab_glyph",
  "anyhow",

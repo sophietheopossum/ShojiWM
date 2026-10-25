@@ -1,11 +1,15 @@
 use cgmath::{ElementWise, Matrix3, Vector2, Vector3};
 use smithay::{
+    backend::allocator::Fourcc,
     backend::renderer::{
+        Frame, ImportMem,
         element::{
             Element, Id, Kind, RenderElement, UnderlyingStorage,
-            surface::WaylandSurfaceRenderElement,
+            surface::{WaylandSurfaceRenderElement, WaylandSurfaceTexture},
         },
-        gles::{GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform, UniformName},
+        gles::{
+            GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName,
+        },
         utils::{CommitCounter, DamageSet, OpaqueRegions},
     },
     utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Transform},
@@ -108,6 +112,52 @@ fn union_physical_rect(
     )
 }
 
+/// Physical pixels kept clear of the clip's edges when claiming opaque area:
+/// the mask's antialiased half pixel, bilinear sampling and rounding.
+const OPAQUE_EDGE_MARGIN: i32 = 2;
+
+/// The part of `opaque` (element-local physical rects) the clip leaves whole:
+/// inside `slot`, and inside the rounded `mask` away from its corners, both in
+/// element-local logical units of `scale` physical pixels. The corners are
+/// left out at the largest `radius`, whichever corner it belongs to.
+fn clip_opaque_rects(
+    opaque: &[Rectangle<i32, Physical>],
+    slot: SnappedLogicalRect,
+    mask: SnappedLogicalRect,
+    radius: [f32; 4],
+    scale: f32,
+) -> Vec<Rectangle<i32, Physical>> {
+    // Inward to whole pixels, then the margin: a claimed pixel culls what is
+    // under it, so claiming one the surface does not fully cover would show
+    // whatever the buffer held there.
+    let inset = |left: f32, top: f32, right: f32, bottom: f32| {
+        let left = (left * scale).ceil() as i32 + OPAQUE_EDGE_MARGIN;
+        let top = (top * scale).ceil() as i32 + OPAQUE_EDGE_MARGIN;
+        let right = (right * scale).floor() as i32 - OPAQUE_EDGE_MARGIN;
+        let bottom = (bottom * scale).floor() as i32 - OPAQUE_EDGE_MARGIN;
+        (right > left && bottom > top).then(|| {
+            Rectangle::<i32, Physical>::new((left, top).into(), (right - left, bottom - top).into())
+        })
+    };
+    let Some(slot) = inset(slot.x, slot.y, slot.x + slot.width, slot.y + slot.height) else {
+        return Vec::new();
+    };
+    let radius = radius.into_iter().fold(0.0f32, f32::max);
+    let (left, top) = (mask.x, mask.y);
+    let (right, bottom) = (mask.x + mask.width, mask.y + mask.height);
+    // The rounded rectangle without its corners: a band across its whole
+    // width and one down its whole height.
+    let bands = [
+        inset(left, top + radius, right, bottom - radius),
+        inset(left + radius, top, right - radius, bottom),
+    ];
+    opaque
+        .iter()
+        .filter_map(|rect| rect.intersection(slot))
+        .flat_map(|rect| bands.iter().flatten().filter_map(move |band| rect.intersection(*band)))
+        .collect()
+}
+
 fn snapped_physical_rect_in_element_space(
     rect: Rectangle<i32, Physical>,
     element_geometry: Rectangle<i32, Physical>,
@@ -150,6 +200,8 @@ pub struct ClippedSurfaceElement {
     /// `src_transfer == 0.0` is the untagged fast path and makes the shader
     /// skip the conversion entirely, so nothing changes for sRGB clients.
     color: SurfaceColor,
+    /// A single-pixel buffer's colour as a texture (`solid_texture`).
+    solid: Option<GlesTexture>,
 }
 
 /// The shader's color-management uniforms for one surface.
@@ -163,6 +215,52 @@ struct SurfaceColor {
 
 #[derive(Debug)]
 struct ClippedSurfaceProgram(GlesTexProgram);
+
+/// 1x1 textures of single-pixel buffer colours, by premultiplied RGBA8.
+#[derive(Debug, Default)]
+struct SolidTextures(std::cell::RefCell<std::collections::HashMap<[u8; 4], GlesTexture>>);
+
+/// A single-pixel buffer's colour as a 1x1 texture. smithay draws such a
+/// buffer as a solid fill, which no texture program reaches: drawn as is, the
+/// clip (and the colour conversion) would not apply. GStreamer's waylandsink
+/// fills its window this way, so its video showed square corners.
+fn solid_texture(
+    renderer: &mut GlesRenderer,
+    inner: &WaylandSurfaceRenderElement<GlesRenderer>,
+) -> Result<Option<GlesTexture>, GlesError> {
+    let WaylandSurfaceTexture::SolidColor(color) = inner.texture() else {
+        return Ok(None);
+    };
+    // Premultiplied, like the buffer and like `draw_solid` takes it.
+    let rgba = color
+        .components()
+        .map(|component| (component.clamp(0.0, 1.0) * 255.0).round() as u8);
+    let cached = renderer
+        .egl_context()
+        .user_data()
+        .get_or_insert(SolidTextures::default)
+        .0
+        .borrow()
+        .get(&rgba)
+        .cloned();
+    if let Some(texture) = cached {
+        return Ok(Some(texture));
+    }
+    // Abgr8888 is R, G, B, A in memory.
+    let texture = renderer.import_memory(&rgba, Fourcc::Abgr8888, (1, 1).into(), false)?;
+    let textures = &renderer
+        .egl_context()
+        .user_data()
+        .get_or_insert(SolidTextures::default)
+        .0;
+    let mut textures = textures.borrow_mut();
+    // Clients use a handful of colours; never let it grow without bound.
+    if textures.len() >= 64 {
+        textures.clear();
+    }
+    textures.insert(rgba, texture.clone());
+    Ok(Some(texture))
+}
 
 /// The shader's color-management uniforms, in the order `color_uniforms`
 /// returns them.
@@ -434,6 +532,7 @@ impl ClippedSurfaceElement {
         image_description: Option<crate::color::ImageDescription>,
     ) -> Result<Self, GlesError> {
         let program = Self::program(renderer)?;
+        let solid = solid_texture(renderer, &inner)?;
 
         let element_geometry = inner.geometry(output_scale);
         // ContentClip callers pass forced_geometry when the compositor has an explicit
@@ -701,6 +800,7 @@ impl ClippedSurfaceElement {
                 0.0
             },
             color,
+            solid,
         })
     }
 
@@ -716,6 +816,7 @@ impl ClippedSurfaceElement {
         image_description: crate::color::ImageDescription,
     ) -> Result<Self, GlesError> {
         let program = Self::program(renderer)?;
+        let solid = solid_texture(renderer, &inner)?;
         let geometry = inner.geometry(output_scale);
         let output_scale = output_scale.x.abs().max(0.0001) as f32;
         let whole_element = SnappedLogicalRect {
@@ -743,6 +844,7 @@ impl ClippedSurfaceElement {
             sample_uv_snap_axes: [0.0; 2],
             sample_uv_compensation_enabled: 0.0,
             color,
+            solid,
         })
     }
 
@@ -967,8 +1069,43 @@ impl Element for ClippedSurfaceElement {
         damage
     }
 
-    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        OpaqueRegions::default()
+    /// The surface's own opaque region where the clip leaves it whole, so the
+    /// damage tracker skips what is under it: an opaque window had the whole
+    /// desktop drawn under it every frame (wallpaper layers, widgets, their
+    /// blurs). Only claimed while the quad is the surface itself, drawn as it
+    /// is; the shader maps the buffer differently otherwise.
+    /// `crate::perf_options::PerfOption::ClipOpaque` turns it off.
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        match &self.inner {
+            ClippedSurfaceInner::Mapped(inner) => {
+                if !crate::perf_options::PerfOption::ClipOpaque.enabled()
+                    || self.alpha() < 1.0
+                    || inner.transform() != Transform::Normal
+                    || (scale.x - f64::from(self.output_scale)).abs() > 1e-6
+                    || inner.geometry(scale) != self.geometry
+                {
+                    return OpaqueRegions::default();
+                }
+                let opaque = inner.opaque_regions(scale);
+                if opaque.is_empty() {
+                    return OpaqueRegions::default();
+                }
+                let slot = if self.rect_bounds_enabled > 0.5 {
+                    self.slot_rect
+                } else {
+                    self.mask_rect
+                };
+                clip_opaque_rects(
+                    &opaque,
+                    slot,
+                    self.mask_rect,
+                    self.corner_radius,
+                    self.output_scale,
+                )
+                .into_iter()
+                .collect()
+            }
+        }
     }
 
     fn alpha(&self) -> f32 {
@@ -1034,15 +1171,27 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceElement {
                     );
                 }
                 frame.override_default_tex_program(self.program.clone(), uniforms);
-                let result = RenderElement::<GlesRenderer>::draw(
-                    inner,
-                    frame,
-                    src,
-                    dst,
-                    damage,
-                    opaque_regions,
-                    cache,
-                );
+                let result = match &self.solid {
+                    Some(texture) => Frame::render_texture_from_to(
+                        frame,
+                        texture,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        inner.transform(),
+                        inner.alpha(),
+                    ),
+                    None => RenderElement::<GlesRenderer>::draw(
+                        inner,
+                        frame,
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    ),
+                };
                 frame.clear_tex_program_override();
                 if std::env::var_os("SHOJI_GAP_DEBUG")
                     .is_some_and(|value| value != "0" && !value.is_empty())
@@ -1067,7 +1216,7 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{color_uniforms, compute_sample_uv_compensation};
+    use super::{clip_opaque_rects, color_uniforms, compute_sample_uv_compensation};
     use cgmath::Vector2;
     use smithay::utils::{Logical, Physical, Point, Rectangle, Scale};
 
@@ -1257,5 +1406,43 @@ mod tests {
                 });
             assert_eq!(color_uniforms(Some(pq_bt2020)).src_to_compositing, expected);
         }
+    }
+
+    fn logical(x: f32, y: f32, width: f32, height: f32) -> crate::backend::visual::SnappedLogicalRect {
+        crate::backend::visual::SnappedLogicalRect { x, y, width, height }
+    }
+
+    fn physical(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Physical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    #[test]
+    fn an_opaque_surface_claims_its_clip_without_the_corners() {
+        let whole = logical(0.0, 0.0, 100.0, 50.0);
+        let rects = clip_opaque_rects(&[physical(0, 0, 100, 50)], whole, whole, [10.0; 4], 1.0);
+        assert_eq!(rects, vec![physical(2, 12, 96, 26), physical(12, 2, 76, 46)]);
+        let claimed = |x: i32, y: i32| rects.iter().any(|rect| rect.contains((x, y)));
+        // Corners and the antialiased edge stay drawn from below.
+        assert!(!claimed(3, 3) && !claimed(96, 46) && !claimed(1, 25) && !claimed(50, 49));
+        assert!(claimed(50, 25) && claimed(2, 25) && claimed(50, 2));
+    }
+
+    #[test]
+    fn the_claim_stays_inside_the_slot_the_surface_and_the_scale() {
+        let mask = logical(0.0, 0.0, 100.0, 50.0);
+        // A slot cropping the surface on the right.
+        let slot = logical(0.0, 0.0, 60.0, 50.0);
+        let rects = clip_opaque_rects(&[physical(0, 0, 100, 50)], slot, mask, [0.0; 4], 1.0);
+        assert!(rects.iter().all(|rect| rect.loc.x + rect.size.w <= 58));
+        // Only the surface's own opaque part.
+        let rects = clip_opaque_rects(&[physical(0, 0, 30, 50)], mask, mask, [0.0; 4], 1.0);
+        assert!(rects.iter().all(|rect| rect.loc.x + rect.size.w <= 30));
+        // At scale 2, logical units are two pixels.
+        let rects = clip_opaque_rects(&[physical(0, 0, 200, 100)], mask, mask, [10.0; 4], 2.0);
+        assert_eq!(rects[0], physical(2, 22, 196, 56));
+        // Nothing opaque, or a clip too small to keep anything whole.
+        assert!(clip_opaque_rects(&[], mask, mask, [10.0; 4], 1.0).is_empty());
+        let tiny = logical(0.0, 0.0, 3.0, 3.0);
+        assert!(clip_opaque_rects(&[physical(0, 0, 3, 3)], tiny, tiny, [0.0; 4], 1.0).is_empty());
     }
 }
