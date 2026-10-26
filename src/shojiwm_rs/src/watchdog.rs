@@ -34,7 +34,7 @@ use shojiwm_lib::{
     runtime_api::{
         ConfigRuntime, DecorationRequest as D, EffectRequest as E, InputRequest as I,
         ReloadPreparation, RuntimeError, RuntimeEvent as Ev, RuntimeReply, RuntimeRequest as R,
-        SchedulerTickRequest, WindowRequest as W, WorkspaceRequest,
+        WindowRequest as W, WorkspaceRequest,
     },
     ssd::WaylandWindowSnapshot,
 };
@@ -1325,7 +1325,7 @@ mod tests {
             ("evaluateCached", None)
         );
         assert_eq!(
-            named(R::SchedulerTick(SchedulerTickRequest {
+            named(R::SchedulerTick(shojiwm_lib::runtime_api::SchedulerTickRequest {
                 output: None,
                 frame_outputs: &[]
             })),
@@ -1494,7 +1494,7 @@ mod tests {
         runtime
             .request(
                 0.0,
-                R::SchedulerTick(SchedulerTickRequest {
+                R::SchedulerTick(shojiwm_lib::runtime_api::SchedulerTickRequest {
                     output: None,
                     frame_outputs: &[],
                 }),
