@@ -10,9 +10,10 @@ bitflags = "2.11.0"
 thiserror = "2.0.12"
 # The fork's rev is in the workspace's Cargo.toml, which turns its default
 # features off so that this list is the whole set: Smithay's usual default
-# feature set, but without its direct X11 backend. Xwayland support remains
-# enabled below, and X11 clients are handled through xwayland-satellite rather
-# than by running ShojiWM as a nested X11 client through Smithay's x11rb backend.
+# feature set, but without its direct X11 backend, emulated-input backend, or
+# Pixman software renderer. Xwayland support remains enabled below, and X11
+# clients are handled through xwayland-satellite rather than by running ShojiWM
+# as a nested X11 client through Smithay's x11rb backend.
 smithay = { workspace = true, features = [
     "backend_drm",
     "backend_gbm",
@@ -22,12 +23,10 @@ smithay = { workspace = true, features = [
     "backend_winit",
     "desktop",
     "renderer_gl",
-    "renderer_pixman",
     "renderer_multi",
     "xwayland",
     "wayland_frontend",
     "backend_vulkan",
-    "backend_libei",
     "use_system_lib",
 ] }
 smithay-drm-extras = { workspace = true }
