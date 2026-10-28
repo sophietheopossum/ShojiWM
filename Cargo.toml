@@ -11,7 +11,9 @@ members = [
 # The smithay fork, pinned once for every crate that uses it: bump the rev
 # here only, or two copies of smithay end up in one build.
 [workspace.dependencies]
-smithay = { git = "https://github.com/sophietheopossum/smithay.git", rev = "36d6aecc3bda7f3bf41d1d446fe4e960b22dae5e" }
+# Default features off: each crate names the ones it uses (shojiwm_lib leaves
+# out the X11 backend).
+smithay = { git = "https://github.com/sophietheopossum/smithay.git", rev = "36d6aecc3bda7f3bf41d1d446fe4e960b22dae5e", default-features = false }
 smithay-drm-extras = { git = "https://github.com/sophietheopossum/smithay.git", rev = "36d6aecc3bda7f3bf41d1d446fe4e960b22dae5e", default-features = false }
 
 [profile.release]
