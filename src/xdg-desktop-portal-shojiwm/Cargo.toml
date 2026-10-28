@@ -13,9 +13,22 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 zbus = { version = "5.15.0", default-features = false, features = ["tokio"] }
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "signal"] }
-serde = { version = "1.0.219", features = ["derive"] }
-futures-util = "0.3"
-iced = { version = "0.14", features = ["tokio", "image"] }
+# The picker is a small, mostly idle Wayland window with RGBA thumbnails that
+# are already in memory. Use iced's tiny-skia software renderer only: the
+# default renderer set also builds and initializes the full wgpu stack, while
+# `image-without-codecs` provides the image widget without file-format codecs.
+iced = {
+    version = "0.14",
+    default-features = false,
+    features = [
+        "tiny-skia",
+        "wayland",
+        "tokio",
+        "image-without-codecs",
+        "crisp",
+        "linux-theme-detection",
+    ],
+}
 tokio-stream = { version = "0.1", features = ["sync"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
