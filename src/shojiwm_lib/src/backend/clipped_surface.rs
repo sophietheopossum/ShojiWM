@@ -1,4 +1,4 @@
-use cgmath::{ElementWise, Matrix3, Vector2, Vector3};
+use glam::{Affine2, Mat3, Vec2, Vec3};
 use smithay::{
     backend::allocator::Fourcc,
     backend::renderer::{
@@ -34,18 +34,18 @@ struct SampleUvCompensation {
 }
 
 fn compute_sample_uv_compensation(
-    src_loc: Vector2<f32>,
-    src_size: Vector2<f32>,
-    buffer_size: Vector2<f32>,
-    sampled_pixels: Vector2<f32>,
-    projected_pixels: Vector2<f32>,
+    src_loc: Vec2,
+    src_size: Vec2,
+    buffer_size: Vec2,
+    sampled_pixels: Vec2,
+    projected_pixels: Vec2,
 ) -> SampleUvCompensation {
-    let safe_buffer = Vector2::new(buffer_size.x.max(1.0), buffer_size.y.max(1.0));
-    let uv_tl = src_loc.div_element_wise(safe_buffer);
-    let uv_br = (src_loc + src_size).div_element_wise(safe_buffer);
+    let safe_buffer = buffer_size.max(Vec2::ONE);
+    let uv_tl = src_loc / safe_buffer;
+    let uv_br = (src_loc + src_size) / safe_buffer;
     let uv_range = uv_br - uv_tl;
     let misalignment = sampled_pixels - projected_pixels;
-    let absolute_misalignment = Vector2::new(misalignment.x.abs(), misalignment.y.abs());
+    let absolute_misalignment = misalignment.abs();
     let compensation_min = 0.5;
     let compensation_max = 2.0;
     // Activate snap in both directions for small raster-grid rounding drift
@@ -65,7 +65,7 @@ fn compute_sample_uv_compensation(
     //     the extra source texel simply falls off the right edge — cleanly,
     //     without the middle-column drop that absolute misalignment caused
     //     and without the bilinear softness that skipping snap caused.
-    let signed_effective = Vector2::new(
+    let signed_effective = Vec2::new(
         if snap_x > 0.5 {
             projected_pixels.x - sampled_pixels.x
         } else {
@@ -77,12 +77,8 @@ fn compute_sample_uv_compensation(
             0.0
         },
     );
-    let safe_projected_pixels =
-        Vector2::new(projected_pixels.x.max(1.0), projected_pixels.y.max(1.0));
-    let adjusted_uv_br = uv_br
-        + signed_effective
-            .div_element_wise(safe_projected_pixels)
-            .mul_element_wise(uv_range);
+    let safe_projected_pixels = projected_pixels.max(Vec2::ONE);
+    let adjusted_uv_br = uv_br + (signed_effective / safe_projected_pixels) * uv_range;
     let enabled = snap_x > 0.5 || snap_y > 0.5;
 
     SampleUvCompensation {
@@ -674,19 +670,19 @@ impl ClippedSurfaceElement {
                 .into(),
         );
         let buffer_size = inner.buffer_size();
-        let buffer_size = Vector2::new(buffer_size.w as f32, buffer_size.h as f32);
+        let buffer_size = Vec2::new(buffer_size.w as f32, buffer_size.h as f32);
         let view = inner.view();
-        let src_loc = Vector2::new(view.src.loc.x as f32, view.src.loc.y as f32);
-        let src_size = Vector2::new(view.src.size.w as f32, view.src.size.h as f32);
+        let src_loc = Vec2::new(view.src.loc.x as f32, view.src.loc.y as f32);
+        let src_size = Vec2::new(view.src.size.w as f32, view.src.size.h as f32);
         let sampled_pixels = if src_size.x > 0.0 && src_size.y > 0.0 {
             src_size
         } else {
-            Vector2::new(
+            Vec2::new(
                 element_geometry.size.w as f32,
                 element_geometry.size.h as f32,
             )
         };
-        let view_dst_pixels = Vector2::new(
+        let view_dst_pixels = Vec2::new(
             view.dst.w.max(0) as f32 * output_scale_x,
             view.dst.h.max(0) as f32 * output_scale_y,
         );
@@ -696,7 +692,7 @@ impl ClippedSurfaceElement {
         // otherwise the texture is bilinearly stretched to fill the larger
         // quad and the surface appears blurry.
         let projected_pixels =
-            Vector2::new(render_geometry.size.w as f32, render_geometry.size.h as f32);
+            Vec2::new(render_geometry.size.w as f32, render_geometry.size.h as f32);
         let sample_uv_compensation = compute_sample_uv_compensation(
             src_loc,
             src_size,
@@ -857,22 +853,22 @@ impl ClippedSurfaceElement {
             match &self.inner {
                 ClippedSurfaceInner::Mapped(inner) => {
                     let element_geometry = self.geometry;
-                    let element_size = Vector2::new(
+                    let element_size = Vec2::new(
                         element_geometry.size.w as f32 / self.output_scale.max(0.0001),
                         element_geometry.size.h as f32 / self.output_scale.max(0.0001),
                     );
 
-                    let slot_origin = Vector2::new(self.slot_rect.x, self.slot_rect.y);
-                    let slot_size = Vector2::new(self.slot_rect.width, self.slot_rect.height);
-                    let mask_origin = Vector2::new(self.mask_rect.x, self.mask_rect.y);
-                    let mask_size = Vector2::new(self.mask_rect.width, self.mask_rect.height);
+                    let slot_origin = Vec2::new(self.slot_rect.x, self.slot_rect.y);
+                    let slot_size = Vec2::new(self.slot_rect.width, self.slot_rect.height);
+                    let mask_origin = Vec2::new(self.mask_rect.x, self.mask_rect.y);
+                    let mask_size = Vec2::new(self.mask_rect.width, self.mask_rect.height);
 
                     let buffer_size = inner.buffer_size();
-                    let buffer_size = Vector2::new(buffer_size.w as f32, buffer_size.h as f32);
+                    let buffer_size = Vec2::new(buffer_size.w as f32, buffer_size.h as f32);
 
                     let view = inner.view();
-                    let src_loc = Vector2::new(view.src.loc.x as f32, view.src.loc.y as f32);
-                    let src_size = Vector2::new(view.src.size.w as f32, view.src.size.h as f32);
+                    let src_loc = Vec2::new(view.src.loc.x as f32, view.src.loc.y as f32);
+                    let src_size = Vec2::new(view.src.size.w as f32, view.src.size.h as f32);
 
                     let transform = match inner.transform() {
                         Transform::_90 => Transform::_270,
@@ -880,25 +876,18 @@ impl ClippedSurfaceElement {
                         other => other,
                     };
 
-                    // smithay's Transform::matrix() returns a glam Affine2 since
-                    // the cgmath -> glam migration; expand it back into the 3x3
-                    // homogeneous cgmath matrix this clip pipeline works in.
-                    let tm = transform.matrix();
-                    let transform_matrix = Matrix3::from_translation(Vector2::new(0.5, 0.5))
-                        * Matrix3::from_cols(
-                            Vector3::new(tm.x_axis.x, tm.x_axis.y, 0.0),
-                            Vector3::new(tm.y_axis.x, tm.y_axis.y, 0.0),
-                            Vector3::new(tm.z_axis.x, tm.z_axis.y, 1.0),
-                        )
-                        * Matrix3::from_translation(Vector2::new(-0.5, -0.5));
+                    // Smithay's Transform::matrix() is a glam Affine2. Keep
+                    // the clip pipeline in Affine2, then expand it to the 3x3
+                    // homogeneous matrix expected by the shader uniform.
+                    let transform_matrix = Affine2::from_translation(Vec2::splat(0.5))
+                        * transform.matrix()
+                        * Affine2::from_translation(Vec2::splat(-0.5));
 
                     let input_to_local = transform_matrix
-                        * Matrix3::from_nonuniform_scale(element_size.x, element_size.y)
-                        * Matrix3::from_nonuniform_scale(
-                            buffer_size.x / src_size.x,
-                            buffer_size.y / src_size.y,
-                        )
-                        * Matrix3::from_translation(-src_loc.div_element_wise(buffer_size));
+                        * Affine2::from_scale(element_size)
+                        * Affine2::from_scale(buffer_size / src_size)
+                        * Affine2::from_translation(-src_loc / buffer_size);
+                    let input_to_local_cols = input_to_local.to_cols_array();
 
                     (
                         slot_origin,
@@ -907,15 +896,15 @@ impl ClippedSurfaceElement {
                         mask_size,
                         self.corner_radius,
                         [
-                            input_to_local.x.x,
-                            input_to_local.x.y,
-                            input_to_local.x.z,
-                            input_to_local.y.x,
-                            input_to_local.y.y,
-                            input_to_local.y.z,
-                            input_to_local.z.x,
-                            input_to_local.z.y,
-                            input_to_local.z.z,
+                            input_to_local_cols[0],
+                            input_to_local_cols[1],
+                            0.0,
+                            input_to_local_cols[2],
+                            input_to_local_cols[3],
+                            0.0,
+                            input_to_local_cols[4],
+                            input_to_local_cols[5],
+                            1.0,
                         ],
                     )
                 }
@@ -923,23 +912,7 @@ impl ClippedSurfaceElement {
 
         if clipped_uniforms_debug_enabled() {
             let map_uv = |u: f32, v: f32| {
-                let mapped = Matrix3::from_cols(
-                    Vector3::new(
-                        input_to_local_array[0],
-                        input_to_local_array[1],
-                        input_to_local_array[2],
-                    ),
-                    Vector3::new(
-                        input_to_local_array[3],
-                        input_to_local_array[4],
-                        input_to_local_array[5],
-                    ),
-                    Vector3::new(
-                        input_to_local_array[6],
-                        input_to_local_array[7],
-                        input_to_local_array[8],
-                    ),
-                ) * Vector3::new(u, v, 1.0);
+                let mapped = Mat3::from_cols_array(&input_to_local_array) * Vec3::new(u, v, 1.0);
 
                 [mapped.x, mapped.y]
             };
@@ -1217,7 +1190,7 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceElement {
 #[cfg(test)]
 mod tests {
     use super::{clip_opaque_rects, color_uniforms, compute_sample_uv_compensation};
-    use cgmath::Vector2;
+    use glam::Vec2;
     use smithay::utils::{Logical, Physical, Point, Rectangle, Scale};
 
     use crate::backend::visual::{
@@ -1228,11 +1201,11 @@ mod tests {
     #[test]
     fn leaves_matching_projection_unchanged() {
         let compensation = compute_sample_uv_compensation(
-            Vector2::new(0.0, 0.0),
-            Vector2::new(2646.0, 1586.0),
-            Vector2::new(2646.0, 1586.0),
-            Vector2::new(2646.0, 1586.0),
-            Vector2::new(2646.0, 1586.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(2646.0, 1586.0),
+            Vec2::new(2646.0, 1586.0),
+            Vec2::new(2646.0, 1586.0),
+            Vec2::new(2646.0, 1586.0),
         );
 
         assert!(!compensation.enabled);
@@ -1242,11 +1215,11 @@ mod tests {
     #[test]
     fn expands_sampling_when_projection_is_one_pixel_wider() {
         let compensation = compute_sample_uv_compensation(
-            Vector2::new(0.0, 0.0),
-            Vector2::new(2646.0, 1586.0),
-            Vector2::new(2646.0, 1586.0),
-            Vector2::new(2646.0, 1586.0),
-            Vector2::new(2647.0, 1586.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(2646.0, 1586.0),
+            Vec2::new(2646.0, 1586.0),
+            Vec2::new(2646.0, 1586.0),
+            Vec2::new(2647.0, 1586.0),
         );
 
         assert!(compensation.enabled);
@@ -1262,11 +1235,11 @@ mod tests {
         // the right edge). Expanding instead would make nearest-neighbor drop
         // a row in the middle — the kitty resize artifact.
         let compensation = compute_sample_uv_compensation(
-            Vector2::new(0.0, 0.0),
-            Vector2::new(1230.0, 796.0),
-            Vector2::new(1230.0, 796.0),
-            Vector2::new(1230.0, 796.0),
-            Vector2::new(1230.0, 795.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1230.0, 796.0),
+            Vec2::new(1230.0, 796.0),
+            Vec2::new(1230.0, 796.0),
+            Vec2::new(1230.0, 795.0),
         );
 
         assert!(compensation.enabled);
@@ -1281,11 +1254,11 @@ mod tests {
         // projected_y < sampled_y by 0.7441: snap activates, adjusted_uv_br[1]
         // shrinks so nearest-neighbor maps 1:1 instead of dropping a row.
         let compensation = compute_sample_uv_compensation(
-            Vector2::new(0.0, 0.0),
-            Vector2::new(1890.0, 1063.0),
-            Vector2::new(1890.0, 1063.0),
-            Vector2::new(1890.0, 1063.0),
-            Vector2::new(1890.2539, 1062.2559),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1890.0, 1063.0),
+            Vec2::new(1890.0, 1063.0),
+            Vec2::new(1890.0, 1063.0),
+            Vec2::new(1890.2539, 1062.2559),
         );
 
         assert!(compensation.enabled);
@@ -1297,11 +1270,11 @@ mod tests {
     #[test]
     fn compensates_when_source_texels_are_one_pixel_shorter_on_both_axes() {
         let compensation = compute_sample_uv_compensation(
-            Vector2::new(0.0, 0.0),
-            Vector2::new(1919.0, 1199.0),
-            Vector2::new(1919.0, 1199.0),
-            Vector2::new(1919.0, 1199.0),
-            Vector2::new(1920.0, 1200.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1919.0, 1199.0),
+            Vec2::new(1919.0, 1199.0),
+            Vec2::new(1919.0, 1199.0),
+            Vec2::new(1920.0, 1200.0),
         );
 
         assert!(compensation.enabled);
@@ -1313,11 +1286,11 @@ mod tests {
     #[test]
     fn leaves_intentional_large_scaling_mismatch_unchanged() {
         let compensation = compute_sample_uv_compensation(
-            Vector2::new(0.0, 0.0),
-            Vector2::new(640.0, 480.0),
-            Vector2::new(640.0, 480.0),
-            Vector2::new(640.0, 480.0),
-            Vector2::new(800.0, 600.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(640.0, 480.0),
+            Vec2::new(640.0, 480.0),
+            Vec2::new(640.0, 480.0),
+            Vec2::new(800.0, 600.0),
         );
 
         assert!(!compensation.enabled);
