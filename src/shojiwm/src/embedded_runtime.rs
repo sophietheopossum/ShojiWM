@@ -1294,15 +1294,18 @@ impl ShojiRuntimeBridge {
 
     #[async_method]
     async fn wait_overlay(&self, id: u32) -> Result<(), std::io::Error> {
-        shojiwm_lib::backend::overlay::get(&self.overlay_owner, id)?
-            .wait(false)
+        let control = shojiwm_lib::backend::overlay::get(&self.overlay_owner, id)?;
+        tokio::task::spawn_blocking(move || control.wait(false))
             .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
     }
 
     #[async_method]
     async fn wait_overlay_closed(&self, id: u32) -> Result<(), std::io::Error> {
         if let Ok(control) = shojiwm_lib::backend::overlay::get(&self.overlay_owner, id) {
-            control.wait(true).await?;
+            tokio::task::spawn_blocking(move || control.wait(true))
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))??;
         }
         Ok(())
     }
