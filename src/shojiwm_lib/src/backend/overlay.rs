@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     io,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
@@ -20,8 +20,6 @@ use smithay::{
     output::Output,
     utils::{Logical, Physical, Point, Rectangle, Scale, Transform},
 };
-use tokio::sync::Notify;
-
 use super::{
     shader_effect::{EffectInstancePipelineCache, apply_overlay_effect},
     snapshot,
@@ -54,7 +52,7 @@ pub struct Control {
     persistent: bool,
     snapshot: bool,
     state: Mutex<ControlState>,
-    changed: Notify,
+    changed: Condvar,
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -155,7 +153,7 @@ pub fn create(
                 closed: None,
                 deadline: Some(Instant::now() + Duration::from_secs_f64(duration / 1000.0)),
             }),
-            changed: Notify::new(),
+            changed: Condvar::new(),
         }),
     );
     drop(registry);
@@ -178,7 +176,7 @@ impl Control {
         let mut state = self.state.lock().unwrap();
         if state.closed.is_none() {
             state.closed = Some(reason.to_owned());
-            self.changed.notify_waiters();
+            self.changed.notify_all();
             DIRTY.store(true, Ordering::Release);
             // A runtime that polls (`is_closed`) instead of awaiting learns it next tick.
             self.host.wake();
@@ -196,7 +194,7 @@ impl Control {
                 .is_some_and(|deadline| Instant::now() >= deadline)
         {
             state.closed = Some("Output overlay timed out".into());
-            self.changed.notify_waiters();
+            self.changed.notify_all();
             DIRTY.store(true, Ordering::Release);
             self.host.wake();
         }
@@ -209,17 +207,17 @@ impl Control {
         if self.persistent {
             state.deadline = None;
         }
-        self.changed.notify_waiters();
+        self.changed.notify_all();
         drop(state);
         self.host.wake();
     }
 
-    /// The first frame with the overlay has been rendered (what `wait(false)` awaits).
+    /// The first frame with the overlay has been rendered (what `wait(false)` waits for).
     pub fn is_ready(&self) -> bool {
         self.state.lock().unwrap().ready
     }
 
-    /// Disposed, replaced, timed out or its runtime stopped (what `wait(true)` awaits).
+    /// Disposed, replaced, timed out or its runtime stopped (what `wait(true)` waits for).
     pub fn is_closed(&self) -> bool {
         self.alive();
         self.state.lock().unwrap().closed.is_some()
@@ -251,35 +249,35 @@ impl Control {
         wake();
     }
 
-    pub async fn wait(&self, closed: bool) -> io::Result<()> {
+    pub fn wait(&self, closed: bool) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
         loop {
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let deadline = {
-                let state = self.state.lock().unwrap();
-                if let Some(reason) = &state.closed {
-                    return if closed {
-                        Ok(())
-                    } else {
-                        Err(io::Error::other(reason.clone()))
-                    };
-                }
-                if !closed && state.ready {
-                    return Ok(());
-                }
-                state.deadline
-            };
-            if let Some(deadline) = deadline {
-                if tokio::time::timeout_at(deadline.into(), notified)
-                    .await
-                    .is_err()
-                {
+            if let Some(reason) = &state.closed {
+                return if closed {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(reason.clone()))
+                };
+            }
+            if !closed && state.ready {
+                return Ok(());
+            }
+            if let Some(deadline) = state.deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    drop(state);
                     self.alive();
                     wake();
+                    state = self.state.lock().unwrap();
+                    continue;
                 }
+                let (guard, _) = self
+                    .changed
+                    .wait_timeout(state, deadline.saturating_duration_since(now))
+                    .unwrap();
+                state = guard;
             } else {
-                notified.await;
+                state = self.changed.wait(state).unwrap();
             }
         }
     }
@@ -900,8 +898,22 @@ mod tests {
         overlays.tick(&[output], false);
         assert!(overlays.slots.is_empty());
     }
-    #[tokio::test]
-    async fn deadline_rejects_without_a_compositor_tick() {
+
+    fn wait_within(
+        control: &Arc<Control>,
+        closed: bool,
+        timeout: Duration,
+    ) -> Option<io::Result<()>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let control = control.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(control.wait(closed));
+        });
+        rx.recv_timeout(timeout).ok()
+    }
+
+    #[test]
+    fn deadline_rejects_without_a_compositor_tick() {
         let owner = Arc::new(AtomicBool::new(true));
         let effect = CompiledEffect {
             input: EffectInput::Named(SNAPSHOT_NAME.into()),
@@ -922,17 +934,16 @@ mod tests {
             )
             .unwrap();
             let control = get(&owner, id).unwrap();
-            let result = tokio::time::timeout(Duration::from_secs(1), control.wait(false))
-                .await
-                .unwrap();
+            let result = wait_within(&control, false, Duration::from_secs(1))
+                .expect("overlay deadline must reject without a compositor tick");
             assert!(result.unwrap_err().to_string().contains("timed out"));
-            control.wait(true).await.unwrap();
+            control.wait(true).unwrap();
             controls().lock().unwrap().remove(&id);
         }
     }
 
-    #[tokio::test]
-    async fn ready_overlay_lifetimes_and_cleanup() {
+    #[test]
+    fn ready_overlay_lifetimes_and_cleanup() {
         let owner = Arc::new(AtomicBool::new(true));
         let id = create(
             &owner,
@@ -946,15 +957,11 @@ mod tests {
         .unwrap();
         let control = get(&owner, id).unwrap();
         control.mark_ready();
-        control.wait(false).await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(75), control.wait(true))
-                .await
-                .is_err()
-        );
+        control.wait(false).unwrap();
+        assert!(wait_within(&control, true, Duration::from_millis(75)).is_none());
         assert!(control.alive());
         control.dispose();
-        control.wait(true).await.unwrap();
+        control.wait(true).unwrap();
         assert!(!control.alive());
         controls().lock().unwrap().remove(&id);
 
@@ -970,8 +977,7 @@ mod tests {
         .unwrap();
         let control = get(&owner, id).unwrap();
         control.mark_ready();
-        tokio::time::timeout(Duration::from_secs(1), control.wait(true))
-            .await
+        wait_within(&control, true, Duration::from_secs(1))
             .expect("a ready temporary overlay must still expire")
             .unwrap();
         assert!(!control.alive());
@@ -990,13 +996,13 @@ mod tests {
         let control = get(&owner, id).unwrap();
         control.mark_ready();
         close_owner(&owner); // runtime teardown/reload uses this path
-        control.wait(true).await.unwrap();
+        control.wait(true).unwrap();
         assert!(!control.alive());
         controls().lock().unwrap().remove(&id);
     }
 
-    #[tokio::test]
-    async fn runtime_teardown_rejects_capture_and_wakes_closed_waiters() {
+    #[test]
+    fn runtime_teardown_rejects_capture_and_wakes_closed_waiters() {
         let owner = Arc::new(AtomicBool::new(true));
         let effect = CompiledEffect {
             input: EffectInput::Named(SNAPSHOT_NAME.into()),
@@ -1017,19 +1023,30 @@ mod tests {
         .unwrap();
         let control = get(&owner, id).unwrap();
         assert!(get(&Arc::new(AtomicBool::new(true)), id).is_err());
-        let captured = control.wait(false);
-        let closed = control.wait(true);
-        let cancel = async {
-            tokio::task::yield_now().await;
-            close_owner(&owner);
-        };
-        let (captured, closed, ()) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(captured, closed, cancel)
-        })
-        .await
-        .expect("runtime shutdown must wake pending native promises");
-        assert!(captured.is_err());
-        assert!(closed.is_ok());
+        let (tx, rx) = std::sync::mpsc::channel();
+        for closed in [false, true] {
+            let control = control.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((closed, control.wait(closed)));
+            });
+        }
+        drop(tx);
+        close_owner(&owner);
+        let mut captured = None;
+        let mut closed = None;
+        for _ in 0..2 {
+            let (is_closed, result) = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("runtime shutdown must wake pending overlay waiters");
+            if is_closed {
+                closed = Some(result);
+            } else {
+                captured = Some(result);
+            }
+        }
+        assert!(captured.expect("ready waiter result").is_err());
+        assert!(closed.expect("closed waiter result").is_ok());
         controls().lock().unwrap().remove(&id);
     }
 }
