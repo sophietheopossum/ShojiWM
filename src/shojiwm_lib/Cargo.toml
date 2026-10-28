@@ -18,9 +18,10 @@ smithay = {
     rev = "36d6aecc3bda7f3bf41d1d446fe4e960b22dae5e",
     default-features = false,
     # Smithay's usual default feature set, but without its direct X11
-    # backend: Xwayland support remains enabled below, and X11 clients are
-    # handled through xwayland-satellite rather than by running ShojiWM as a
-    # nested X11 client through Smithay's x11rb backend.
+    # backend, emulated-input backend, or Pixman software renderer:
+    # Xwayland support remains enabled below, and X11 clients are handled
+    # through xwayland-satellite rather than by running ShojiWM as a nested
+    # X11 client through Smithay's x11rb backend.
     features = [
         "backend_drm",
         "backend_gbm",
@@ -30,12 +31,10 @@ smithay = {
         "backend_winit",
         "desktop",
         "renderer_gl",
-        "renderer_pixman",
         "renderer_multi",
         "xwayland",
         "wayland_frontend",
         "backend_vulkan",
-        "backend_libei",
         "use_system_lib",
     ]
 }
