@@ -7869,11 +7869,10 @@ dependencies = [
  "atomic-waker",
  "bitflags 2.11.0",
  "block2 0.5.1",
- "bytemuck",
  "calloop 0.13.0",
  "cfg_aliases",
  "concurrent-queue",
- "core-foundation 0.9.4",
+ "core-foundation",
  "core-graphics",
  "cursor-icon",
  "dpi",
@@ -7886,7 +7885,6 @@ dependencies = [
  "objc2-foundation 0.2.2",
  "objc2-ui-kit 0.2.2",
  "orbclient 0.3.51",
- "percent-encoding",
  "pin-project",
  "raw-window-handle",
  "redox_syscall 0.4.1",
@@ -7905,8 +7903,6 @@ dependencies = [
  "web-sys",
  "web-time",
  "windows-sys 0.52.0",
- "x11-dl",
- "x11rb",
  "xkbcommon-dl",
 ]
 
@@ -8361,13 +8357,11 @@ name = "xdg-desktop-portal-shojiwm"
 version = "0.1.0"
 dependencies = [
  "drm-fourcc",
- "futures-util",
  "gbm",
  "iced",
  "libspa",
  "pipewire",
  "rustix 1.1.4",
- "serde",
  "tokio",
  "tokio-stream",
  "toml 0.8.23",
