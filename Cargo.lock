@@ -5186,7 +5186,6 @@ dependencies = [
  "smithay-drm-extras",
  "thiserror 2.0.18",
  "timescope",
- "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
