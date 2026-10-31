@@ -15,11 +15,10 @@
 //! runs while no window moves: the effect is only assigned while a drag
 //! (and the settle after it) is live, and the poll cancels itself at rest.
 //!
-//! Two of dcrey7's helpers are not ported: his automatic quality gate
-//! (this machine is known, and the config has no quality levels) and his
-//! animation-activity signal that pauses his glass blur while animations
-//! run. If the wobble ever drops frames against the liquid glass, that
-//! second one is the knob to add.
+//! One of dcrey7's helpers is not ported: his automatic quality gate
+//! (this machine is known, and the config has no quality levels). His
+//! animation-activity signal is: while a wobble runs it pauses the liquid
+//! glass, whose blur would otherwise be redone on every wobble frame.
 
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
@@ -27,6 +26,8 @@ use shojiwm_rs::{
     prelude::*,
     ssd::{WindowMovePhaseSnapshot, WindowPositionSnapshot},
 };
+
+use super::animation_activity::AnimationActivity;
 
 const GRID: usize = 4;
 const COUNT: usize = GRID * GRID;
@@ -385,7 +386,7 @@ impl Inner {
     }
 }
 
-fn start_poll(wobble: &Rc<Wobble>) {
+fn start_poll(wobble: &Rc<Wobble>, activity: AnimationActivity) {
     let window = {
         let mut inner = wobble.inner.borrow_mut();
         if inner.poll.is_some() {
@@ -394,6 +395,7 @@ fn start_poll(wobble: &Rc<Wobble>) {
         inner.last_ms = None;
         inner.window
     };
+    let window_id = window.id();
     let poll_wobble = wobble.clone();
     let poll = window.create_poll(1.0, move |handle| {
         let running = {
@@ -411,6 +413,7 @@ fn start_poll(wobble: &Rc<Wobble>) {
                 inner.started = false;
             }
             poll_wobble.active.set(false);
+            activity.set_running("wobbly", &window_id, false);
             handle.cancel();
         }
     });
@@ -419,7 +422,7 @@ fn start_poll(wobble: &Rc<Wobble>) {
 
 /// Wobbly windows: register the window effect and feed it every
 /// interactive window move (KWin: start/step/finish UserMovedResized).
-pub fn configure_wobbly() {
+pub fn configure_wobbly(activity: &AnimationActivity) {
     let wobbles: Wobbles = Rc::default();
 
     {
@@ -439,6 +442,7 @@ pub fn configure_wobbly() {
 
     {
         let wobbles = wobbles.clone();
+        let activity = activity.clone();
         COMPOSITOR.event.on_window_move(move |window, event| {
             let wobble = wobble_for(&wobbles, window);
             let dragging = {
@@ -469,19 +473,22 @@ pub fn configure_wobbly() {
             };
             if dragging {
                 wobble.active.set(true);
-                start_poll(&wobble);
+                activity.set_running("wobbly", &window.id(), true);
+                start_poll(&wobble, activity.clone());
             }
         });
     }
 
     {
         let wobbles = wobbles.clone();
+        let activity = activity.clone();
         COMPOSITOR.event.on_close(move |window| {
             if let Some(wobble) = wobbles.borrow_mut().remove(&window)
                 && let Some(poll) = wobble.inner.borrow_mut().poll.take()
             {
                 poll.cancel();
             }
+            activity.set_running("wobbly", &window.id(), false);
         });
     }
 }

@@ -32,7 +32,10 @@ use shojiwm_rs::prelude::*;
 use crate::{
     drag_and_drop::install_drag_and_drop,
     flip_3d::create_flip_3d,
-    minka::{decoration, displays, events, input, keybinds, rendering, session, settings, wobbly, workspace_ipc},
+    minka::{
+        animation_activity::AnimationActivity, decoration, displays, events, input, keybinds,
+        rendering, session, settings, wobbly, workspace_ipc,
+    },
     window_grid::create_window_grid,
     window_manager::WindowManager,
     window_switcher::WindowSwitcher,
@@ -108,15 +111,23 @@ fn setup() {
         });
     }
 
+    // Shared with rendering, decoration and the animations themselves, so
+    // the glass can pause while an animation runs.
+    let animation = AnimationActivity::new();
+
     displays::configure_displays();
     input::configure_input(&wm);
-    rendering::configure_rendering(&switcher);
-    wobbly::configure_wobbly();
+    rendering::configure_rendering(&switcher, &animation);
+    wobbly::configure_wobbly(&animation);
 
     let pointer = events::wire_window_events(&wm, &ipc);
-    COMPOSITOR
-        .window
-        .composition(decoration::create_window_composition(wm, ipc, pointer, switcher));
+    COMPOSITOR.window.composition(decoration::create_window_composition(
+        wm,
+        ipc,
+        pointer,
+        switcher,
+        animation,
+    ));
 }
 
 #[cfg(test)]

@@ -7,7 +7,10 @@ use shojiwm_rs::{
     ssd::{WindowDecorationModeSnapshot, WindowDecorationStateSnapshot},
 };
 
-use super::{events::PointerTracking, rendering::backdrop_fade, workspace_ipc::WorkspaceIpc};
+use super::{
+    animation_activity::AnimationActivity, events::PointerTracking, rendering::backdrop_fade,
+    workspace_ipc::WorkspaceIpc,
+};
 use crate::window_switcher::WindowSwitcher;
 use crate::window_manager::{
     EDGE_DRAG_HALO_PX, WINDOW_BORDER_PX, WINDOW_STATE_FULLSCREEN, WINDOW_STATE_MAXIMIZED,
@@ -124,6 +127,7 @@ pub fn create_window_composition(
     ipc: WorkspaceIpc,
     pointer: PointerTracking,
     switcher: WindowSwitcher,
+    animation: AnimationActivity,
 ) -> impl Fn(Window) -> ManagedWindow + 'static {
     move |window| {
         // Read in the body on purpose: these switch the whole structure, so a
@@ -221,9 +225,11 @@ pub fn create_window_composition(
             }
         });
         // No backdrop effects while the window switcher shows the windows as
-        // textures: there is nothing under a window there to blur. Read here
-        // on purpose: it switches the structure.
-        let blur_suspended = switcher.blur_suspended().get();
+        // textures (nothing under a window there to blur), or while a window
+        // animation runs (the blur would be redone on every frame and drops
+        // frames against a busy GPU). Read here on purpose: it switches the
+        // structure.
+        let blur_suspended = switcher.blur_suspended().get() || animation.running().get();
         let inner = || {
             if terminal && !blur_suspended {
                 ShaderEffect::new(liquid_glass(&switcher))

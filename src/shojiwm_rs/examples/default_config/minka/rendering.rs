@@ -6,6 +6,7 @@ use shojiwm_rs::{
     ssd::{OpaqueRegionPolicy, PopupParentKindSnapshot, SurfacePolicy},
 };
 
+use super::animation_activity::AnimationActivity;
 use crate::{
     island_glass::island_glass,
     window_manager::{WINDOW_STATE_MINIMIZE_VISUAL_IDLE, WINDOW_STATE_MINIMIZED},
@@ -74,19 +75,21 @@ fn wants_layer_blur(layer: &shojiwm_rs::ssd::WaylandLayerSnapshot) -> bool {
     !covers_output || namespace == Some("minka-fx")
 }
 
-pub fn configure_rendering(switcher: &WindowSwitcher) {
+pub fn configure_rendering(switcher: &WindowSwitcher, animation: &AnimationActivity) {
     // Triple buffering: render the next frame while the previous one waits
     // for its vblank.
     COMPOSITOR.rendering.frame_pacing(FramePacing::Throughput);
 
     // Blur behind the regions clients ask for (ext-background-effect). Off
-    // while the window switcher is shown, then faded back in like the window
-    // backdrops.
+    // while the window switcher is shown or a window animation runs (the
+    // blur would be redone on every animation frame), then faded back in
+    // like the window backdrops.
     let background_blur = backdrop_blur(switcher);
     let blur_suspended = switcher.blur_suspended();
-    COMPOSITOR
-        .effect
-        .background_with(move || (!blur_suspended.get()).then(|| background_blur.clone()));
+    let animation_running = animation.running();
+    COMPOSITOR.effect.background_with(move || {
+        (!blur_suspended.get() && !animation_running.get()).then(|| background_blur.clone())
+    });
 
     let layer_blur_mask = SurfaceEffect::new(masked_blur(layer_source(), 24));
     let island = island_glass();
