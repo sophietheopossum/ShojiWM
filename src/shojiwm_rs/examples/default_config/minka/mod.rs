@@ -12,7 +12,9 @@
 //! - `events`: compositor events to the window manager; `dock`: proximity
 //! - `decoration`: window chrome and drag tabs
 //! - `wobbly`: wobbly windows while dragging (KWin via dcrey7's port)
+//! - `animation_activity`: running window animations (pauses the glass)
 
+pub mod animation_activity;
 pub mod decoration;
 pub mod displays;
 pub mod dock;
