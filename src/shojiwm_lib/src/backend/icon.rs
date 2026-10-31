@@ -83,7 +83,8 @@ pub struct IconSpec {
 pub struct IconRasterizer {
     cache: HashMap<IconCacheKey, Option<MemoryRenderBuffer>>,
     path_cache: HashMap<IconPathCacheKey, Option<PathBuf>>,
-    icon_index: Option<HashMap<String, Vec<PathBuf>>>,
+    icon_index: Option<HashMap<String, Vec<RankedIconPath>>>,
+    desktop_icon_index: Option<DesktopIconIndex>,
     async_job_sender: Option<AsyncAssetJobSender>,
     async_buffers: HashMap<u64, TimedIconBuffer>,
     async_in_flight: HashSet<u64>,
@@ -105,6 +106,45 @@ struct IconPathCacheKey {
     target: i32,
 }
 
+/// An icon file and the rank of the theme it comes from: 0 is the user's
+/// icon theme, then the themes it inherits from. Lower ranks win.
+#[derive(Debug, Clone)]
+struct RankedIconPath {
+    path: PathBuf,
+    theme_rank: usize,
+}
+
+/// Desktop-entry `Icon=` values keyed by desktop-file ID and
+/// `StartupWMClass`. X11 windows report a WM class rather than a desktop
+/// file name, so this index lets the class resolve to the declared icon.
+#[derive(Debug, Default)]
+struct DesktopIconIndex {
+    by_desktop_id: HashMap<String, String>,
+    by_desktop_id_lowercase: HashMap<String, String>,
+    by_startup_wm_class: HashMap<String, String>,
+}
+
+impl DesktopIconIndex {
+    fn icon_for_identity(&self, identity: &str) -> Option<&str> {
+        let identity = strip_desktop_suffix(identity);
+        if let Some(icon) = self.by_desktop_id.get(identity) {
+            return Some(icon);
+        }
+
+        let lowercase = identity.to_lowercase();
+        if lowercase != identity {
+            if let Some(icon) = self.by_desktop_id.get(&lowercase) {
+                return Some(icon);
+            }
+        }
+
+        self.by_desktop_id_lowercase
+            .get(&lowercase)
+            .map(String::as_str)
+            .or_else(|| self.by_startup_wm_class.get(&lowercase).map(String::as_str))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TimedIconBuffer {
     buffer: MemoryRenderBuffer,
@@ -117,6 +157,7 @@ impl IconRasterizer {
             cache: HashMap::new(),
             path_cache: HashMap::new(),
             icon_index: None,
+            desktop_icon_index: None,
             async_job_sender,
             async_buffers: HashMap::new(),
             async_in_flight: HashSet::new(),
@@ -160,7 +201,10 @@ impl IconRasterizer {
         let (key, full_width, full_height, raster_scale) = icon_cache_key_for_spec(spec)?;
         // A blurred icon is drawn inside room for the blur.
         let pad = (crate::backend::blur::padding(spec.blur) as f64 * raster_scale).round() as i32;
-        let (target_width, target_height) = ((full_width - 2 * pad).max(1), (full_height - 2 * pad).max(1));
+        let (target_width, target_height) = (
+            (full_width - 2 * pad).max(1),
+            (full_height - 2 * pad).max(1),
+        );
 
         let rgba = if let Some(asset_path) = spec.asset_path.as_deref() {
             let fit = spec.image_fit.unwrap_or(ImageFit::Contain);
@@ -188,9 +232,15 @@ impl IconRasterizer {
             for row in 0..target_height {
                 let from = (row * target_width * 4) as usize;
                 let to = (((row + pad) * full_width + pad) * 4) as usize;
-                padded[to..to + (target_width * 4) as usize].copy_from_slice(&pixels[from..from + (target_width * 4) as usize]);
+                padded[to..to + (target_width * 4) as usize]
+                    .copy_from_slice(&pixels[from..from + (target_width * 4) as usize]);
             }
-            crate::backend::blur::blur_premultiplied(&mut padded, full_width, full_height, spec.blur * raster_scale as f32);
+            crate::backend::blur::blur_premultiplied(
+                &mut padded,
+                full_width,
+                full_height,
+                spec.blur * raster_scale as f32,
+            );
             pixels = padded;
         }
         let (target_width, target_height) = (full_width, full_height);
@@ -221,7 +271,10 @@ impl IconRasterizer {
         if let Some(bytes) = spec.icon.as_ref().and_then(|icon| icon.bytes.as_ref()) {
             return decode_png_and_scale(bytes, target_width, target_height);
         }
-        let names = icon_candidate_names(spec);
+        let names = {
+            let desktop_icons = self.ensure_desktop_icon_index();
+            icon_candidate_names(spec, desktop_icons)
+        };
         if names.is_empty() {
             return None;
         }
@@ -292,21 +345,26 @@ impl IconRasterizer {
         resolved
     }
 
-    fn ensure_icon_index(&mut self) -> &HashMap<String, Vec<PathBuf>> {
+    fn ensure_icon_index(&mut self) -> &HashMap<String, Vec<RankedIconPath>> {
         if self.icon_index.is_none() {
-            let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
-            for root in icon_roots() {
-                if !root.exists() {
-                    continue;
-                }
-                build_icon_index(&root, &mut index);
-            }
-            self.icon_index = Some(index);
+            let roots = icon_roots();
+            let order = icon_theme_order(&current_icon_theme(), &roots);
+            self.icon_index = Some(build_ranked_icon_index(&roots, &order));
         }
 
         self.icon_index
             .as_ref()
             .expect("icon index must be initialized")
+    }
+
+    fn ensure_desktop_icon_index(&mut self) -> &DesktopIconIndex {
+        if self.desktop_icon_index.is_none() {
+            self.desktop_icon_index = Some(build_desktop_icon_index(&application_dirs()));
+        }
+
+        self.desktop_icon_index
+            .as_ref()
+            .expect("desktop icon index must be initialized")
     }
 
     fn prune_async_buffers(&mut self) {
@@ -689,20 +747,36 @@ fn theme_icon_source_key(spec: &IconSpec) -> Option<String> {
     spec.app_id.as_ref().map(|app_id| format!("app:{app_id}"))
 }
 
-fn icon_candidate_names(spec: &IconSpec) -> Vec<String> {
+fn icon_candidate_names(spec: &IconSpec, desktop_icons: &DesktopIconIndex) -> Vec<String> {
     let mut names = Vec::new();
+    let mut identities = Vec::new();
 
     if let Some(icon) = spec.icon.as_ref().and_then(|icon| icon.name.as_ref()) {
-        push_unique_name(&mut names, icon);
+        push_unique_name(&mut identities, icon);
+    }
+    if let Some(app_id) = spec.app_id.as_deref() {
+        push_unique_name(&mut identities, app_id);
+    }
+
+    // An X11 app_id is its WM_CLASS, not necessarily an icon or desktop
+    // file name. Resolve it through desktop entries first, then keep the
+    // raw identity as a fallback for apps whose class is also icon-named.
+    for identity in &identities {
+        if let Some(icon) = desktop_icons.icon_for_identity(identity) {
+            push_unique_name_and_lowercase(&mut names, icon);
+        }
+    }
+    for identity in &identities {
+        push_window_icon_name(&mut names, identity);
     }
 
     if let Some(app_id) = spec.app_id.as_deref() {
-        push_unique_name(&mut names, app_id);
-        if let Some(last) = app_id.rsplit('.').next() {
-            push_unique_name(&mut names, last);
+        let desktop_id = strip_desktop_suffix(app_id);
+        if desktop_id != app_id {
+            push_window_icon_name(&mut names, desktop_id);
         }
-        if let Some(stripped) = app_id.strip_suffix(".desktop") {
-            push_unique_name(&mut names, stripped);
+        if let Some(last) = desktop_id.rsplit('.').next() {
+            push_window_icon_name(&mut names, last);
         }
     }
 
@@ -715,62 +789,331 @@ fn push_unique_name(names: &mut Vec<String>, name: &str) {
     }
 }
 
+fn push_unique_name_and_lowercase(names: &mut Vec<String>, name: &str) {
+    push_unique_name(names, name);
+    if !name.contains('/') {
+        push_unique_name(names, &name.to_lowercase());
+    }
+}
+
+/// Window-supplied identities are icon names, not file paths. If one does
+/// contain a separator, use only its stem so it cannot turn into a direct
+/// filesystem lookup; absolute paths are reserved for desktop entries.
+fn push_window_icon_name(names: &mut Vec<String>, name: &str) {
+    if name.contains('/') {
+        if let Some(stem) = Path::new(name).file_stem().and_then(|stem| stem.to_str()) {
+            push_unique_name_and_lowercase(names, stem);
+        }
+    } else {
+        push_unique_name_and_lowercase(names, name);
+    }
+}
+
+fn strip_desktop_suffix(value: &str) -> &str {
+    let suffix = ".desktop";
+    if value.len() >= suffix.len() {
+        let split = value.len() - suffix.len();
+        if value
+            .get(split..)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(suffix))
+        {
+            return &value[..split];
+        }
+    }
+    value
+}
+
+fn build_desktop_icon_index(application_dirs: &[PathBuf]) -> DesktopIconIndex {
+    let mut index = DesktopIconIndex::default();
+    for dir in application_dirs {
+        index_desktop_files(dir, dir, 0, &mut index);
+    }
+    index
+}
+
+fn index_desktop_files(root: &Path, dir: &Path, depth: usize, index: &mut DesktopIconIndex) {
+    const MAX_DEPTH: usize = 6;
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    for entry in entries {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            index_desktop_files(root, &path, depth + 1, index);
+            continue;
+        }
+        // `is_file` follows a symlink to a regular desktop file, but not a
+        // symlink to a directory; this indexes Flatpak-style exported links
+        // without wandering through linked directory trees.
+        if !path.is_file() {
+            continue;
+        }
+        if !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("desktop"))
+        {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(icon) = ini_value(&text, "Desktop Entry", "Icon")
+            .map(|value| normalize_desktop_icon_name(&value))
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        let mut desktop_ids = Vec::new();
+        if let Ok(relative) = path.strip_prefix(root) {
+            let relative_id = relative
+                .with_extension("")
+                .components()
+                .filter_map(|component| component.as_os_str().to_str())
+                .collect::<Vec<_>>()
+                .join("-");
+            if !relative_id.is_empty() {
+                desktop_ids.push(relative_id);
+            }
+        }
+        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+            if !desktop_ids.iter().any(|id| id == stem) {
+                desktop_ids.push(stem.to_string());
+            }
+        }
+
+        for desktop_id in desktop_ids {
+            index
+                .by_desktop_id
+                .entry(desktop_id.clone())
+                .or_insert_with(|| icon.clone());
+            index
+                .by_desktop_id_lowercase
+                .entry(desktop_id.to_lowercase())
+                .or_insert_with(|| icon.clone());
+        }
+
+        if let Some(wm_classes) = ini_value(&text, "Desktop Entry", "StartupWMClass") {
+            for wm_class in wm_classes
+                .split(';')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                index
+                    .by_startup_wm_class
+                    .entry(wm_class.to_lowercase())
+                    .or_insert_with(|| icon.clone());
+            }
+        }
+    }
+}
+
+fn normalize_desktop_icon_name(icon: &str) -> String {
+    let icon = icon.trim();
+    let path = Path::new(icon);
+    if path.is_absolute() {
+        return icon.to_string();
+    }
+
+    let mut name = if icon.contains('/') {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(icon)
+    } else {
+        icon
+    };
+    for extension in [".png", ".svg", ".xpm"] {
+        if name.len() >= extension.len() {
+            let split = name.len() - extension.len();
+            if name
+                .get(split..)
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(extension))
+            {
+                name = &name[..split];
+                break;
+            }
+        }
+    }
+    name.to_string()
+}
+
+fn application_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/share"))
+        });
+    if let Some(data_home) = data_home {
+        dirs.push(data_home.join("applications"));
+    }
+
+    let mut data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            std::env::split_paths(&value)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if data_dirs.is_empty() {
+        data_dirs = vec![
+            PathBuf::from("/usr/local/share"),
+            PathBuf::from("/usr/share"),
+        ];
+    }
+    for dir in data_dirs {
+        let applications = dir.join("applications");
+        if !dirs.contains(&applications) {
+            dirs.push(applications);
+        }
+    }
+
+    dirs
+}
+
+/// Like the freedesktop icon lookup: the first name the window asks for
+/// wins; for that name, the earliest theme in the user's chain wins; then
+/// the size closest to the target.
 fn find_icon_path_in_index(
-    index: &HashMap<String, Vec<PathBuf>>,
+    index: &HashMap<String, Vec<RankedIconPath>>,
     names: &[String],
     width: i32,
     height: i32,
 ) -> Option<PathBuf> {
-    let mut best: Option<(PathBuf, i32)> = None;
     let target = width.max(height);
 
     for name in names {
+        let candidate = Path::new(name);
+        if candidate.is_absolute() && is_supported_icon_path(candidate) && candidate.is_file() {
+            return Some(candidate.to_path_buf());
+        }
         let Some(paths) = index.get(name) else {
             continue;
         };
-        for path in paths {
-            consider_icon_path(path, target, &mut best);
+        let mut best: Option<(PathBuf, i64)> = None;
+        for ranked in paths {
+            consider_icon_path(ranked, target, &mut best);
+        }
+        if let Some((path, _)) = best {
+            return Some(path);
         }
     }
 
-    best.map(|(path, _)| path)
+    None
 }
 
-fn build_icon_index(dir: &Path, index: &mut HashMap<String, Vec<PathBuf>>) {
+fn is_supported_icon_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("png") || extension.eq_ignore_ascii_case("svg")
+        })
+}
+
+/// Index every PNG and SVG under the icon roots by name. Each file keeps the
+/// rank of its theme (the folder right under a root); files of themes outside
+/// the user's chain, and loose files like pixmaps, rank after the chain.
+fn build_ranked_icon_index(
+    roots: &[PathBuf],
+    order: &HashMap<String, usize>,
+) -> HashMap<String, Vec<RankedIconPath>> {
+    let loose_rank = order.len();
+    let other_theme_rank = order.len() + 1;
+    let mut index = HashMap::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let theme = entry.file_name().to_string_lossy().into_owned();
+                // Themes in the chain are often mostly links into other
+                // themes, so follow links there. All themes with links
+                // followed are ~2 million files: too much memory.
+                match order.get(&theme) {
+                    Some(&rank) => build_icon_index(&path, rank, true, 0, &mut index),
+                    None => build_icon_index(&path, other_theme_rank, false, 0, &mut index),
+                }
+            } else if path.is_file() {
+                add_icon_file(&path, loose_rank, &mut index);
+            }
+        }
+    }
+    index
+}
+
+fn build_icon_index(
+    dir: &Path,
+    theme_rank: usize,
+    follow_links: bool,
+    depth: usize,
+    index: &mut HashMap<String, Vec<RankedIconPath>>,
+) {
+    // Themes are a few folders deep; the limit also stops link loops.
+    const MAX_DEPTH: usize = 6;
+    if depth > MAX_DEPTH {
+        return;
+    }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
 
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+        let (is_dir, is_file) = if follow_links {
+            (path.is_dir(), path.is_file())
+        } else {
+            match entry.file_type() {
+                Ok(kind) => (kind.is_dir(), kind.is_file()),
+                Err(_) => continue,
+            }
         };
-
-        if file_type.is_dir() {
-            build_icon_index(&path, index);
-            continue;
+        if is_dir {
+            build_icon_index(&path, theme_rank, follow_links, depth + 1, index);
+        } else if is_file {
+            add_icon_file(&path, theme_rank, index);
         }
-
-        if !file_type.is_file() {
-            continue;
-        }
-
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
-            continue;
-        };
-        if !matches!(extension.to_ascii_lowercase().as_str(), "png" | "svg") {
-            continue;
-        }
-
-        index.entry(stem.to_string()).or_default().push(path);
     }
 }
 
-fn consider_icon_path(path: &Path, target: i32, best: &mut Option<(PathBuf, i32)>) {
+fn add_icon_file(path: &Path, theme_rank: usize, index: &mut HashMap<String, Vec<RankedIconPath>>) {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return;
+    };
+    let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+        return;
+    };
+    if !matches!(extension.to_ascii_lowercase().as_str(), "png" | "svg") {
+        return;
+    }
+
+    index
+        .entry(stem.to_string())
+        .or_default()
+        .push(RankedIconPath {
+            path: path.to_path_buf(),
+            theme_rank,
+        });
+}
+
+fn consider_icon_path(ranked: &RankedIconPath, target: i32, best: &mut Option<(PathBuf, i64)>) {
+    let path = &ranked.path;
     let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
         return;
     };
@@ -789,12 +1132,86 @@ fn consider_icon_path(path: &Path, target: i32, best: &mut Option<(PathBuf, i32)
     } else {
         50
     };
-    let score = size_penalty + path_bonus + extension_penalty;
+    // The theme comes first; the other penalties stay far below 100 000.
+    let score = ranked.theme_rank as i64 * 100_000
+        + i64::from(size_penalty + path_bonus + extension_penalty);
 
     match best {
         Some((_, current_score)) if *current_score <= score => {}
         _ => *best = Some((path.to_path_buf(), score)),
     }
+}
+
+/// The icon theme KDE uses: `[Icons] Theme=` in kdeglobals (set by System
+/// Settings). Without one, hicolor.
+fn current_icon_theme() -> String {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    config_home
+        .and_then(|dir| fs::read_to_string(dir.join("kdeglobals")).ok())
+        .and_then(|text| ini_value(&text, "Icons", "Theme"))
+        .unwrap_or_else(|| "hicolor".to_string())
+}
+
+/// The user's theme, then the themes it inherits from (depth first, as the
+/// freedesktop spec says), then hicolor last. Maps a theme name to its rank.
+fn icon_theme_order(theme: &str, roots: &[PathBuf]) -> HashMap<String, usize> {
+    fn visit(theme: &str, roots: &[PathBuf], order: &mut Vec<String>) {
+        if theme == "hicolor" || order.iter().any(|seen| seen == theme) {
+            return;
+        }
+        order.push(theme.to_string());
+        for parent in theme_parents(theme, roots) {
+            visit(&parent, roots, order);
+        }
+    }
+
+    let mut order = Vec::new();
+    visit(theme, roots, &mut order);
+    order.push("hicolor".to_string());
+    order
+        .into_iter()
+        .enumerate()
+        .map(|(rank, name)| (name, rank))
+        .collect()
+}
+
+/// `Inherits=` of a theme's index.theme (the first one found in the roots).
+fn theme_parents(theme: &str, roots: &[PathBuf]) -> Vec<String> {
+    roots
+        .iter()
+        .find_map(|root| fs::read_to_string(root.join(theme).join("index.theme")).ok())
+        .and_then(|text| ini_value(&text, "Icon Theme", "Inherits"))
+        .map(|value| {
+            value
+                .split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One value from an INI-style file: `key=value` under `[section]`.
+fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_section = line == format!("[{section}]");
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once('=') {
+            if name.trim() == key {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 fn icon_roots() -> Vec<PathBuf> {
@@ -1218,6 +1635,138 @@ fn intersect_logical_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icon_lookup_prefers_the_user_theme_chain() {
+        let root =
+            std::env::temp_dir().join(format!("shoji-wm-icon-theme-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        // picks inherits base; other is not in the chain but has the exact size.
+        write(
+            "picks/index.theme",
+            "[Icon Theme]\nName=picks\nInherits=base,hicolor\n",
+        );
+        write("picks/48x48/places/folder.png", "");
+        write("base/index.theme", "[Icon Theme]\nName=base\n");
+        write("base/48x48/places/folder.png", "");
+        write("base/32x32/places/folder-music.png", "");
+        write("other/32x32/places/folder.png", "");
+        write("other/32x32/places/folder-music.png", "");
+
+        // Links: followed inside the chain, not in other themes.
+        write("store/folder-videos.png", "");
+        fs::create_dir_all(root.join("picks/32x32/places")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("store/folder-videos.png"),
+            root.join("picks/32x32/places/folder-videos.png"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("store/folder-videos.png"),
+            root.join("other/32x32/places/folder-linked.png"),
+        )
+        .unwrap();
+
+        let roots = vec![root.clone()];
+        let order = icon_theme_order("picks", &roots);
+        assert_eq!(order.get("picks"), Some(&0));
+        assert_eq!(order.get("base"), Some(&1));
+        assert_eq!(order.get("hicolor"), Some(&2));
+
+        let index = build_ranked_icon_index(&roots, &order);
+        let find =
+            |name: &str| find_icon_path_in_index(&index, &[name.to_string()], 32, 32).unwrap();
+        assert!(find("folder").starts_with(root.join("picks")));
+        assert!(find("folder-music").starts_with(root.join("base")));
+        // The first name wins, even when a later name is in an earlier theme.
+        let both =
+            find_icon_path_in_index(&index, &["folder-music".into(), "folder".into()], 32, 32)
+                .unwrap();
+        assert!(both.starts_with(root.join("base")));
+        assert!(find("folder-videos").starts_with(root.join("picks")));
+        assert!(find_icon_path_in_index(&index, &["folder-linked".into()], 32, 32).is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ini_value_reads_the_right_section() {
+        let text = "[General]\nTheme=nope\n[Icons]\nTheme=shoji-picks\n";
+        assert_eq!(
+            ini_value(text, "Icons", "Theme").as_deref(),
+            Some("shoji-picks")
+        );
+        assert_eq!(ini_value(text, "Missing", "Theme"), None);
+    }
+
+    #[test]
+    fn x11_icon_candidates_use_lower_case_and_startup_wm_class() {
+        let root =
+            std::env::temp_dir().join(format!("shoji-wm-x11-icon-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let applications = root.join("applications");
+        fs::create_dir_all(&applications).unwrap();
+        fs::write(
+            applications.join("google-chrome.desktop"),
+            "[Desktop Entry]\nName=Chrome\nIcon=chrome-custom\nStartupWMClass=Google-Chrome\n",
+        )
+        .unwrap();
+        fs::write(
+            applications.join("custom-browser.desktop"),
+            "[Desktop Entry]\nName=Browser\nIcon=browser-custom\nStartupWMClass=mybrowser\n",
+        )
+        .unwrap();
+        let absolute_icon = root.join("absolute-icon.png");
+        fs::write(&absolute_icon, "").unwrap();
+        fs::write(
+            applications.join("absolute.desktop"),
+            format!(
+                "[Desktop Entry]\nName=Absolute\nIcon={}\n",
+                absolute_icon.display()
+            ),
+        )
+        .unwrap();
+
+        let spec_for = |app_id: &str| IconSpec {
+            rect: LogicalRect::new(0, 0, 16, 16),
+            rect_precise: None,
+            icon: Some(WindowIconSnapshot {
+                name: Some(app_id.to_string()),
+                bytes: None,
+            }),
+            app_id: Some(app_id.to_string()),
+            asset_path: None,
+            image_fit: None,
+            fallback_asset_path: None,
+            raster_scale: 1.0,
+            blur: 0.0,
+        };
+
+        let index = build_desktop_icon_index(&[applications]);
+        let chrome = icon_candidate_names(&spec_for("Google-chrome"), &index);
+        assert_eq!(chrome.first().map(String::as_str), Some("chrome-custom"));
+        assert!(chrome.iter().any(|name| name == "google-chrome"));
+
+        let browser = icon_candidate_names(&spec_for("MyBrowser"), &index);
+        assert_eq!(browser.first().map(String::as_str), Some("browser-custom"));
+        assert!(browser.iter().any(|name| name == "mybrowser"));
+
+        let absolute = icon_candidate_names(&spec_for("absolute"), &index);
+        assert_eq!(
+            find_icon_path_in_index(&HashMap::new(), &absolute, 16, 16),
+            Some(absolute_icon)
+        );
+
+        let unknown = icon_candidate_names(&spec_for("UnknownApp"), &DesktopIconIndex::default());
+        assert!(unknown.iter().any(|name| name == "unknownapp"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn asset_cache_key_includes_image_fit() {
