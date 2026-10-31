@@ -3967,7 +3967,7 @@ impl ShojiWM {
             return;
         };
         let keyboard = self.seat.get_keyboard().unwrap();
-        match keyboard.set_keymap_from_string(self, keymap.to_string()) {
+        match keyboard.set_keymap_from_keymap_file(self, keymap) {
             Ok(()) => self.virtual_keyboard_keymap_active = true,
             Err(err) => warn!(?err, "Failed to apply virtual keyboard keymap"),
         }
