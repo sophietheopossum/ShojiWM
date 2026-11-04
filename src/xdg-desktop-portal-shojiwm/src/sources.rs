@@ -303,12 +303,13 @@ impl Dispatch<wl_output::WlOutput, ()> for AppData {
             wl_output::Event::Name { name } => cur.name = name,
             wl_output::Event::Description { description } => cur.description = description,
             wl_output::Event::Geometry {
-                x, y, transform, ..
+                x,
+                y,
+                transform: WEnum::Value(transform),
+                ..
             } => {
                 cur.position = (x, y);
-                if let WEnum::Value(transform) = transform {
-                    cur.transform = transform;
-                }
+                cur.transform = transform;
             }
             wl_output::Event::Mode {
                 flags,
