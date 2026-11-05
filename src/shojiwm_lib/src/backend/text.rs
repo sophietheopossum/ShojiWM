@@ -1067,10 +1067,7 @@ mod tests {
             resolve_font_family(["Missing preferred face"], |_| false),
             CosmicFamily::SansSerif
         );
-        assert_eq!(
-            resolve_font_family([], |_| false),
-            CosmicFamily::SansSerif
-        );
+        assert_eq!(resolve_font_family([], |_| false), CosmicFamily::SansSerif);
     }
 
     fn at_most(chars: usize) -> impl FnMut(&str) -> bool {

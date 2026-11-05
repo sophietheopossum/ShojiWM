@@ -68,12 +68,16 @@ pub fn element_for_output(
     rects: &[LogicalRect],
     output_geo: Rectangle<i32, Logical>,
 ) -> DamageOnlyElement {
-    let damage = elements_for_output(rects, output_geo).into_iter().map(|element| element.rect);
+    let damage = elements_for_output(rects, output_geo)
+        .into_iter()
+        .map(|element| element.rect);
     OUTPUT_DAMAGE.with_borrow_mut(|outputs| {
-        let output = outputs.entry(name.to_owned()).or_insert_with(|| OutputDamage {
-            id: Id::new(),
-            bag: DamageBag::new(OUTPUT_DAMAGE_HISTORY),
-        });
+        let output = outputs
+            .entry(name.to_owned())
+            .or_insert_with(|| OutputDamage {
+                id: Id::new(),
+                bag: DamageBag::new(OUTPUT_DAMAGE_HISTORY),
+            });
         let damage = damage.collect::<Vec<_>>();
         if !damage.is_empty() {
             output.bag.add(damage);
@@ -99,7 +103,9 @@ impl Element for DamageOnlyElement {
     fn current_commit(&self) -> CommitCounter {
         self.history
             .as_ref()
-            .map_or_else(CommitCounter::default, |(history, _)| history.current_commit())
+            .map_or_else(CommitCounter::default, |(history, _)| {
+                history.current_commit()
+            })
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> {
@@ -115,7 +121,11 @@ impl Element for DamageOnlyElement {
         self.rect.to_physical_precise_round(scale)
     }
 
-    fn damage_since(&self, scale: Scale<f64>, commit: Option<CommitCounter>) -> DamageSet<i32, Physical> {
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
         let Some((history, output)) = &self.history else {
             if commit != Some(self.current_commit()) {
                 return DamageSet::from_slice(&[Rectangle::from_size(self.geometry(scale).size)]);
@@ -123,7 +133,10 @@ impl Element for DamageOnlyElement {
             return DamageSet::default();
         };
         match history.damage_since(commit) {
-            Some(damage) => damage.iter().map(|rect| rect.to_physical_precise_up(scale)).collect(),
+            Some(damage) => damage
+                .iter()
+                .map(|rect| rect.to_physical_precise_up(scale))
+                .collect(),
             None => DamageSet::from_slice(&[output.to_physical_precise_up(scale)]),
         }
     }
@@ -187,8 +200,16 @@ mod tests {
     use super::*;
 
     /// What an age-1 tracker repaints for one frame of `elements`.
-    fn damage(tracker: &mut OutputDamageTracker, elements: &[DamageOnlyElement]) -> Vec<Rectangle<i32, Physical>> {
-        tracker.damage_output(1, elements).unwrap().0.cloned().unwrap_or_default()
+    fn damage(
+        tracker: &mut OutputDamageTracker,
+        elements: &[DamageOnlyElement],
+    ) -> Vec<Rectangle<i32, Physical>> {
+        tracker
+            .damage_output(1, elements)
+            .unwrap()
+            .0
+            .cloned()
+            .unwrap_or_default()
     }
 
     #[test]
@@ -197,20 +218,35 @@ mod tests {
         let mut tracker = OutputDamageTracker::new((800, 600), 1.0, Transform::Normal);
         // Something under it, which must never be repainted because it moved down the stack.
         let below = DamageOnlyElement::new(Rectangle::new((100, 100).into(), (300, 200).into()));
-        let frame = |rects: &[LogicalRect]| vec![element_for_output("test-a", rects, output), below.clone()];
+        let frame = |rects: &[LogicalRect]| {
+            vec![element_for_output("test-a", rects, output), below.clone()]
+        };
 
-        assert!(!damage(&mut tracker, &frame(&[])).is_empty(), "first frame repaints");
+        assert!(
+            !damage(&mut tracker, &frame(&[])).is_empty(),
+            "first frame repaints"
+        );
         assert!(damage(&mut tracker, &frame(&[])).is_empty());
         let clock = LogicalRect::new(45, 94, 202, 202);
-        assert_eq!(damage(&mut tracker, &frame(&[clock])), vec![Rectangle::new((45, 94).into(), (202, 202).into())]);
-        assert!(damage(&mut tracker, &frame(&[])).is_empty(), "no follow-up frame");
+        assert_eq!(
+            damage(&mut tracker, &frame(&[clock])),
+            vec![Rectangle::new((45, 94).into(), (202, 202).into())]
+        );
+        assert!(
+            damage(&mut tracker, &frame(&[])).is_empty(),
+            "no follow-up frame"
+        );
         // Clipped to the output, which may sit anywhere in the layout.
         let offset = Rectangle::new((800, 0).into(), (800, 600).into());
         let mut offset_tracker = OutputDamageTracker::new((800, 600), 1.0, Transform::Normal);
-        let offset_frame = |rects: &[LogicalRect]| vec![element_for_output("test-b", rects, offset)];
+        let offset_frame =
+            |rects: &[LogicalRect]| vec![element_for_output("test-b", rects, offset)];
         damage(&mut offset_tracker, &offset_frame(&[]));
         assert_eq!(
-            damage(&mut offset_tracker, &offset_frame(&[LogicalRect::new(700, 10, 200, 20)])),
+            damage(
+                &mut offset_tracker,
+                &offset_frame(&[LogicalRect::new(700, 10, 200, 20)])
+            ),
             vec![Rectangle::new((0, 10).into(), (100, 20).into())]
         );
     }
@@ -224,6 +260,9 @@ mod tests {
             element_for_output("test-c", &[LogicalRect::new(0, 0, 10, 10)], output);
         }
         let element = element_for_output("test-c", &[], output);
-        assert_eq!(damage(&mut tracker, &[element]), vec![Rectangle::from_size((800, 600).into())]);
+        assert_eq!(
+            damage(&mut tracker, &[element]),
+            vec![Rectangle::from_size((800, 600).into())]
+        );
     }
 }
