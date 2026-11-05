@@ -775,8 +775,11 @@ mod tests {
         // and a socket file nobody listens on.
         fs::write(format!("/tmp/.X{}-lock", paths.start()), "999999999\n").expect("write lock");
         drop(
-            std::os::unix::net::UnixListener::bind(format!("{X11_TMP_UNIX_DIR}/X{}", paths.start()))
-                .expect("leave a socket file"),
+            std::os::unix::net::UnixListener::bind(format!(
+                "{X11_TMP_UNIX_DIR}/X{}",
+                paths.start()
+            ))
+            .expect("leave a socket file"),
         );
 
         let reservation = reserve_x11_display(paths.start()).expect("reserve display");
@@ -789,8 +792,11 @@ mod tests {
     fn keeps_a_lock_whose_server_is_alive() {
         ensure_x11_unix_dir().expect("prepare X11 socket directory");
         let paths = TestDisplayPaths::new();
-        fs::write(format!("/tmp/.X{}-lock", paths.start()), format!("{:>10}\n", std::process::id()))
-            .expect("write lock");
+        fs::write(
+            format!("/tmp/.X{}-lock", paths.start()),
+            format!("{:>10}\n", std::process::id()),
+        )
+        .expect("write lock");
 
         let reservation = reserve_x11_display(paths.start()).expect("reserve next display");
 

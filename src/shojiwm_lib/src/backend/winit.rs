@@ -1028,8 +1028,6 @@ pub fn init_winit(
         winit_render_mode(&output).expect("winit output has a mode right after creation");
     let mut damage_tracker = OutputDamageTracker::from_mode_source(initial_render_mode.clone());
     let mut blink_damage_tracker = OutputDamageTracker::from_mode_source(initial_render_mode);
-    // `SHOJI_FRAME_DAMAGE_DEBUG`: the frame's damage as an age-1 tracker would see it.
-    let mut damage_probe = crate::frame_stats::DamageProbe::default();
     event_loop
         .handle()
         .insert_source(winit, move |event, _, state| {

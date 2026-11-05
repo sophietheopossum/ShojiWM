@@ -3375,12 +3375,9 @@ impl ShojiWM {
             return;
         };
         let pos = pointer.current_location();
-        if pointer.is_grabbed()
-            || self
-                .runtime_input_grab
-                .as_ref()
-                .is_some_and(|grab| !grab.passes(pos.x, pos.y))
-        {
+        // No pointer passthrough on this branch: a runtime input grab takes
+        // the pointer everywhere, so hover does not follow it either.
+        if pointer.is_grabbed() || self.runtime_input_grab.is_some() {
             return;
         }
         self.update_decoration_hover_target(pos);

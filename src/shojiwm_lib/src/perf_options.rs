@@ -22,7 +22,11 @@ const UNSET: u8 = 0;
 const ON: u8 = 1;
 const OFF: u8 = 2;
 
-static STATES: [AtomicU8; 3] = [AtomicU8::new(UNSET), AtomicU8::new(UNSET), AtomicU8::new(UNSET)];
+static STATES: [AtomicU8; 3] = [
+    AtomicU8::new(UNSET),
+    AtomicU8::new(UNSET),
+    AtomicU8::new(UNSET),
+];
 
 impl PerfOption {
     pub const ALL: [Self; 3] = [Self::FrameGate, Self::TargetedRedraw, Self::ClipOpaque];
@@ -71,7 +75,8 @@ impl PerfOption {
     }
 
     pub fn set(self, on: bool) {
-        self.state().store(if on { ON } else { OFF }, Ordering::Relaxed);
+        self.state()
+            .store(if on { ON } else { OFF }, Ordering::Relaxed);
     }
 }
 
@@ -79,7 +84,12 @@ impl PerfOption {
 pub fn json() -> String {
     let states = PerfOption::ALL
         .into_iter()
-        .map(|option| (option.name().to_owned(), serde_json::Value::Bool(option.enabled())))
+        .map(|option| {
+            (
+                option.name().to_owned(),
+                serde_json::Value::Bool(option.enabled()),
+            )
+        })
         .collect::<serde_json::Map<_, _>>();
     serde_json::Value::Object(states).to_string()
 }

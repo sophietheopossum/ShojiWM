@@ -111,14 +111,17 @@ impl CommonArgs {
             } else if flag("--frame-debug")
                 || args.iter().any(|arg| arg.starts_with("--frame-debug="))
             {
-                Some(match parse_option_value(args, "--frame-debug").as_deref() {
-                    Some("on") => crate::control_socket::Command::FrameDebugOn,
-                    Some("off") => crate::control_socket::Command::FrameDebugOff,
-                    _ => crate::control_socket::Command::FrameDebugTake,
-                })
+                Some(
+                    match parse_option_value(args, "--frame-debug", &consumed_values).as_deref() {
+                        Some("on") => crate::control_socket::Command::FrameDebugOn,
+                        Some("off") => crate::control_socket::Command::FrameDebugOff,
+                        _ => crate::control_socket::Command::FrameDebugTake,
+                    },
+                )
             } else if flag("--perf-options") {
                 Some(crate::control_socket::Command::PerfOptions)
-            } else if let Some(value) = parse_option_value(args, "--perf-option") {
+            } else if let Some(value) = parse_option_value(args, "--perf-option", &consumed_values)
+            {
                 value.split_once('=').and_then(|(name, state)| {
                     let option = crate::perf_options::PerfOption::parse(name)?;
                     match state {

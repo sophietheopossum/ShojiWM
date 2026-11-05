@@ -55,7 +55,9 @@ pub struct OutputFrames {
 static FRAMES: Mutex<BTreeMap<String, OutputFrames>> = Mutex::new(BTreeMap::new());
 
 pub fn record(output: &str, update: impl FnOnce(&mut OutputFrames)) {
-    let mut frames = FRAMES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut frames = FRAMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match frames.get_mut(output) {
         Some(counters) => update(counters),
         None => update(frames.entry(output.to_owned()).or_default()),
@@ -71,7 +73,9 @@ pub fn record_gpu_wait(output: &str, waited: Duration) {
 
 /// Every output's counters, as one line of JSON: `{"DP-1": {...}, ...}`.
 pub fn json() -> String {
-    let frames = FRAMES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let frames = FRAMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     serde_json::to_string(&*frames).unwrap_or_else(|_| "{}".to_owned())
 }
 
@@ -96,7 +100,9 @@ static DEBUG_LOG: Mutex<DebugLog> = Mutex::new(DebugLog {
 const DEBUG_FRAMES: usize = 600;
 
 fn debug_log() -> std::sync::MutexGuard<'static, DebugLog> {
-    DEBUG_LOG.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    DEBUG_LOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Whether frame debugging is on.
@@ -125,7 +131,9 @@ pub fn record_redraw_caller(caller: &'static Location<'static>) {
 pub fn take_debug_json() -> String {
     let mut log = debug_log();
     let now = Instant::now();
-    let seconds = log.since.map_or(0.0, |since| now.duration_since(since).as_secs_f64());
+    let seconds = log
+        .since
+        .map_or(0.0, |since| now.duration_since(since).as_secs_f64());
     log.since = debugging().then_some(now);
     let mut callers = std::mem::take(&mut log.redraw_callers)
         .into_iter()
@@ -169,7 +177,13 @@ pub fn probe_frame<E: Element>(output: &Output, elements: &[E]) -> Option<bool> 
         return None;
     }
     let name = output.name();
-    Some(PROBES.with(|probes| probes.borrow_mut().entry(name).or_default().frame(output, elements)))
+    Some(PROBES.with(|probes| {
+        probes
+            .borrow_mut()
+            .entry(name)
+            .or_default()
+            .frame(output, elements)
+    }))
 }
 
 /// One output's elements as last drawn, to tell which changed.
@@ -188,12 +202,20 @@ impl DamageProbe {
     /// tracker would redraw; returns whether it would redraw anything.
     pub fn frame<E: Element>(&mut self, output: &Output, elements: &[E]) -> bool {
         let scale = Scale::from(output.current_scale().fractional_scale());
-        let tracker = self.tracker.get_or_insert_with(|| OutputDamageTracker::from_output(output));
+        let tracker = self
+            .tracker
+            .get_or_insert_with(|| OutputDamageTracker::from_output(output));
         let damaged_px: i64 = match tracker.damage_output(1, elements) {
-            Ok((Some(rects), _)) => rects.iter().map(|rect| rect.size.w as i64 * rect.size.h as i64).sum(),
+            Ok((Some(rects), _)) => rects
+                .iter()
+                .map(|rect| rect.size.w as i64 * rect.size.h as i64)
+                .sum(),
             _ => 0,
         };
-        let output_px = output.current_mode().map_or(1, |mode| mode.size.w as i64 * mode.size.h as i64).max(1);
+        let output_px = output
+            .current_mode()
+            .map_or(1, |mode| mode.size.w as i64 * mode.size.h as i64)
+            .max(1);
         let output = output.name();
         let output = output.as_str();
         self.frame += 1;
@@ -221,14 +243,25 @@ impl DamageProbe {
             }
             seen.insert(id, (commit, geometry));
         }
-        let gone = self.last.keys().filter(|id| !seen.contains_key(*id)).count();
+        let gone = self
+            .last
+            .keys()
+            .filter(|id| !seen.contains_key(*id))
+            .count();
         if gone > 0 {
             changes.push(format!("{gone} gone"));
         }
         self.last = seen;
         if !changes.is_empty() || damaged_px > 0 {
             let damaged_pct = (damaged_px * 100 / output_px).min(999);
-            info!(output, frame = self.frame, elements = elements.len(), damaged_pct, ?changes, "frame damage");
+            info!(
+                output,
+                frame = self.frame,
+                elements = elements.len(),
+                damaged_pct,
+                ?changes,
+                "frame damage"
+            );
             let at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_millis() as u64);
@@ -277,7 +310,13 @@ mod tests {
             .unwrap();
         assert_eq!(ours[1], 2);
         let again: serde_json::Value = serde_json::from_str(&take_debug_json()).unwrap();
-        assert!(again["redraw_callers"].as_array().unwrap().iter().all(|caller| caller[0] != ours[0]));
+        assert!(
+            again["redraw_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|caller| caller[0] != ours[0])
+        );
         set_debugging(false);
         assert!(!DEBUGGING.load(Ordering::Relaxed));
     }

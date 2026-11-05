@@ -2679,7 +2679,10 @@ fn layout_popup(
     layout_node_resolved(node, rect, None, window_slot_size, frame, rect)
 }
 
-fn apply_node_transform(node: &mut ComputedDecorationNode, inherited_clip: Option<ResolvedDecorationClip>) {
+fn apply_node_transform(
+    node: &mut ComputedDecorationNode,
+    inherited_clip: Option<ResolvedDecorationClip>,
+) {
     let Some(transform) = node.style.transform else {
         return;
     };
@@ -2701,11 +2704,15 @@ fn apply_node_transform(node: &mut ComputedDecorationNode, inherited_clip: Optio
 
 /// `node`'s clip and its descendants', from their (transformed) content
 /// rects under `inherited_clip`; corner radii shrink with the scale.
-fn reclip_transformed(node: &mut ComputedDecorationNode, inherited_clip: Option<ResolvedDecorationClip>) {
+fn reclip_transformed(
+    node: &mut ComputedDecorationNode,
+    inherited_clip: Option<ResolvedDecorationClip>,
+) {
     let frame = node.frame;
     let own = node_style_clips_children(&node.style).then(|| {
-        let radius = (node.style.resolved_border_radius(frame.scale) - node.style.resolved_border_width(frame.scale))
-            .max(ResolvedLayoutValue::ZERO);
+        let radius = (node.style.resolved_border_radius(frame.scale)
+            - node.style.resolved_border_width(frame.scale))
+        .max(ResolvedLayoutValue::ZERO);
         let factor = node.transform_scale.0.min(node.transform_scale.1);
         ResolvedDecorationClip {
             rect: node.resolved_content_rect,
@@ -2717,7 +2724,9 @@ fn reclip_transformed(node: &mut ComputedDecorationNode, inherited_clip: Option<
         (Some(parent), None) => Some(parent),
         (None, current) => current,
     };
-    node.effective_clip = node.resolved_effective_clip.map(|clip| clip.to_logical_clip(frame));
+    node.effective_clip = node
+        .resolved_effective_clip
+        .map(|clip| clip.to_logical_clip(frame));
     let clip = node.resolved_effective_clip;
     for child in &mut node.children {
         reclip_transformed(child, clip);
@@ -3642,9 +3651,16 @@ fn node_style_clips_children(style: &DecorationStyle) -> bool {
 /// they do not meet: a node moved wholly outside its clip (transformed, or
 /// a scrolled page's row) shows nothing and takes no hits, where no clip at
 /// all would draw it in full.
-fn clip_within(parent: ResolvedDecorationClip, current: ResolvedDecorationClip) -> ResolvedDecorationClip {
+fn clip_within(
+    parent: ResolvedDecorationClip,
+    current: ResolvedDecorationClip,
+) -> ResolvedDecorationClip {
     intersect_resolved_decoration_clips(parent, current).unwrap_or(ResolvedDecorationClip {
-        rect: ResolvedLogicalRect { width: ResolvedLayoutValue::ZERO, height: ResolvedLayoutValue::ZERO, ..parent.rect },
+        rect: ResolvedLogicalRect {
+            width: ResolvedLayoutValue::ZERO,
+            height: ResolvedLayoutValue::ZERO,
+            ..parent.rect
+        },
         radius: ResolvedLayoutValue::ZERO,
     })
 }
@@ -3756,17 +3772,31 @@ mod tests {
 
     #[test]
     fn a_clipped_node_scrolled_out_of_its_clip_shows_and_takes_nothing() {
-        let column = || DecorationNode::new(DecorationNodeKind::Box(BoxNode { direction: LayoutDirection::Column }));
+        let column = || {
+            DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                direction: LayoutDirection::Column,
+            }))
+        };
         // A page's row, its title clipped, scrolled above the room it is
         // seen through (50 to 90).
-        let button = DecorationNode::new(DecorationNodeKind::Button(ButtonNode { action: WindowAction::Close }))
-            .with_style(DecorationStyle { width: Some(20.0), height: Some(20.0), ..Default::default() });
+        let button = DecorationNode::new(DecorationNodeKind::Button(ButtonNode {
+            action: WindowAction::Close,
+        }))
+        .with_style(DecorationStyle {
+            width: Some(20.0),
+            height: Some(20.0),
+            ..Default::default()
+        });
         let row = column()
             .with_style(DecorationStyle {
                 width: Some(100.0),
                 height: Some(30.0),
                 position: Some(StylePosition::Absolute),
-                inset: PositionOffsets { top: Some(-45.0), left: Some(0.0), ..Default::default() },
+                inset: PositionOffsets {
+                    top: Some(-45.0),
+                    left: Some(0.0),
+                    ..Default::default()
+                },
                 overflow: Some(Overflow::Hidden),
                 ..Default::default()
             })
@@ -3774,20 +3804,30 @@ mod tests {
         let room = column()
             .with_style(DecorationStyle {
                 height: Some(40.0),
-                margin: Edges { top: 50.0, ..Default::default() },
+                margin: Edges {
+                    top: 50.0,
+                    ..Default::default()
+                },
                 position: Some(StylePosition::Relative),
                 overflow: Some(Overflow::Hidden),
                 ..Default::default()
             })
             .with_children(vec![row]);
-        let layout = DecorationTree::new(column().with_children(vec![room, DecorationNode::new(DecorationNodeKind::WindowSlot)]))
-            .layout(LogicalRect::new(0, 0, 100, 200))
-            .expect("layout should succeed");
+        let layout = DecorationTree::new(column().with_children(vec![
+            room,
+            DecorationNode::new(DecorationNodeKind::WindowSlot),
+        ]))
+        .layout(LogicalRect::new(0, 0, 100, 200))
+        .expect("layout should succeed");
         let row = &layout.root.children[0].children[0];
         assert_eq!(row.rect.y, 5, "the row sits above the room");
         let clip = row.effective_clip.expect("a clip, if an empty one");
         assert_eq!((clip.rect.width, clip.rect.height), (0, 0));
-        assert_eq!(layout.hit_test(LogicalPoint::new(10, 10)), DecorationHitTestResult::Move, "its button takes no press");
+        assert_eq!(
+            layout.hit_test(LogicalPoint::new(10, 10)),
+            DecorationHitTestResult::Move,
+            "its button takes no press"
+        );
     }
 
     #[test]
@@ -3949,49 +3989,94 @@ mod tests {
     fn a_transformed_child_keeps_its_parents_clip_where_it_is() {
         // A scrolling area (overflow hidden) around content scaled to half:
         // the area's clip must not shrink around the content's middle.
-        let root = DecorationNode::new(DecorationNodeKind::Box(BoxNode { direction: LayoutDirection::Column }))
-            .with_style(DecorationStyle { overflow: Some(Overflow::Hidden), ..Default::default() })
-            .with_children(vec![
-                DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
-                    .with_style(DecorationStyle {
-                        width: Some(100.0),
-                        height: Some(100.0),
-                        transform: Some(NodeTransform { translate_x: 0.0, translate_y: 0.0, scale_x: 0.5, scale_y: 0.5 }),
-                        ..Default::default()
-                    })
-                    .with_children(vec![DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
-                        .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)])]),
-            ]);
-        let layout = DecorationTree::new(root).layout(LogicalRect::new(0, 0, 100, 100)).expect("layout should succeed");
-        let area = layout.root.resolved_effective_clip.expect("the area clips").rect;
+        let root = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Column,
+        }))
+        .with_style(DecorationStyle {
+            overflow: Some(Overflow::Hidden),
+            ..Default::default()
+        })
+        .with_children(vec![
+            DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
+                .with_style(DecorationStyle {
+                    width: Some(100.0),
+                    height: Some(100.0),
+                    transform: Some(NodeTransform {
+                        translate_x: 0.0,
+                        translate_y: 0.0,
+                        scale_x: 0.5,
+                        scale_y: 0.5,
+                    }),
+                    ..Default::default()
+                })
+                .with_children(vec![
+                    DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
+                        .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)]),
+                ]),
+        ]);
+        let layout = DecorationTree::new(root)
+            .layout(LogicalRect::new(0, 0, 100, 100))
+            .expect("layout should succeed");
+        let area = layout
+            .root
+            .resolved_effective_clip
+            .expect("the area clips")
+            .rect;
         let content = &layout.root.children[0];
-        assert_eq!(content.resolved_effective_clip.expect("inherited").rect, area);
-        assert_eq!(content.children[0].resolved_effective_clip.expect("inherited").rect, area);
+        assert_eq!(
+            content.resolved_effective_clip.expect("inherited").rect,
+            area
+        );
+        assert_eq!(
+            content.children[0]
+                .resolved_effective_clip
+                .expect("inherited")
+                .rect,
+            area
+        );
         assert_eq!(content.transform_scale, (0.5, 0.5));
     }
 
     #[test]
     fn a_clipping_child_moved_outside_its_parents_clip_shows_nothing() {
         // Scrolled out of view: its own clip and the area's do not meet.
-        let root = DecorationNode::new(DecorationNodeKind::Box(BoxNode { direction: LayoutDirection::Column }))
-            .with_style(DecorationStyle { overflow: Some(Overflow::Hidden), ..Default::default() })
-            .with_children(vec![
-                DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
-                    .with_style(DecorationStyle {
-                        width: Some(100.0),
-                        height: Some(100.0),
-                        overflow: Some(Overflow::Hidden),
-                        transform: Some(NodeTransform { translate_x: 0.0, translate_y: 150.0, scale_x: 1.0, scale_y: 1.0 }),
-                        ..Default::default()
-                    })
-                    .with_children(vec![DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
-                        .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)])]),
-            ]);
-        let layout = DecorationTree::new(root).layout(LogicalRect::new(0, 0, 100, 100)).expect("layout should succeed");
+        let root = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Column,
+        }))
+        .with_style(DecorationStyle {
+            overflow: Some(Overflow::Hidden),
+            ..Default::default()
+        })
+        .with_children(vec![
+            DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
+                .with_style(DecorationStyle {
+                    width: Some(100.0),
+                    height: Some(100.0),
+                    overflow: Some(Overflow::Hidden),
+                    transform: Some(NodeTransform {
+                        translate_x: 0.0,
+                        translate_y: 150.0,
+                        scale_x: 1.0,
+                        scale_y: 1.0,
+                    }),
+                    ..Default::default()
+                })
+                .with_children(vec![
+                    DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
+                        .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)]),
+                ]),
+        ]);
+        let layout = DecorationTree::new(root)
+            .layout(LogicalRect::new(0, 0, 100, 100))
+            .expect("layout should succeed");
         let moved = &layout.root.children[0];
-        let clip = moved.resolved_effective_clip.expect("an empty clip, not none");
+        let clip = moved
+            .resolved_effective_clip
+            .expect("an empty clip, not none");
         assert_eq!((clip.rect.width.raw(), clip.rect.height.raw()), (0, 0));
-        let inner = moved.children[0].resolved_effective_clip.expect("inherited");
+        let inner = moved.children[0]
+            .resolved_effective_clip
+            .expect("inherited");
         assert_eq!((inner.rect.width.raw(), inner.rect.height.raw()), (0, 0));
     }
 

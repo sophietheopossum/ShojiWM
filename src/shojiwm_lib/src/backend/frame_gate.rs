@@ -25,7 +25,10 @@ pub struct FrameGate<K, T> {
 
 impl<K: PartialEq, T> FrameGate<K, T> {
     pub fn new(tracker: OutputDamageTracker) -> Self {
-        Self { tracker, drawn: None }
+        Self {
+            tracker,
+            drawn: None,
+        }
     }
 
     /// What the frame drawn last left, when `elements`, drawn with `key`,
@@ -38,7 +41,10 @@ impl<K: PartialEq, T> FrameGate<K, T> {
             self.drawn = None;
             return None;
         }
-        self.drawn.as_ref().filter(|(drawn_key, _)| drawn_key == key).map(|(_, left)| left)
+        self.drawn
+            .as_ref()
+            .filter(|(drawn_key, _)| drawn_key == key)
+            .map(|(_, left)| left)
     }
 
     /// The elements last passed to `unchanged` were drawn with `key`.
@@ -69,17 +75,31 @@ mod tests {
         let window = DamageOnlyElement::new(Rectangle::new((100, 100).into(), (300, 200).into()));
         let output = Rectangle::from_size((800, 600).into());
         let frame = |rects: &[LogicalRect]| {
-            vec![crate::backend::damage::element_for_output("gate-test", rects, output), window.clone()]
+            vec![
+                crate::backend::damage::element_for_output("gate-test", rects, output),
+                window.clone(),
+            ]
         };
 
-        assert_eq!(gate.unchanged(&frame(&[]), &0), None, "the first frame is drawn");
+        assert_eq!(
+            gate.unchanged(&frame(&[]), &0),
+            None,
+            "the first frame is drawn"
+        );
         gate.drawn(0, "first");
         assert_eq!(gate.unchanged(&frame(&[]), &0), Some(&"first"));
         assert_eq!(gate.unchanged(&frame(&[]), &0), Some(&"first"), "and again");
-        assert_eq!(gate.unchanged(&frame(&[]), &1), None, "drawn differently, so drawn");
+        assert_eq!(
+            gate.unchanged(&frame(&[]), &1),
+            None,
+            "drawn differently, so drawn"
+        );
         gate.drawn(1, "second");
 
-        assert_eq!(gate.unchanged(&frame(&[LogicalRect::new(10, 10, 20, 20)]), &1), None);
+        assert_eq!(
+            gate.unchanged(&frame(&[LogicalRect::new(10, 10, 20, 20)]), &1),
+            None
+        );
         // Not drawn after all (the render failed): the next frame, though it
         // changes nothing more, still has to show the change.
         assert_eq!(gate.unchanged(&frame(&[]), &1), None);
@@ -90,7 +110,11 @@ mod tests {
         gate.forget();
         assert_eq!(gate.unchanged(&frame(&[]), &1), None);
         gate.drawn(1, "fourth");
-        assert_eq!(gate.unchanged(&[window.clone()], &1), None, "an element gone is a change");
+        assert_eq!(
+            gate.unchanged(&[window.clone()], &1),
+            None,
+            "an element gone is a change"
+        );
         gate.drawn(1, "fifth");
         assert_eq!(gate.unchanged(&[window], &1), Some(&"fifth"));
         crate::backend::damage::forget_output("gate-test");
