@@ -70,6 +70,7 @@ use smithay::{
         selection::{
             data_device::DataDeviceState, primary_selection::PrimarySelectionState,
             wlr_data_control::DataControlState,
+            ext_data_control::DataControlState as ExtDataControlState,
         },
         session_lock::{LockSurface, SessionLockManagerState},
         shell::kde::decoration::KdeDecorationState,
@@ -342,6 +343,7 @@ pub struct ShojiWM {
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub data_control_state: DataControlState,
+    pub ext_data_control_state: ExtDataControlState,
     pub popups: PopupManager,
 
     pub seat: Seat<Self>,
@@ -424,6 +426,7 @@ pub struct ShojiWM {
     /// Windows marked dirty while a decoration refresh pass runs (by a host
     /// message it drains, say): the pass must not clear them with the
     /// windows it processed earlier, or their changes are never refreshed.
+    /// Kept by the outermost pass when one runs inside another.
     pub runtime_dirty_marked_during_refresh: Option<std::collections::HashSet<String>>,
     pub runtime_managed_only_window_ids: std::collections::HashSet<String>,
     pub runtime_node_only_window_ids: std::collections::HashSet<String>,
@@ -1668,6 +1671,10 @@ impl ShojiWM {
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
         let data_control_state =
             DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        // Both protocol generations share Smithay's seat selection. Modern
+        // clipboard clients (including Dux) use ext_data_control exclusively.
+        let ext_data_control_state =
+            ExtDataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
 
         // A seat is a group of keyboards, pointer and touch devices.
         // A seat typically has a pointer and maintains a keyboard focus and a pointer focus.
@@ -1822,6 +1829,7 @@ impl ShojiWM {
             data_device_state,
             primary_selection_state,
             data_control_state,
+            ext_data_control_state,
             popups,
             seat,
 
@@ -5324,8 +5332,13 @@ impl ShojiWM {
         self.full_damage_pending_outputs.remove(output_name) || self.force_full_damage
     }
 
+    /// `SHOJI_REDRAW_STATS` / `SHOJI_REDRAW_REASON_DEBUG` name the caller.
+    #[track_caller]
     pub fn schedule_redraw(&mut self) {
         let caller = std::panic::Location::caller();
+        if crate::frame_stats::debugging() {
+            crate::frame_stats::record_redraw_caller(caller);
+        }
         if std::env::var_os("SHOJI_REDRAW_STATS")
             .is_some_and(|value| value != "0" && !value.is_empty())
         {

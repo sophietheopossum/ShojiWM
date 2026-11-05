@@ -1541,6 +1541,23 @@ impl ShojiWM {
                     return;
                 }
                 if self.runtime_input_grab.is_some() {
+                    // A decoration may open a runtime prompt on mouse-down.
+                    // Smithay already saw that press and installed its implicit
+                    // grab. Deliver its matching release even though the grab
+                    // now takes the button, otherwise later decoration clicks
+                    // remain trapped in the old grab after the prompt closes.
+                    if button_state == ButtonState::Released && pointer.is_grabbed() {
+                        pointer.button(
+                            self,
+                            &ButtonEvent {
+                                button,
+                                state: button_state,
+                                serial,
+                                time: event.time(),
+                            },
+                        );
+                        pointer.frame(self);
+                    }
                     self.input_grab_pointer_button(button, button_state, event.time().millis());
                     return;
                 }
@@ -3339,6 +3356,26 @@ impl ShojiWM {
                 target,
             })
             .collect()
+    }
+
+    /// Decorations change shape under a pointer that does not move (a panel
+    /// shrinking away from it): what is hovered follows, as if it had moved,
+    /// instead of keeping a hover the pointer is no longer over. Checked
+    /// after every decoration refresh; a no-op when nothing under it changed.
+    pub(crate) fn refresh_decoration_hover(&mut self) {
+        if self.session_lock_active {
+            return;
+        }
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let pos = pointer.current_location();
+        // No pointer passthrough on this branch: a runtime input grab takes
+        // the pointer everywhere, so hover does not follow it either.
+        if pointer.is_grabbed() || self.runtime_input_grab.is_some() {
+            return;
+        }
+        self.update_decoration_hover_target(pos);
     }
 
     fn update_decoration_hover_target(

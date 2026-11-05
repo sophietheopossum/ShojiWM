@@ -38,6 +38,7 @@ use smithay::{
                 },
             },
             gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture},
+            sync::SyncPoint,
             utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
         session::{Session, libseat::LibSeatSession},
@@ -47,7 +48,8 @@ use smithay::{
     output::{Mode as WlMode, Output, PhysicalProperties},
     reexports::{
         calloop::{
-            LoopHandle, RegistrationToken,
+            Interest, LoopHandle, Mode as PollMode, PostAction, RegistrationToken,
+            generic::Generic,
             timer::{TimeoutAction, Timer},
         },
         drm::control::{ModeTypeFlags, connector, crtc},
@@ -77,6 +79,7 @@ use crate::{
     backend::damage,
     backend::damage_blink,
     backend::decoration,
+    backend::frame_gate::FrameGate,
     backend::snapshot,
     backend::visual::{
         WindowVisualState, is_identity_visual_geometry, requires_full_window_snapshot,
@@ -1085,6 +1088,9 @@ struct DeferredSubmit {
     latency_render_started_at: Option<Duration>,
     /// The vblank the frame was rendered for.
     frame_target: Duration,
+    /// The GPU's fence for the frame, while it may still be drawing it: the
+    /// commit waits for it (`submit_when_rendered`).
+    sync: Option<SyncPoint>,
 }
 
 struct SurfaceData {
@@ -1092,6 +1098,9 @@ struct SurfaceData {
     drm_output: GbmDrmOutput,
     available_modes: Vec<smithay::reexports::drm::control::Mode>,
     blink_damage_tracker: OutputDamageTracker,
+    /// Keeps a redraw with nothing new from repainting the swapchain; see
+    /// [`FrameGate`]. Keyed by the clear color and frame flags drawn with.
+    frame_gate: FrameGate<([f32; 4], FrameFlags), TtyRenderFrameResult>,
     frame_pending: bool,
     /// Latency diagnostic (`SHOJI_LATENCY_TRACE`): see [`LatencyInFlight`].
     latency_in_flight: Option<LatencyInFlight>,
@@ -1455,6 +1464,7 @@ fn render_cross_gpu_frame<E: RenderElement<GlesRenderer>>(
                 states: RenderElementStates {
                     states: Default::default(),
                 },
+                sync: None,
             });
         }
     };
@@ -1479,6 +1489,8 @@ fn render_cross_gpu_frame<E: RenderElement<GlesRenderer>>(
         // The client elements' states (for presentation feedback and dmabuf feedback) come
         // from the render GPU's pass; this GPU only saw the one texture.
         states,
+        // Waited for above.
+        sync: None,
     })
 }
 
@@ -1711,6 +1723,8 @@ fn render_ahead_allowed(surface: &SurfaceData, policy_allows: bool) -> bool {
 }
 
 fn drop_ahead_frame(surface: &mut SurfaceData) {
+    // Every path that drops a rendered frame unshown comes through here.
+    surface.frame_gate.forget();
     surface.ahead_submit = None;
     surface.ahead_held_client_buffers.clear();
     surface.ahead_attempted = false;
@@ -1848,6 +1862,7 @@ fn power_on_surface(surface: &mut SurfaceData) {
     surface.power_cleared = false;
     // The swapchain contents predate the dark period; render the first frame from scratch.
     surface.drm_output.reset_buffers();
+    surface.frame_gate.forget();
     if let Some(target) = surface.cross_gpu.as_mut() {
         target.reset(&surface.output);
     }
@@ -1920,6 +1935,25 @@ struct TtyRenderFrameResult {
     overlay_details: Vec<String>,
     cursor_plane_assigned: bool,
     states: RenderElementStates,
+    /// The fence of a frame composited into the swapchain, which the commit
+    /// must wait for (`render_surface`).
+    sync: Option<SyncPoint>,
+}
+
+impl TtyRenderFrameResult {
+    /// This frame, standing in for a later one that changes nothing.
+    fn unchanged(&self) -> Self {
+        Self {
+            is_empty: true,
+            primary_scanout: self.primary_scanout,
+            primary_plane_kind: self.primary_plane_kind,
+            overlay_plane_count: self.overlay_plane_count,
+            overlay_details: self.overlay_details.clone(),
+            cursor_plane_assigned: self.cursor_plane_assigned,
+            states: self.states.clone(),
+            sync: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2020,9 +2054,25 @@ pub fn device_added(
     let gbm = Device::new(fd.clone())
         .map_err(|error| driver_load_error(path, "create a GBM device", &error))?;
 
-    let egl = unsafe { EGLDisplay::new(gbm.clone()) }
-        .map_err(|error| driver_load_error(path, "initialize EGL", &error))?;
-    let ctx = EGLContext::new_with_priority(&egl, ContextPriority::High)?;
+    // NVIDIA's driver waits for the GPU (a fence, `glFinish`) by spinning on the clock and
+    // `sched_yield`, so every wait still left on this thread (a client's acquire point, a
+    // texture's read fence) costs as much CPU as the GPU takes. `__GL_YIELD=USLEEP` makes it
+    // sleep instead. It is read when the driver loads, here; clients started later do not
+    // inherit it. A value the user set is kept.
+    let gl_yield = std::env::var_os("__GL_YIELD").is_none();
+    if gl_yield {
+        crate::process_env::set_var("__GL_YIELD", "USLEEP");
+    }
+    let loaded = (|| -> Result<_, Box<dyn std::error::Error>> {
+        let egl = unsafe { EGLDisplay::new(gbm.clone()) }
+            .map_err(|error| driver_load_error(path, "initialize EGL", &error))?;
+        let ctx = EGLContext::new_with_priority(&egl, ContextPriority::High)?;
+        Ok((egl, ctx))
+    })();
+    if gl_yield {
+        crate::process_env::remove_var("__GL_YIELD");
+    }
+    let (_egl, ctx) = loaded?;
     let mut renderer = unsafe { GlesRenderer::new(ctx)? };
     // Only the GPU clients render with (the first one opened, which hosts the dmabuf global)
     // binds the display. Binding it on another GPU advertises that GPU's `wl_drm`: on a hybrid
@@ -3067,6 +3117,23 @@ fn submit_deferred_frame(
     let Some(deferred) = surface.deferred_submit.take() else {
         return;
     };
+    if let Some(sync) = deferred.sync.as_ref().filter(|sync| !sync.is_reached()) {
+        let output = surface.output.name();
+        if submit_when_rendered(
+            loop_handle,
+            node,
+            crtc,
+            generation,
+            deadline_scheduled,
+            sync,
+            output.clone(),
+        ) {
+            surface.deferred_submit = Some(deferred);
+            return;
+        }
+        let _ = sync.wait();
+        crate::frame_stats::record(&output, |frames| frames.waited_for_gpu += 1);
+    }
     let queue_started_at = Instant::now();
     let submit_error = {
         timescope::scope!("tty deferred queue_frame");
@@ -3086,6 +3153,7 @@ fn submit_deferred_frame(
             }
             surface.queued_at = Some(queue_started_at);
             surface.queued_cpu_duration = deferred.total_cpu_elapsed;
+            crate::frame_stats::record(&surface.output.name(), |frames| frames.committed += 1);
             surface.skipped_while_pending_count = 0;
             // `frame_pending` and `WaitingForVBlank` were already set when
             // the frame was staged.
@@ -3125,6 +3193,8 @@ fn submit_deferred_frame(
             // no-damage replacement the redraw is one empty render.
             surface.frame_pending = false;
             surface.redraw_state = TtyRedrawState::Idle;
+            // Its elements still have to reach the screen.
+            surface.frame_gate.forget();
             // The staged frame is dropped and will never flip, so no flip releases its hold,
             // and a later empty render does not replace it: an idle output would pin those
             // client buffers indefinitely. Nothing waits for the render here. It was submitted
@@ -3143,6 +3213,44 @@ fn submit_deferred_frame(
             state.schedule_redraw();
         }
     }
+}
+
+/// Commit the frame staged under `generation` once the GPU has finished drawing it:
+/// `submit_deferred_frame` runs when the fence's fd becomes readable. NVIDIA cannot take the
+/// fence with the commit (IN_FENCE_FD, see `render_surface`), and waiting for it on this
+/// thread spins in the driver for as long as the GPU draws, holding up every other output
+/// and input meanwhile. `false` when the fence cannot be exported: the caller waits for it.
+fn submit_when_rendered(
+    loop_handle: &LoopHandle<'_, ShojiWM>,
+    node: DrmNode,
+    crtc: crtc::Handle,
+    generation: u64,
+    deadline_scheduled: bool,
+    sync: &SyncPoint,
+    output: String,
+) -> bool {
+    let Some(fence) = sync.export() else {
+        return false;
+    };
+    let held_at = Instant::now();
+    let callback_loop_handle = loop_handle.clone();
+    loop_handle
+        .insert_source(
+            Generic::new(fence, Interest::READ, PollMode::OneShot),
+            move |_, _, state| {
+                crate::frame_stats::record_gpu_wait(&output, held_at.elapsed());
+                submit_deferred_frame(
+                    state,
+                    &callback_loop_handle,
+                    node,
+                    crtc,
+                    generation,
+                    deadline_scheduled,
+                );
+                Ok(PostAction::Remove)
+            },
+        )
+        .is_ok()
 }
 
 /// Submit a frame that was rendered ahead, now that the flip it waited for completed.
@@ -3874,15 +3982,52 @@ impl RenderElement<GlesRenderer> for ProfiledTtyRenderElement<'_> {
             self.draw_label,
             (dst.size.w, dst.size.h),
         );
-        let result = RenderElement::<GlesRenderer>::draw(
-            self.inner,
-            frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        );
+        let draw = |frame: &mut GlesFrame<'_, '_>| {
+            RenderElement::<GlesRenderer>::draw(
+                self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            )
+        };
+        // The main thread's time per element kind, for ShojiWM's profiler.
+        let result = match self.draw_label {
+            "tty-element-window-draw" => {
+                timescope::scope!("tty draw window");
+                draw(frame)
+            }
+            "tty-element-clipped-draw" => {
+                timescope::scope!("tty draw clipped window");
+                draw(frame)
+            }
+            "tty-element-text-draw" => {
+                timescope::scope!("tty draw text");
+                draw(frame)
+            }
+            "tty-element-snapshot-draw" => {
+                timescope::scope!("tty draw snapshot");
+                draw(frame)
+            }
+            "tty-element-decoration-draw" => {
+                timescope::scope!("tty draw decoration");
+                draw(frame)
+            }
+            "tty-element-backdrop-draw" => {
+                timescope::scope!("tty draw backdrop");
+                draw(frame)
+            }
+            "tty-element-cursor-draw" => {
+                timescope::scope!("tty draw cursor");
+                draw(frame)
+            }
+            _ => {
+                timescope::scope!("tty draw other");
+                draw(frame)
+            }
+        };
         crate::backend::shader_effect::end_gpu_timing_frame_span(frame, timing);
         result
     }
@@ -3898,6 +4043,7 @@ impl RenderElement<GlesRenderer> for ProfiledTtyRenderElement<'_> {
         dst: Rectangle<i32, Physical>,
         cache: &UserDataMap,
     ) -> Result<(), GlesError> {
+        timescope::scope!("tty capture framebuffer");
         let timing = crate::backend::shader_effect::begin_gpu_timing_frame_span(
             frame,
             "tty-element-framebuffer-capture",
@@ -4983,24 +5129,36 @@ fn render_surface(
         };
 
         let mut content_elements: Vec<TtyRenderElements> = Vec::new();
-        // Synthetic DamageOnly elements force the OutputDamageTracker to repaint
-        // regions (decorations, manual invalidation). During the fullscreen fast
-        // path they are actively harmful: the fullscreen surface occludes every
-        // region they target, but as non-scanout elements stacked above the
-        // client surface they knock it off the primary plane. Worse, scanning
-        // out skips the swapchain render, which feeds back as fresh decoration
-        // damage the next frame — so the damage element reappears every other
-        // frame and direct scanout flaps engaged/disengaged at ~30 Hz. The
-        // client surface carries its own damage for smithay's tracker, so
-        // dropping these here is safe and keeps scanout steady.
-        if fullscreen_window.is_none() {
-            content_elements.extend(
-                damage::elements_for_output(&extra_damage, output_geo)
-                    .into_iter()
-                    .map(TtyRenderElements::Damage),
-            );
-        }
-        overlay_below_layers += content_elements.len();
+        // The output's damage elements (`damage::element_for_output`) force the
+        // OutputDamageTracker to repaint regions (decorations, manual
+        // invalidation): one on top of the display's list, one on top of the
+        // captures', each always the topmost of its list so that it never moves
+        // in the stack. While locked there are none, as the lock surface is all
+        // that shows. During the fullscreen fast path they are actively harmful:
+        // the fullscreen surface occludes every region they target, but as
+        // non-scanout elements stacked above the client surface they knock it
+        // off the primary plane. Worse, scanning out skips the swapchain render,
+        // which feeds back as fresh decoration damage the next frame — so the
+        // damage element reappears every other frame and direct scanout flaps
+        // engaged/disengaged at ~30 Hz. The client surface carries its own
+        // damage for smithay's tracker, so dropping these here is safe and keeps
+        // scanout steady.
+        let output_damage =
+            (fullscreen_window.is_none() && !state.session_lock_active).then(|| {
+                let name = output.name();
+                (
+                    damage::element_for_output(
+                        &format!("{name}:display"),
+                        &extra_damage,
+                        output_geo,
+                    ),
+                    damage::element_for_output(
+                        &format!("{name}:capture"),
+                        &extra_damage,
+                        output_geo,
+                    ),
+                )
+            });
         content_elements.extend(scene_elements);
         let live_locker = session_lock_surface_for_output
             .as_ref()
@@ -5089,6 +5247,10 @@ fn render_surface(
                 }),
             );
         }
+        let display_damage = output_damage.map(|(display, capture)| {
+            content_for_capture.insert(0, TtyRenderElements::Damage(capture));
+            TtyRenderElements::Damage(display)
+        });
         // The element count for diagnostics — final elements is built below
         // after capture has run against the by-reference slices.
         timing.render_element_count = cursor_pointer_elements.len() + content_for_capture.len();
@@ -5239,12 +5401,13 @@ fn render_surface(
         // After capture has run against the cursor / content slices by
         // reference, move them into a single element list for the DRM render.
         let mut elements: Vec<TtyRenderElements> = Vec::with_capacity(
-            error_text_elements.len()
+            1 + error_text_elements.len()
                 + error_background_elements.len()
                 + fps_overlay_elements.len()
                 + cursor_elements.len()
                 + content_for_capture.len(),
         );
+        elements.extend(display_damage);
         elements.extend(error_text_elements);
         elements.extend(error_background_elements);
         elements.extend(fps_overlay_elements);
@@ -5254,6 +5417,9 @@ fn render_surface(
         } else {
             elements.extend(content_for_capture);
         }
+        // Frame debugging: which elements changed, and what an age-1 damage
+        // tracker would redraw.
+        crate::frame_stats::probe_frame(&output, &elements);
 
         // HDR10 outputs composite the element list into the fp16
         // intermediate, and the DRM pass renders a single PQ-encode element
@@ -5458,8 +5624,18 @@ fn render_surface(
         // alternating async game frames with vblank-bound cursor frames produces visibly uneven
         // cursor motion even when both the game and the output are otherwise running fast.
         let mut fullscreen_root_buffer_details = None;
+        // Nothing new since the frame drawn last: it stays on screen, unrepainted.
+        let gate_key = (frame_clear_color, frame_flags);
+        let unchanged_frame = surface
+            .frame_gate
+            .unchanged(&elements, &gate_key)
+            .filter(|_| crate::perf_options::PerfOption::FrameGate.enabled())
+            .map(TtyRenderFrameResult::unchanged);
+        let gated = unchanged_frame.is_some();
         let render_frame_result: Result<TtyRenderFrameResult, Box<dyn std::error::Error>> =
-            if let Some(scanout_renderer) = cross_gpu_scanout_renderer.as_deref_mut()
+            if let Some(unchanged_frame) = unchanged_frame {
+                Ok(unchanged_frame)
+            } else if let Some(scanout_renderer) = cross_gpu_scanout_renderer.as_deref_mut()
                 && let Some(target) = surface.cross_gpu.as_mut()
             {
                 timescope::scope!("tty render_frame cross-gpu");
@@ -5497,7 +5673,10 @@ fn render_surface(
                                 element.id(),
                             ));
                         }
-                        if crate::backend::shader_effect::gpu_element_timing_debug_enabled() {
+                        // Also while ShojiWM's profiler runs, which times each element kind.
+                        if crate::backend::shader_effect::gpu_element_timing_debug_enabled()
+                            || timescope::is_profile_enabled()
+                        {
                             let profiled_elements = elements
                                 .iter()
                                 .map(ProfiledTtyRenderElement::new)
@@ -5517,14 +5696,16 @@ fn render_surface(
                                     // needs_sync() is true the page flip would be submitted before
                                     // the GPU finishes rendering, causing the display to scan out a
                                     // partially-rendered buffer and producing visible microstutter
-                                    // during scroll/animation. Block on the swapchain sync point
-                                    // manually before queue_frame commits the flip.
-                                    if result.needs_sync()
-                                        && let PrimaryPlaneElement::Swapchain(ref element) =
-                                            result.primary_element
-                                    {
-                                        let _ = element.sync.wait();
-                                    }
+                                    // during scroll/animation. The commit waits for the
+                                    // swapchain sync point instead (`submit_when_rendered`).
+                                    let sync = match &result.primary_element {
+                                        PrimaryPlaneElement::Swapchain(element)
+                                            if result.needs_sync() =>
+                                        {
+                                            Some(element.sync.clone())
+                                        }
+                                        _ => None,
+                                    };
                                     let primary_scanout = matches!(
                                         result.primary_element,
                                         PrimaryPlaneElement::Element(_)
@@ -5557,6 +5738,7 @@ fn render_surface(
                                         overlay_details,
                                         cursor_plane_assigned: result.cursor_element.is_some(),
                                         states: result.states,
+                                        sync,
                                     }
                                 })
                         } else {
@@ -5570,14 +5752,16 @@ fn render_surface(
                                     // needs_sync() is true the page flip would be submitted before
                                     // the GPU finishes rendering, causing the display to scan out a
                                     // partially-rendered buffer and producing visible microstutter
-                                    // during scroll/animation. Block on the swapchain sync point
-                                    // manually before queue_frame commits the flip.
-                                    if result.needs_sync()
-                                        && let PrimaryPlaneElement::Swapchain(ref element) =
-                                            result.primary_element
-                                    {
-                                        let _ = element.sync.wait();
-                                    }
+                                    // during scroll/animation. The commit waits for the
+                                    // swapchain sync point instead (`submit_when_rendered`).
+                                    let sync = match &result.primary_element {
+                                        PrimaryPlaneElement::Swapchain(element)
+                                            if result.needs_sync() =>
+                                        {
+                                            Some(element.sync.clone())
+                                        }
+                                        _ => None,
+                                    };
                                     let primary_scanout = matches!(
                                         result.primary_element,
                                         PrimaryPlaneElement::Element(_)
@@ -5610,6 +5794,7 @@ fn render_surface(
                                         overlay_details,
                                         cursor_plane_assigned: result.cursor_element.is_some(),
                                         states: result.states,
+                                        sync,
                                     }
                                 })
                         }
@@ -5634,6 +5819,11 @@ fn render_surface(
                 return Err(err);
             }
         };
+        if gated {
+            crate::frame_stats::record(&output.name(), |frames| frames.unchanged += 1);
+        } else {
+            surface.frame_gate.drawn(gate_key, result.unchanged());
+        }
         fps_counter.record_present(output.name().as_str());
         if !result.is_empty {
             // Submitted (now or deferred): hold until `frame_finish`. An empty frame is not
@@ -5996,6 +6186,34 @@ fn render_surface(
                     }
                 }
             }
+            // The GPU may still be drawing the frame. Rather than wait for it here, the
+            // commit is held until its fence signals (`submit_when_rendered`); a frame
+            // rendered ahead or held for the deadline waits for it when it is submitted. A
+            // tearing flip cannot be held (`submit_deferred_frame` commits vblank-synced).
+            let pending_sync = result.sync.clone().filter(|sync| !sync.is_reached());
+            if !rendering_ahead
+                && !deferred
+                && let Some(sync) = pending_sync.as_ref()
+            {
+                let generation = surface.deferred_submit_generation.wrapping_add(1);
+                surface.deferred_submit_generation = generation;
+                if !should_tear
+                    && submit_when_rendered(
+                        loop_handle,
+                        node,
+                        crtc,
+                        generation,
+                        false,
+                        sync,
+                        output.name(),
+                    )
+                {
+                    deferred = true;
+                } else {
+                    let _ = sync.wait();
+                    crate::frame_stats::record(&output.name(), |frames| frames.waited_for_gpu += 1);
+                }
+            }
             if rendering_ahead {
                 // Staged until the flip in flight completes; `frame_finish` submits it.
                 surface.ahead_submit = Some(DeferredSubmit {
@@ -6004,6 +6222,7 @@ fn render_surface(
                     latency_render_started_at: latency_anchor
                         .map(|(anchor_mono, _, _)| anchor_mono),
                     frame_target: frame_time,
+                    sync: pending_sync.clone(),
                 });
             } else if deferred {
                 surface.deferred_submit = Some(DeferredSubmit {
@@ -6012,6 +6231,7 @@ fn render_surface(
                     latency_render_started_at: latency_anchor
                         .map(|(anchor_mono, _, _)| anchor_mono),
                     frame_target: frame_time,
+                    sync: pending_sync.clone(),
                 });
             } else {
                 // Even without the hold (late render or gate off), re-patch
@@ -6074,6 +6294,7 @@ fn render_surface(
                             );
                             return Ok(RenderSurfaceOutcome::CommitFailed);
                         }
+                        surface.frame_gate.forget();
                         return Err(Box::new(err));
                     }
                 }
@@ -6102,6 +6323,7 @@ fn render_surface(
                 }
                 surface.queued_at = Some(queue_started_at);
                 surface.queued_cpu_duration = total_cpu_elapsed;
+                crate::frame_stats::record(&output.name(), |frames| frames.committed += 1);
             }
             surface.frame_pending = true;
             surface.in_flight_frame_target = Some(frame_time);
@@ -6164,6 +6386,7 @@ fn render_surface(
                     .insert(output_name, next_frame_time_ms);
             }
         } else {
+            crate::frame_stats::record(&output.name(), |frames| frames.empty += 1);
             if frame_liveness_debug_enabled() {
                 tracing::info!(
                     output = %output.name(),
@@ -6423,7 +6646,7 @@ fn transform_clipped_elements(
 }
 
 /// `WindowClipElement`s as scene elements, in order. `Clipped` and
-/// `ColorConverted` both draw through the clipped-surface shader.
+/// `Subsurface` both draw through the clipped-surface shader.
 fn window_clip_elements_to_tty(
     elements: Vec<window_render::WindowClipElement>,
     visual: WindowVisualState,
@@ -6432,7 +6655,7 @@ fn window_clip_elements_to_tty(
         .into_iter()
         .flat_map(|element| match element {
             window_render::WindowClipElement::Clipped(element)
-            | window_render::WindowClipElement::ColorConverted(element) => {
+            | window_render::WindowClipElement::Subsurface(element) => {
                 transform_clipped_elements(vec![element], visual)
             }
             window_render::WindowClipElement::Raw(element) => transform_window_elements(
@@ -6509,7 +6732,7 @@ fn window_surface_source_elements_for_window(
                     root_raw_element = Some(element);
                 }
                 window_render::WindowClipElement::Raw(_)
-                | window_render::WindowClipElement::ColorConverted(_) => {}
+                | window_render::WindowClipElement::Subsurface(_) => {}
             }
         }
         if let Some(element) = root_raw_element {
@@ -8565,7 +8788,39 @@ fn backdrop_shader_elements_for_window(
             return Vec::new();
         }
     }
-    let Some(decoration) = window_decorations.get(window).cloned() else {
+    // The few fields the backdrops read, copied out: they update the window's
+    // backdrop cache below, so they cannot borrow it, and cloning the whole state
+    // (its tree, layout and buffers) every frame cost more than drawing them.
+    struct BackdropDecoration {
+        id: String,
+        title: String,
+        app_id: Option<String>,
+        root_rect: crate::ssd::LogicalRect,
+        visual_transform: crate::ssd::WindowTransform,
+        root_subpixel_offset: crate::backend::visual::RootSubpixelEdges,
+        shader_buffers: Vec<crate::backend::shader_effect::CachedShaderEffect>,
+    }
+    let Some(decoration) = window_decorations
+        .get(window)
+        .map(|decoration| BackdropDecoration {
+            id: decoration.snapshot.id.clone(),
+            title: decoration.snapshot.title.clone(),
+            app_id: decoration.snapshot.app_id.clone(),
+            root_rect: decoration.layout.root.rect,
+            visual_transform: decoration.visual_transform,
+            root_subpixel_offset: decoration.root_subpixel_offset,
+            shader_buffers: decoration
+                .shader_buffers
+                .iter()
+                .filter(|cached| {
+                    cached.shader.is_texture_backed()
+                        && (!prefer_framebuffer_backdrops
+                            || !cached.shader.supports_framebuffer_backdrop())
+                })
+                .cloned()
+                .collect(),
+        })
+    else {
         return Vec::new();
     };
     let lower_windows = windows_top_to_bottom
@@ -8584,13 +8839,7 @@ fn backdrop_shader_elements_for_window(
 
     decoration
         .shader_buffers
-        .clone()
         .iter()
-        .filter(|cached| {
-            cached.shader.is_texture_backed()
-                && (!prefer_framebuffer_backdrops
-                    || !cached.shader.supports_framebuffer_backdrop())
-        })
         .filter_map(|cached| {
             let cache_key = format!(
                 "{}@{}@{}",
@@ -8605,13 +8854,13 @@ fn backdrop_shader_elements_for_window(
             let uses_backdrop = cached.shader.uses_backdrop_input();
             let uses_xray = cached.shader.uses_xray_backdrop_input();
             let render_as_backdrop = uses_backdrop || uses_xray;
-            let root_rect = decoration.layout.root.rect;
+            let root_rect = decoration.root_rect;
             let mut hasher = SignatureHasher::default();
             cached.stable_key.hash(&mut hasher);
             let display_rect = if apply_visual_transform {
                 crate::backend::visual::transformed_rect(
                     cached.rect,
-                    decoration.layout.root.rect,
+                    decoration.root_rect,
                     decoration.visual_transform,
                 )
             } else {
@@ -8623,7 +8872,7 @@ fn backdrop_shader_elements_for_window(
                     if apply_visual_transform {
                         crate::backend::visual::transformed_precise_rect(
                             rect,
-                            decoration.layout.root.rect,
+                            decoration.root_rect,
                             decoration.visual_transform,
                         )
                     } else {
@@ -8743,9 +8992,9 @@ fn backdrop_shader_elements_for_window(
 
             if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                 tracing::info!(
-                    window_id = %decoration.snapshot.id,
-                    title = %decoration.snapshot.title,
-                    app_id = ?decoration.snapshot.app_id,
+                    window_id = %decoration.id,
+                    title = %decoration.title,
+                    app_id = ?decoration.app_id,
                     stable_key = %cached.stable_key,
                     source_effect_rect = ?source_effect_rect,
                     source_effect_rect_precise = ?source_effect_rect_precise,
@@ -8786,7 +9035,7 @@ fn backdrop_shader_elements_for_window(
                                 if apply_visual_transform {
                                     crate::backend::visual::transformed_precise_rect(
                                         clip,
-                                        decoration.layout.root.rect,
+                                        decoration.root_rect,
                                         decoration.visual_transform,
                                     )
                                 } else {
@@ -8810,7 +9059,7 @@ fn backdrop_shader_elements_for_window(
                                 let clip = if apply_visual_transform {
                                     crate::backend::visual::transformed_rect(
                                         clip_rect,
-                                        decoration.layout.root.rect,
+                                        decoration.root_rect,
                                         decoration.visual_transform,
                                     )
                                 } else {
@@ -8875,7 +9124,7 @@ fn backdrop_shader_elements_for_window(
                             local_sample_rect,
                             local_capture_rect,
                             &cached.shader,
-                            alpha,
+                            alpha * cached.opacity,
                             scale.x as f32,
                             [0.0, 0.0],
                             clip_rect,
@@ -8884,15 +9133,15 @@ fn backdrop_shader_elements_for_window(
                                 .unwrap_or(cached.clip_radius as f32),
                             format!(
                                 "window-backdrop:{}:{}",
-                                decoration.snapshot.id, cached.stable_key
+                                decoration.id, cached.stable_key
                             ),
                         )
                         .ok()?;
                     if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                         tracing::info!(
-                            window_id = %decoration.snapshot.id,
-                            title = %decoration.snapshot.title,
-                            app_id = ?decoration.snapshot.app_id,
+                            window_id = %decoration.id,
+                            title = %decoration.title,
+                            app_id = ?decoration.app_id,
                             stable_key = %cached.stable_key,
                             local_rect = ?local_rect,
                             local_sample_rect = ?local_sample_rect,
@@ -8913,7 +9162,7 @@ fn backdrop_shader_elements_for_window(
                             sample_region.size.h,
                         );
                         let backdrop_sample_key =
-                            format!("{}:{}:{}", output.name(), decoration.snapshot.id, cached.stable_key);
+                            format!("{}:{}:{}", output.name(), decoration.id, cached.stable_key);
                         let previous_backdrop_sample =
                             previous_backdrop_sample_state(
                                 &backdrop_sample_key,
@@ -9059,7 +9308,7 @@ fn backdrop_shader_elements_for_window(
                     debug_scene_geometry_snapshot(&backdrop_scene, scale);
                 let (xray_union, xray_first) = debug_scene_geometry_snapshot(&xray_scene, scale);
                 tracing::info!(
-                    window_id = %decoration.snapshot.id,
+                    window_id = %decoration.id,
                     stable_key = %cached.stable_key,
                     source_effect_rect = ?source_effect_rect,
                     source_effect_rect_precise = ?source_effect_rect_precise,
@@ -9094,7 +9343,7 @@ fn backdrop_shader_elements_for_window(
                 renderer,
                 format!(
                     "tty:window-backdrop:{}:{}",
-                    decoration.snapshot.id, cache_key
+                    decoration.id, cache_key
                 ),
                 input_texture,
                 xray_texture,
@@ -9155,7 +9404,7 @@ fn backdrop_shader_elements_for_window(
                         if apply_visual_transform {
                             crate::backend::visual::transformed_precise_rect(
                                 clip,
-                                decoration.layout.root.rect,
+                                decoration.root_rect,
                                 decoration.visual_transform,
                             )
                         } else {
@@ -9179,7 +9428,7 @@ fn backdrop_shader_elements_for_window(
                         let clip = if apply_visual_transform {
                             crate::backend::visual::transformed_rect(
                                 clip_rect,
-                                decoration.layout.root.rect,
+                                decoration.root_rect,
                                 decoration.visual_transform,
                             )
                         } else {
@@ -9227,7 +9476,7 @@ fn backdrop_shader_elements_for_window(
                 local_sample_rect,
                 local_capture_rect,
                 &cached.shader,
-                alpha,
+                alpha * cached.opacity,
                 scale.x as f32,
                 [0.0, 0.0],
                 clip_rect,
@@ -9236,15 +9485,15 @@ fn backdrop_shader_elements_for_window(
                     .unwrap_or(cached.clip_radius as f32),
                 format!(
                     "window-backdrop:{}:{}",
-                    decoration.snapshot.id, cached.stable_key
+                    decoration.id, cached.stable_key
                 ),
             )
             .ok()?;
             if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                 tracing::info!(
-                    window_id = %decoration.snapshot.id,
-                    title = %decoration.snapshot.title,
-                    app_id = ?decoration.snapshot.app_id,
+                    window_id = %decoration.id,
+                    title = %decoration.title,
+                    app_id = ?decoration.app_id,
                     stable_key = %cached.stable_key,
                     local_rect = ?local_rect,
                     local_sample_rect = ?local_sample_rect,
@@ -9266,7 +9515,7 @@ fn backdrop_shader_elements_for_window(
                     sample_region.size.h,
                 );
                 let backdrop_sample_key =
-                    format!("{}:{}:{}", output.name(), decoration.snapshot.id, cached.stable_key);
+                    format!("{}:{}:{}", output.name(), decoration.id, cached.stable_key);
                 let previous_backdrop_sample = previous_backdrop_sample_state(
                     &backdrop_sample_key,
                     BackdropSampleFrameState {
@@ -11051,13 +11300,30 @@ fn configured_background_effect_elements_for_window(
     usize,
     crate::backend::shader_effect::StableBackdropTextureElement,
 )> {
-    let Some(decoration) = window_decorations.get(window).cloned() else {
+    let Some(decoration) = window_decorations.get(window) else {
         return Vec::new();
     };
-    let rects = protocol_background_effect_rects_for_window(window, &decoration);
+    let rects = protocol_background_effect_rects_for_window(window, decoration);
     if rects.is_empty() {
         return Vec::new();
     }
+    // What the effect reads of the decoration, copied out: it updates the
+    // window's backdrop cache below, and this ran for every window, every frame,
+    // as a clone of the whole state.
+    struct EffectDecoration {
+        id: String,
+        title: String,
+        app_id: Option<String>,
+        root_rect: crate::ssd::LogicalRect,
+        visual_transform: crate::ssd::WindowTransform,
+    }
+    let decoration = EffectDecoration {
+        id: decoration.snapshot.id.clone(),
+        title: decoration.snapshot.title.clone(),
+        app_id: decoration.snapshot.app_id.clone(),
+        root_rect: decoration.layout.root.rect,
+        visual_transform: decoration.visual_transform,
+    };
     let lower_windows = windows_top_to_bottom
         .iter()
         .skip(window_index + 1)
@@ -11085,7 +11351,7 @@ fn configured_background_effect_elements_for_window(
             let effect_rect = if apply_visual_transform {
                 crate::backend::visual::transformed_rect(
                     rect,
-                    decoration.layout.root.rect,
+                    decoration.root_rect,
                     decoration.visual_transform,
                 )
             } else {
@@ -11174,8 +11440,8 @@ fn configured_background_effect_elements_for_window(
                 {
                     let local_rect = smithay::utils::Rectangle::new(
                         smithay::utils::Point::from((
-                            effect_rect.x - decoration.layout.root.rect.x,
-                            effect_rect.y - decoration.layout.root.rect.y,
+                            effect_rect.x - decoration.root_rect.x,
+                            effect_rect.y - decoration.root_rect.y,
                         )),
                         (effect_rect.width, effect_rect.height).into(),
                     );
@@ -11189,7 +11455,7 @@ fn configured_background_effect_elements_for_window(
                     let geometry =
                         crate::backend::visual::relative_physical_rect_from_root_global_origin_size(
                             effect_rect,
-                            decoration.layout.root.rect,
+                            decoration.root_rect,
                             output_geo,
                             scale,
                         );
@@ -11208,7 +11474,7 @@ fn configured_background_effect_elements_for_window(
                         [0.0, 0.0],
                         None,
                         0.0,
-                        format!("protocol-window:{}:{}", decoration.snapshot.id, stable_key),
+                        format!("protocol-window:{}:{}", decoration.id, stable_key),
                     )
                     .ok()
                     .map(|element| (index, element));
@@ -11274,12 +11540,12 @@ fn configured_background_effect_elements_for_window(
             );
             if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                 tracing::info!(
-                    window_id = %decoration.snapshot.id,
-                    title = %decoration.snapshot.title,
-                    app_id = ?decoration.snapshot.app_id,
+                    window_id = %decoration.id,
+                    title = %decoration.title,
+                    app_id = ?decoration.app_id,
                     stable_key = %stable_key,
                     effect_rect = ?effect_rect,
-                    root_rect = ?decoration.layout.root.rect,
+                    root_rect = ?decoration.root_rect,
                     output_geo = ?output_geo,
                     blur_padding,
                     capture_geo = ?capture_geo,
@@ -11289,8 +11555,8 @@ fn configured_background_effect_elements_for_window(
                     output_size = ?output_size,
                     local_rect = ?smithay::utils::Rectangle::<i32, Logical>::new(
                         smithay::utils::Point::from((
-                            effect_rect.x - decoration.layout.root.rect.x,
-                            effect_rect.y - decoration.layout.root.rect.y,
+                            effect_rect.x - decoration.root_rect.x,
+                            effect_rect.y - decoration.root_rect.y,
                         )),
                         (effect_rect.width, effect_rect.height).into(),
                     ),
@@ -11303,7 +11569,7 @@ fn configured_background_effect_elements_for_window(
                     ),
                     geometry = ?crate::backend::visual::relative_physical_rect_from_root_global_origin_size(
                         effect_rect,
-                        decoration.layout.root.rect,
+                        decoration.root_rect,
                         output_geo,
                         scale,
                     ),
@@ -11326,7 +11592,7 @@ fn configured_background_effect_elements_for_window(
                 renderer,
                 format!(
                     "tty:protocol-window:{}:{}",
-                    decoration.snapshot.id, cache_key
+                    decoration.id, cache_key
                 ),
                 input_texture,
                 xray_texture,
@@ -11376,8 +11642,8 @@ fn configured_background_effect_elements_for_window(
             }
             let local_rect = smithay::utils::Rectangle::new(
                 smithay::utils::Point::from((
-                    effect_rect.x - decoration.layout.root.rect.x,
-                    effect_rect.y - decoration.layout.root.rect.y,
+                    effect_rect.x - decoration.root_rect.x,
+                    effect_rect.y - decoration.root_rect.y,
                 )),
                 (effect_rect.width, effect_rect.height).into(),
             );
@@ -11391,7 +11657,7 @@ fn configured_background_effect_elements_for_window(
             let geometry =
                 crate::backend::visual::relative_physical_rect_from_root_global_origin_size(
                     effect_rect,
-                    decoration.layout.root.rect,
+                    decoration.root_rect,
                     output_geo,
                     scale,
                 );
@@ -11418,7 +11684,7 @@ fn configured_background_effect_elements_for_window(
                 [0.0, 0.0],
                 None,
                 0.0,
-                format!("protocol-window:{}:{}", decoration.snapshot.id, stable_key),
+                format!("protocol-window:{}:{}", decoration.id, stable_key),
             )
             .ok()
             .map(|element| (index, element))
@@ -11612,7 +11878,7 @@ fn window_scene_elements_for_capture(
             for element in clipped {
                 match element {
                     window_render::WindowClipElement::Clipped(element)
-                    | window_render::WindowClipElement::ColorConverted(element) => {
+                    | window_render::WindowClipElement::Subsurface(element) => {
                         clipped_elements.push(element);
                     }
                     window_render::WindowClipElement::Raw(element) => {
@@ -12656,6 +12922,7 @@ fn connector_connected(
         drm_output,
         available_modes: connector.modes().to_vec(),
         blink_damage_tracker: OutputDamageTracker::from_output(&output),
+        frame_gate: FrameGate::new(OutputDamageTracker::from_output(&output)),
         frame_pending: false,
         latency_in_flight: None,
         queued_at: None,
@@ -12768,6 +13035,8 @@ fn connector_disconnected(
     state.damage_blink_pending.remove(&output_name);
     state.damage_blink_capture_suppression.remove(&output_name);
     state.pending_decoration_damage.clear();
+    damage::forget_output(&format!("{output_name}:display"));
+    damage::forget_output(&format!("{output_name}:capture"));
     announce_output_icc_profiles(state);
     state.apply_runtime_display_configuration();
     state.notify_runtime_outputs_changed();
@@ -15043,7 +15312,7 @@ fn tty_window_stack_elements(
                             window_render::WindowClipElement::Raw(_) => {}
                             // A subsurface; only scenes that take every client
                             // surface include it, as with the clipped ones.
-                            window_render::WindowClipElement::ColorConverted(element) => {
+                            window_render::WindowClipElement::Subsurface(element) => {
                                 if clip_all_client_surfaces {
                                     snapshot_scene.push(TtyRenderElements::Clipped(element));
                                 }
@@ -15230,7 +15499,7 @@ fn tty_window_stack_elements(
                 if crate::env_flag!("SHOJI_GAP_DEBUG") {
                     let first_geometry = clipped.first().map(|element| match element {
                         window_render::WindowClipElement::Clipped(element)
-                        | window_render::WindowClipElement::ColorConverted(element) => {
+                        | window_render::WindowClipElement::Subsurface(element) => {
                             smithay::backend::renderer::element::Element::geometry(element, scale)
                         }
                         window_render::WindowClipElement::Raw(element) => {
@@ -15649,7 +15918,7 @@ fn tty_window_stack_elements(
                         .into_iter()
                         .flat_map(|element| match element {
                             window_render::WindowClipElement::Clipped(element)
-                            | window_render::WindowClipElement::ColorConverted(element) => {
+                            | window_render::WindowClipElement::Subsurface(element) => {
                                 transform_clipped_elements(vec![element], visual_state)
                             }
                             window_render::WindowClipElement::Raw(element) => {
@@ -15728,7 +15997,7 @@ fn tty_window_stack_elements(
                     .into_iter()
                     .flat_map(|element| match element {
                         window_render::WindowClipElement::Clipped(element)
-                        | window_render::WindowClipElement::ColorConverted(element) => {
+                        | window_render::WindowClipElement::Subsurface(element) => {
                             transform_clipped_elements(vec![element], visual_state)
                         }
                         window_render::WindowClipElement::Raw(element) => {

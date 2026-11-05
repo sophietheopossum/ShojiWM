@@ -56,6 +56,9 @@ pub struct CachedDecorationLabel {
     pub text: String,
     pub color: Color,
     pub buffer: MemoryRenderBuffer,
+    /// The node's opacity (its ancestors' included), applied when drawn so
+    /// a fade does not rasterize the text again at every step.
+    pub opacity: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +142,7 @@ impl TextRasterizer {
                 text: spec.text.clone(),
                 color: spec.color,
                 buffer: cached.buffer.clone(),
+                opacity: 1.0,
             });
         }
 
@@ -171,6 +175,7 @@ impl TextRasterizer {
             clip_radius_precise: None,
             text: spec.text.clone(),
             color: spec.color,
+            opacity: 1.0,
             buffer: MemoryRenderBuffer::from_slice(
                 &rendered.pixels,
                 Fourcc::Argb8888,
@@ -208,7 +213,7 @@ impl TextRasterizer {
         let metrics = Metrics::new(font_size, line_height.max(1.0));
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
-        let attrs = attrs_for_spec(spec);
+        let attrs = attrs_for_spec(spec, &self.font_system);
         let alignment = alignment_for_spec(spec.text_align.as_deref());
 
         let shape = |buffer: &mut Buffer, font_system: &mut FontSystem, text: &str| {
@@ -240,9 +245,16 @@ impl TextRasterizer {
 
         let mut pixels = vec![0u8; (target_width * target_height * 4) as usize];
         let text_color = CosmicColor::rgba(spec.color.r, spec.color.g, spec.color.b, spec.color.a);
+        // cosmic-text hands each glyph pixel the colour with its alpha
+        // replaced by the glyph's coverage: the colour's own alpha has to be
+        // applied here, or a translucent text colour (a secondary label)
+        // draws fully opaque.
+        let text_alpha = u16::from(spec.color.a);
         {
             let mut buffer = buffer.borrow_with(&mut self.font_system);
             buffer.draw(&mut self.swash_cache, text_color, |x, y, w, h, color| {
+                let (r, g, b, coverage) = color.as_rgba_tuple();
+                let rgba = (r, g, b, ((u16::from(coverage) * text_alpha) / 255) as u8);
                 for off_y in 0..h as i32 {
                     for off_x in 0..w as i32 {
                         let px = x + off_x;
@@ -250,7 +262,7 @@ impl TextRasterizer {
                         if px < 0 || py < 0 || px >= target_width || py >= target_height {
                             continue;
                         }
-                        blend_pixel(&mut pixels, target_width, px, py, color.as_rgba_tuple());
+                        blend_pixel(&mut pixels, target_width, px, py, rgba);
                     }
                 }
             });
@@ -315,7 +327,7 @@ impl LabelMeasurer {
             .unwrap_or(font_size.ceil() + crate::ssd::DEFAULT_LABEL_LINE_GAP as f32);
         let metrics = Metrics::new(font_size, line_height.max(1.0));
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        let attrs = attrs_for_spec(spec);
+        let attrs = attrs_for_spec(spec, &self.font_system);
 
         {
             let mut buffer = buffer.borrow_with(&mut self.font_system);
@@ -610,7 +622,7 @@ pub(crate) fn memory_text_element(
         renderer,
         physical.loc.to_f64(),
         &label.buffer,
-        Some(alpha.clamp(0.0, 1.0)),
+        Some((alpha * label.opacity).clamp(0.0, 1.0)),
         None,
         None,
         Kind::Unspecified,
@@ -676,25 +688,54 @@ pub(crate) fn memory_text_element(
     }
 }
 
-fn attrs_for_spec<'a>(spec: &'a LabelSpec) -> Attrs<'a> {
-    let mut attrs = Attrs::new()
+/// Resolve the advertised family stack before shaping. Passing an unavailable
+/// family to cosmic-text skips the remaining preferred families; its script
+/// fallback can even choose bitmap emoji for ordinary semibold digits.
+fn resolve_font_family<'a>(
+    families: impl IntoIterator<Item = &'a str>,
+    available: impl Fn(&str) -> bool,
+) -> CosmicFamily<'a> {
+    for family in families {
+        let generic = match family.to_ascii_lowercase().as_str() {
+            "sans-serif" | "ui-sans-serif" | "system-ui" => Some(CosmicFamily::SansSerif),
+            "serif" | "ui-serif" => Some(CosmicFamily::Serif),
+            "monospace" | "ui-monospace" => Some(CosmicFamily::Monospace),
+            "cursive" => Some(CosmicFamily::Cursive),
+            "fantasy" => Some(CosmicFamily::Fantasy),
+            _ => None,
+        };
+        if let Some(generic) = generic {
+            return generic;
+        }
+        if available(family) {
+            return CosmicFamily::Name(family);
+        }
+    }
+    CosmicFamily::SansSerif
+}
+
+fn attrs_for_spec<'a>(spec: &'a LabelSpec, font_system: &FontSystem) -> Attrs<'a> {
+    let family = resolve_font_family(
+        spec.font_family.iter().flatten().map(String::as_str),
+        |family| {
+            font_system.db().faces().any(|face| {
+                face.families
+                    .iter()
+                    // fontdb and cosmic-text match named families exactly.
+                    .any(|(name, _)| name == family)
+            })
+        },
+    );
+    Attrs::new()
         .color(CosmicColor::rgba(
             spec.color.r,
             spec.color.g,
             spec.color.b,
             spec.color.a,
         ))
-        .weight(CosmicWeight(parse_font_weight(spec.font_weight.as_ref())));
-
-    if let Some(family) = spec
-        .font_family
-        .as_ref()
-        .and_then(|families| families.first())
-    {
-        attrs = attrs.family(CosmicFamily::Name(family.as_str()));
-    }
-
-    attrs.style(CosmicStyle::Normal)
+        .weight(CosmicWeight(parse_font_weight(spec.font_weight.as_ref())))
+        .family(family)
+        .style(CosmicStyle::Normal)
 }
 
 fn alignment_for_spec(text_align: Option<&str>) -> Option<Align> {
@@ -762,7 +803,54 @@ fn intersect_logical_rect(
 
 #[cfg(test)]
 mod tests {
-    use super::ellipsize;
+    use super::{CosmicFamily, ellipsize, resolve_font_family};
+
+    #[test]
+    fn font_family_stack_uses_first_installed_preference() {
+        let stack = ["SF Pro Text", "SF Pro", "Inter", "sans-serif"];
+        assert_eq!(
+            resolve_font_family(stack, |name| name == "SF Pro" || name == "Inter"),
+            CosmicFamily::Name("SF Pro")
+        );
+        assert_eq!(
+            resolve_font_family(stack, |name| name == "Inter"),
+            CosmicFamily::Name("Inter")
+        );
+    }
+
+    #[test]
+    fn font_family_stack_preserves_available_primary_face() {
+        assert_eq!(
+            resolve_font_family(["SF Pro Text", "sans-serif"], |_| true),
+            CosmicFamily::Name("SF Pro Text")
+        );
+    }
+
+    #[test]
+    fn font_family_stack_maps_generic_families_instead_of_literal_names() {
+        for (name, expected) in [
+            ("Sans-Serif", CosmicFamily::SansSerif),
+            ("system-ui", CosmicFamily::SansSerif),
+            ("serif", CosmicFamily::Serif),
+            ("monospace", CosmicFamily::Monospace),
+            ("cursive", CosmicFamily::Cursive),
+            ("fantasy", CosmicFamily::Fantasy),
+        ] {
+            assert_eq!(
+                resolve_font_family(["Missing preferred face", name, "Later face"], |_| false),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn font_family_stack_missing_or_empty_uses_generic_sans() {
+        assert_eq!(
+            resolve_font_family(["Missing preferred face"], |_| false),
+            CosmicFamily::SansSerif
+        );
+        assert_eq!(resolve_font_family([], |_| false), CosmicFamily::SansSerif);
+    }
 
     fn at_most(chars: usize) -> impl FnMut(&str) -> bool {
         move |text: &str| text.chars().count() <= chars
