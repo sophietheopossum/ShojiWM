@@ -208,12 +208,14 @@ impl IpcServer {
                 let handler = handlers.borrow().get(&request.method).cloned();
                 let _noted = crate::watchdog::note(&format!("ipc {}", request.method));
                 let response = match handler {
-                    Some(handler) => match handler(&request.params, &IpcClient(request.client.clone())) {
-                        Ok(Some(result)) => json!({ "result": result }),
-                        // Like a TypeScript handler that returns nothing.
-                        Ok(None) => json!({}),
-                        Err(error) => json!({ "error": error }),
-                    },
+                    Some(handler) => {
+                        match handler(&request.params, &IpcClient(request.client.clone())) {
+                            Ok(Some(result)) => json!({ "result": result }),
+                            // Like a TypeScript handler that returns nothing.
+                            Ok(None) => json!({}),
+                            Err(error) => json!({ "error": error }),
+                        }
+                    }
                     None => json!({ "error": format!("unknown method: {}", request.method) }),
                 };
                 if let Some(id) = request.id {
@@ -243,7 +245,8 @@ impl IpcServer {
                             continue;
                         }
                     };
-                    let (Ok(reader), Ok(mut writer)) = (stream.try_clone(), stream.try_clone()) else {
+                    let (Ok(reader), Ok(mut writer)) = (stream.try_clone(), stream.try_clone())
+                    else {
                         continue;
                     };
                     let (outbox, frames) = sync_channel::<String>(CLIENT_QUEUE_FRAMES);
@@ -454,7 +457,9 @@ mod tests {
         let path = scratch.path("live.sock");
         let live = UnixListener::bind(&path).expect("live server");
 
-        let error = IpcServer::bind(path.clone()).err().expect("a served path must be refused");
+        let error = IpcServer::bind(path.clone())
+            .err()
+            .expect("a served path must be refused");
         assert_eq!(error.kind(), ErrorKind::AddrInUse);
 
         // The live server keeps its socket and still accepts.
@@ -493,7 +498,9 @@ mod tests {
 
     fn connect(path: &Path) -> (UnixStream, BufReader<UnixStream>) {
         let stream = UnixStream::connect(path).expect("connect");
-        stream.set_read_timeout(Some(Duration::from_millis(5))).expect("timeout");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .expect("timeout");
         let reader = BufReader::new(stream.try_clone().expect("clone"));
         (stream, reader)
     }
@@ -529,9 +536,17 @@ mod tests {
             }
             frames.len() == 2
         });
-        let id = frames[1]["result"].as_u64().expect("the reply carries the client id");
-        assert_eq!(frames[0], json!({ "event": "subscribed", "payload": { "client": id } }));
-        assert!(try_read(&mut bystander_in).is_none(), "the other client gets nothing");
+        let id = frames[1]["result"]
+            .as_u64()
+            .expect("the reply carries the client id");
+        assert_eq!(
+            frames[0],
+            json!({ "event": "subscribed", "payload": { "client": id } })
+        );
+        assert!(
+            try_read(&mut bystander_in).is_none(),
+            "the other client gets nothing"
+        );
 
         writeln!(caller, r#"{{"id":2,"method":"quiet"}}"#).expect("send");
         let mut reply = None;
@@ -539,7 +554,11 @@ mod tests {
             reply = reply.take().or_else(|| try_read(&mut caller_in));
             reply.is_some()
         });
-        assert_eq!(reply, Some(json!({ "id": 2 })), "no result key, like a void TS handler");
+        assert_eq!(
+            reply,
+            Some(json!({ "id": 2 })),
+            "no result key, like a void TS handler"
+        );
         server.close();
         runtime::reset();
     }
@@ -550,9 +569,14 @@ mod tests {
         let path = scratch.path("file.sock");
         std::fs::write(&path, "not a socket").expect("file");
 
-        let error = IpcServer::bind(path.clone()).err().expect("a regular file must be refused");
+        let error = IpcServer::bind(path.clone())
+            .err()
+            .expect("a regular file must be refused");
         assert_eq!(error.kind(), ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read_to_string(&path).expect("file kept"), "not a socket");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file kept"),
+            "not a socket"
+        );
     }
 
     #[test]
@@ -577,7 +601,10 @@ mod tests {
                 break;
             }
         }
-        assert!(slowest < Duration::from_millis(100), "a broadcast blocked for {slowest:?}");
+        assert!(
+            slowest < Duration::from_millis(100),
+            "a broadcast blocked for {slowest:?}"
+        );
         assert_eq!(server.client_count(), 0, "the stuck client is dropped");
         server.close();
         runtime::reset();
@@ -604,7 +631,13 @@ mod tests {
 
         // No broadcast prunes it: the server lets go of the connection as
         // soon as the client hangs up, even while the config holds a handle.
-        wait_for(|| server.clients.lock().map(|clients| clients.is_empty()).unwrap_or(false));
+        wait_for(|| {
+            server
+                .clients
+                .lock()
+                .map(|clients| clients.is_empty())
+                .unwrap_or(false)
+        });
         let kept = kept.borrow().clone().expect("handle");
         assert!(!kept.is_alive());
         kept.send("late", json!(null));
@@ -636,7 +669,11 @@ mod tests {
         runtime::set_enabled(true);
         runtime::emit(
             |listeners| listeners.enable.clone(),
-            |listener| listener(&crate::compositor::EnableEvent { reason: "initial".into() }),
+            |listener| {
+                listener(&crate::compositor::EnableEvent {
+                    reason: "initial".into(),
+                })
+            },
         );
         assert!(UnixStream::connect(&path).is_ok(), "listening after enable");
         server.close();
