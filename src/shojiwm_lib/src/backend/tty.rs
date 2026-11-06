@@ -2528,6 +2528,56 @@ mod implicit_sync_tests {
     }
 }
 
+#[cfg(test)]
+mod connector_publication_tests {
+    /// A failed first modeset is retried several times. Publishing the
+    /// `wl_output` global before `initialize_output` succeeds therefore gives
+    /// clients a rapid add/remove/add sequence for an output that never lit;
+    /// GTK/GDK clients have segfaulted handling that churn after resume. This
+    /// hardware path has no fake-DRM harness, so pin the call ordering here:
+    /// `connector_connected` itself must not publish or map before the
+    /// initialization result exists, and the surface must be stored before
+    /// display configuration publishes it.
+    #[test]
+    fn connector_connected_does_not_publish_before_initialization_succeeds() {
+        let source = include_str!("tty.rs");
+        let start = source
+            .find("fn connector_connected(\n")
+            .expect("connector_connected exists");
+        let end = start
+            + source[start..]
+                .find("\nfn connector_disconnected(")
+                .expect("connector_connected is followed by connector_disconnected");
+        let body = &source[start..end];
+
+        let initialized = body
+            .find("let initialized = {")
+            .expect("connector_connected keeps DRM initialization in a scoped result");
+        for call in [
+            "state.create_output_global(&output)",
+            "state.space.map_output(&output",
+        ] {
+            if let Some(position) = body.find(call) {
+                assert!(
+                    position > initialized,
+                    "{call} publishes the output before DRM initialization succeeds"
+                );
+            }
+        }
+
+        let stored = body
+            .find("backend.surfaces.insert(crtc, surface)")
+            .expect("connector_connected stores the initialized surface");
+        let configured = body
+            .find("state.apply_runtime_display_configuration()")
+            .expect("connector_connected applies the display configuration");
+        assert!(
+            stored < configured,
+            "publish only after storing the surface"
+        );
+    }
+}
+
 /// Every client buffer that the next render of `output` can sample and that needs a hold: the
 /// windows drawn on it (`windows`, with their popups and subsurfaces), its layer
 /// surfaces, its session-lock surface and a surface cursor while the pointer is on it. See
@@ -12564,28 +12614,13 @@ pub struct PendingConnectorRetry {
 const CONNECTOR_RETRY_MAX_ATTEMPTS: u32 = 8;
 const CONNECTOR_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Undo the output `connector_connected` publishes before the CRTC exists.
+/// Discard the color state prepared for a connector whose first modeset failed.
 ///
-/// `initialize_output` is the first call that can fail, and by then the
-/// `wl_output` global has been advertised and mapped into the space: clients
-/// already see the output and lay windows out on it. Leaving that behind is
-/// strictly worse than never having connected -- the panel is dark while every
-/// client believes it is usable, which is exactly how one rejected post-resume
-/// modeset turns into a blank ScreenPad with windows stranded on it.
-///
-/// `connector_disconnected` cannot do this job: it keys off
-/// `backend.surfaces.remove(&crtc)` and returns immediately when that is empty,
-/// which is precisely the state a failure leaves behind.
-fn unwind_half_connected_output(
-    state: &mut ShojiWM,
-    node: DrmNode,
-    output: &Output,
-    output_name: &str,
-) {
-    // Remove unconditionally, then destroy the blob if there was one: the
-    // kernel only frees property blobs when the DRM fd closes, and this device
-    // stays open across hotplugs, so a retry loop would otherwise leak one blob
-    // per attempt.
+/// The output is deliberately unpublished at this point, so there is no
+/// `wl_output` global or space mapping to undo. The HDR metadata blob still
+/// needs explicit destruction: the kernel only frees property blobs when the
+/// DRM fd closes, and this device stays open across hotplugs and retries.
+fn discard_failed_connector_color_state(state: &mut ShojiWM, node: DrmNode, output_name: &str) {
     let color_state = state.output_color.remove(output_name);
     if let Some(blob) = color_state.and_then(|color| color.hdr_metadata_blob)
         && let Some(backend) = state.tty_backends.get(&node)
@@ -12595,10 +12630,6 @@ fn unwind_half_connected_output(
             blob,
         );
     }
-    state.space.unmap_output(output);
-    state.remove_output_global(output);
-    state.screencopy_state.remove_output(output);
-    state.output_capture_mirrors.remove(output_name);
 }
 
 /// Record a connector whose connect attempt failed, so it can be retried.
@@ -12825,18 +12856,9 @@ fn connector_connected(
     let frame_duration = Duration::from_secs_f64(1_000f64 / wl_mode.refresh as f64);
     output.set_preferred(wl_mode);
     output.change_current_state(Some(wl_mode), None, None, Some((0, 0).into()));
-    state.seed_xwayland_refresh_override_from_output(&output, "tty-output-connected");
-    state.create_output_global(&output);
-    state.space.map_output(&output, (0, 0));
-    info!(
-        ?node,
-        ?crtc,
-        output = %output.name(),
-        size = ?wl_mode.size,
-        refresh_mhz = wl_mode.refresh,
-        available_modes = ?available_modes,
-        "connected tty output"
-    );
+    // Keep this output unpublished until its surface exists below. A failed
+    // first modeset is retried, and advertising it here would churn
+    // `wl_output` global add/remove cycles for a panel that never lit.
 
     // An output of a GPU other than the one clients render with is rendered on the latter and
     // copied over (see `CrossGpuTarget`). Its clients are then best served buffers for the
@@ -12855,8 +12877,8 @@ fn connector_connected(
         });
 
     // Scoped so the `backend` borrow ends before the failure path touches
-    // `state` again. Everything published above this point is undone on error
-    // rather than propagated as-is -- see `unwind_half_connected_output`.
+    // `state` again. The output remains unpublished throughout this attempt;
+    // on error only its prepared color state is discarded.
     let initialized = {
         let backend = state.tty_backends.get_mut(&node).unwrap();
         // Bind this to its own statement so the `drm_output_manager` guard is dropped at
@@ -12908,7 +12930,7 @@ fn connector_connected(
     let (drm_output, dmabuf_feedback) = match initialized {
         Ok(pair) => pair,
         Err(err) => {
-            unwind_half_connected_output(state, node, &output, &output.name());
+            discard_failed_connector_color_state(state, node, &output.name());
             return Err(err);
         }
     };
@@ -12988,9 +13010,20 @@ fn connector_connected(
     if let Some(surface) = backend.surfaces.get_mut(&crtc) {
         surface.redraw_state = TtyRedrawState::Queued;
     }
+    state.seed_xwayland_refresh_override_from_output(&output, "tty-output-connected");
+    info!(
+        ?node,
+        ?crtc,
+        output = %output.name(),
+        size = ?wl_mode.size,
+        refresh_mhz = wl_mode.refresh,
+        available_modes = ?available_modes,
+        "connected tty output"
+    );
     // An unchanged display config is not sent again on hotplug, so this is
     // where a profile configured for this output starts applying.
     announce_output_icc_profiles(state);
+    // This also publishes and maps the new surface in its configured position.
     state.apply_runtime_display_configuration();
     state.notify_runtime_outputs_changed();
     state.schedule_redraw();
