@@ -183,7 +183,6 @@ fn swipe(
     GestureSwipeEventSnapshot {
         phase,
         fingers: 3,
-        modifiers: PointerModifierStateSnapshot::default(),
         position: None,
         delta_x,
         delta_y: 0.0,

@@ -307,9 +307,7 @@ pub fn send(command: Command) -> Result<Option<String>, String> {
     match reply.trim() {
         "ok" => Ok(None),
         "" => Err("the compositor closed the connection without answering".to_string()),
-        json if command == Command::FrameStats && json.starts_with('{') => {
-            Ok(Some(json.to_string()))
-        }
+        json if command.answers_with_json() && json.starts_with('{') => Ok(Some(json.to_string())),
         other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
     }
 }

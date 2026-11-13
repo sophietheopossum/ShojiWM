@@ -875,6 +875,8 @@ impl InputMethodHandler for ShojiWM {
     }
 }
 
+impl smithay::wayland::text_input::TextInputActivation for ShojiWM {}
+
 impl KdeDecorationHandler for ShojiWM {
     fn kde_decoration_state(
         &self,
