@@ -31,15 +31,18 @@ pub mod window;
 pub mod winit;
 
 use std::{
+    cell::RefCell,
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
+    rc::Rc,
     time::{Duration, Instant},
 };
 
 use smithay::{
     backend::{
         drm::DrmNode,
+        input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent, primary_gpu},
@@ -143,17 +146,44 @@ pub fn run_tty_udev(
     libinput.udev_assign_seat(&seat_name).map_err(|_| "")?;
     let libinput_backend = LibinputInputBackend::new(libinput.clone());
 
-    event_loop
-        .handle()
-        .insert_source(libinput_backend, |event, _, state| {
+    // Input that arrives while the session is inactive, kept for the resume.
+    //
+    // Leaving the session takes the input devices away, and libinput then
+    // lets go of every key and button still held, ends the gestures and
+    // touches in progress, and removes the devices. With logind that happens
+    // by itself ahead of `PauseSession`, because the devices are revoked in
+    // the pass that drops DRM master; otherwise `libinput.suspend()` below
+    // does it, and smithay hands the events over before the loop next sleeps.
+    // Either way they can arrive after `tty_session_active` was cleared (a
+    // frame that lost DRM access clears it before the pause is dispatched).
+    // Dropped there, the keys of the VT switch itself (Ctrl+Alt+F<n>) would
+    // stay held after coming back.
+    //
+    // `None` once there is more than such a burst can hold: the devices are
+    // still live then, and a press kept without its release would be worse
+    // than keeping neither.
+    const INACTIVE_INPUT_LIMIT: usize = 1024;
+    let inactive_input: Rc<RefCell<Option<Vec<InputEvent<LibinputInputBackend>>>>> =
+        Rc::new(RefCell::new(Some(Vec::new())));
+
+    event_loop.handle().insert_source(libinput_backend, {
+        let inactive_input = inactive_input.clone();
+        move |event, _, state| {
             if !state.tty_session_active {
+                let mut kept = inactive_input.borrow_mut();
+                match kept.as_mut() {
+                    Some(events) if events.len() < INACTIVE_INPUT_LIMIT => events.push(event),
+                    Some(_) => *kept = None,
+                    None => {}
+                }
                 return;
             }
             state.record_event_source_wake("libinput");
             state.request_tty_maintenance("libinput");
             state.handle_libinput_input_event(&event);
             state.process_input_event(event);
-        })?;
+        }
+    })?;
 
     event_loop.handle().insert_source(
         session_notifier,
@@ -168,14 +198,30 @@ pub fn run_tty_udev(
             SessionEvent::ActivateSession => {
                 info!("resuming tty session");
                 state.tty_session_active = true;
-                // Keys and buttons let go on another VT sent us no release.
+                // Keys let go on another VT sent us no release.
                 state.modifier_tap.reset();
-                state.consumed_pointer_buttons.clear();
+                let kept = inactive_input
+                    .borrow_mut()
+                    .replace(Vec::new())
+                    .unwrap_or_default();
                 if let Err(err) = libinput.resume() {
                     warn!(?err, "failed to resume libinput context");
                 }
                 resume_tty_session(state);
                 state.reapply_gamma();
+                // In the order libinput sent them, and ahead of the devices it
+                // adds again: those arrive through the source above.
+                if !kept.is_empty() {
+                    state.request_tty_maintenance("libinput");
+                }
+                for event in kept {
+                    state.handle_libinput_input_event(&event);
+                    state.process_input_event(event);
+                }
+                // Buttons let go on another VT sent us no release either. After
+                // the replay, so a kept release of a press a binding took is
+                // still taken.
+                state.consumed_pointer_buttons.clear();
             }
         },
     )?;

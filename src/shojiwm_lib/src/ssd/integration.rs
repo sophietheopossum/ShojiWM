@@ -7044,6 +7044,7 @@ fn collect_retargeted_text_buffers(
     buffer.clip_radius = node.effective_clip.map(|clip| clip.radius).unwrap_or(0);
     buffer.clip_rect_precise = clip_rect_precise;
     buffer.clip_radius_precise = clip_radius_precise;
+    buffer.opacity = node.style.opacity.unwrap_or(1.0);
     // Retargeting moves existing pixels; it does not rasterize new text or
     // ink. Keep their metadata truthful so a later raster check can detect
     // a pending content/appearance change instead of accepting stale pixels.
@@ -7133,6 +7134,7 @@ fn collect_retargeted_icon_buffers(
     buffer.clip_radius = node.effective_clip.map(|clip| clip.radius).unwrap_or(0);
     buffer.clip_rect_precise = clip_rect_precise;
     buffer.clip_radius_precise = clip_radius_precise;
+    buffer.opacity = node.style.opacity.unwrap_or(1.0);
 
     if matches!(&node.kind, super::DecorationNodeKind::AppIcon(icon) if icon.fallback.is_none())
         && snapshot.icon.is_none()
@@ -7919,11 +7921,8 @@ fn text_buffers_need_raster_for_node(
 
     let stable_key = format!("{path}:label");
     let previous_buffer = fallback_text_buffer(previous, node.stable_id.as_deref(), &stable_key);
-    let color = node
-        .style
-        .color
-        .unwrap_or(super::Color::WHITE)
-        .with_opacity(node.style.opacity);
+    // Opacity is applied when drawn, not rasterized.
+    let color = node.style.color.unwrap_or(super::Color::WHITE);
     let expects_no_buffer =
         label.text.is_empty() || node.rect.width <= 0 || node.rect.height <= 0 || color.a == 0;
     if expects_no_buffer {
@@ -8633,6 +8632,66 @@ mod tests {
         assert!(!text_buffers_need_raster_for_layout(
             &new, &geometry, &ready, 1.0
         ));
+    }
+
+    #[test]
+    fn faded_label_keeps_its_pixels_and_follows_the_opacity() {
+        use crate::backend::text::TextRasterizer;
+        let layout = |opacity| {
+            let mut label =
+                DecorationNode::new(DecorationNodeKind::Label(super::super::LabelNode {
+                    text: "12".into(),
+                }))
+                .with_style(DecorationStyle {
+                    width: Some(40.0),
+                    height: Some(20.0),
+                    color: Some(Color::WHITE),
+                    opacity: Some(opacity),
+                    ..Default::default()
+                });
+            label.stable_id = Some("day".into());
+            DecorationTree::new(
+                DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                    direction: LayoutDirection::Column,
+                }))
+                .with_children(vec![
+                    label,
+                    DecorationNode::new(DecorationNodeKind::WindowSlot),
+                ]),
+            )
+            .layout_for_client(LogicalRect::new(0, 20, 100, 100))
+            .unwrap()
+        };
+        let half = layout(0.5);
+        let order = build_render_order_map(&half);
+        let geometry = build_node_geometry_map(&half);
+        let mut sync = TextRasterizer::new(None);
+        let built = build_text_buffers_with_fallback(&half, &order, 1.0, &mut sync, &[]);
+        assert_eq!(built.len(), 1);
+        assert_eq!(
+            built[0].color,
+            Color::WHITE,
+            "opacity is applied when drawn, not rasterized"
+        );
+        assert_eq!(built[0].opacity, 0.5);
+        assert!(
+            !text_buffers_need_raster_for_layout(&half, &geometry, &built, 1.0),
+            "a faded label's pixels are still good"
+        );
+
+        let quarter = layout(0.25);
+        let geometry = build_node_geometry_map(&quarter);
+        assert!(
+            !text_buffers_need_raster_for_layout(&quarter, &geometry, &built, 1.0),
+            "a fade step moves no ink"
+        );
+        let moved = retarget_text_buffers_with_node_geometry(
+            &quarter,
+            &build_render_order_map(&quarter),
+            &geometry,
+            &built,
+        );
+        assert_eq!(moved[0].opacity, 0.25, "moved pixels fade with the node");
     }
 
     #[test]
