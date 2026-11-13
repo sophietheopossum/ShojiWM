@@ -42,7 +42,9 @@ use std::{
 use smithay::{
     backend::{
         drm::DrmNode,
-        input::InputEvent,
+        input::{
+            ButtonState, InputBackend, InputEvent, KeyState, KeyboardKeyEvent, PointerButtonEvent,
+        },
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent, primary_gpu},
@@ -121,6 +123,24 @@ fn run_winit(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// Whether `event` only lets go of something, or changes the device list.
+///
+/// That is the input worth keeping while the session is inactive (see
+/// `run_tty_udev`): processed at the resume, it leaves no key, button or
+/// gesture held, and a release the seat does not hold is ignored. A press,
+/// a motion or the start of a gesture would act there, long after the fact.
+fn input_lets_go<B: InputBackend>(event: &InputEvent<B>) -> bool {
+    match event {
+        InputEvent::DeviceAdded { .. } | InputEvent::DeviceRemoved { .. } => true,
+        InputEvent::Keyboard { event } => event.state() == KeyState::Released,
+        InputEvent::PointerButton { event } => event.state() == ButtonState::Released,
+        InputEvent::GestureSwipeEnd { .. }
+        | InputEvent::GesturePinchEnd { .. }
+        | InputEvent::GestureHoldEnd { .. } => true,
+        _ => false,
+    }
+}
+
 pub fn run_tty_udev(
     runtime: crate::runtime_api::RuntimeBoot,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -149,19 +169,19 @@ pub fn run_tty_udev(
     // Input that arrives while the session is inactive, kept for the resume.
     //
     // Leaving the session takes the input devices away, and libinput then
-    // lets go of every key and button still held, ends the gestures and
-    // touches in progress, and removes the devices. With logind that happens
-    // by itself ahead of `PauseSession`, because the devices are revoked in
-    // the pass that drops DRM master; otherwise `libinput.suspend()` below
-    // does it, and smithay hands the events over before the loop next sleeps.
-    // Either way they can arrive after `tty_session_active` was cleared (a
-    // frame that lost DRM access clears it before the pause is dispatched).
+    // lets go of every key and button still held, ends the gestures in
+    // progress, and removes the devices. With logind that happens by itself
+    // ahead of `PauseSession`, because the devices are revoked in the pass
+    // that drops DRM master; otherwise `libinput.suspend()` below does it,
+    // and smithay hands the events over before the loop next sleeps. Either
+    // way they can arrive after `tty_session_active` was cleared (a frame
+    // that lost DRM access clears it before the pause is dispatched).
     // Dropped there, the keys of the VT switch itself (Ctrl+Alt+F<n>) would
     // stay held after coming back.
     //
-    // `None` once there is more than such a burst can hold: the devices are
-    // still live then, and a press kept without its release would be worse
-    // than keeping neither.
+    // Only that kind of input is kept (`input_lets_go`). `None` once there
+    // is far more of it than leaving a session produces: nothing is kept
+    // then until the next resume, as nothing was before.
     const INACTIVE_INPUT_LIMIT: usize = 1024;
     let inactive_input: Rc<RefCell<Option<Vec<InputEvent<LibinputInputBackend>>>>> =
         Rc::new(RefCell::new(Some(Vec::new())));
@@ -170,11 +190,13 @@ pub fn run_tty_udev(
         let inactive_input = inactive_input.clone();
         move |event, _, state| {
             if !state.tty_session_active {
-                let mut kept = inactive_input.borrow_mut();
-                match kept.as_mut() {
-                    Some(events) if events.len() < INACTIVE_INPUT_LIMIT => events.push(event),
-                    Some(_) => *kept = None,
-                    None => {}
+                if input_lets_go(&event) {
+                    let mut kept = inactive_input.borrow_mut();
+                    match kept.as_mut() {
+                        Some(events) if events.len() < INACTIVE_INPUT_LIMIT => events.push(event),
+                        Some(_) => *kept = None,
+                        None => {}
+                    }
                 }
                 return;
             }
