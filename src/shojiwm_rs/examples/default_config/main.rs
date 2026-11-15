@@ -15,7 +15,8 @@
 //! display.
 //!
 //! Shaders and icons are shared with the TypeScript config: relative asset
-//! paths resolve against `packages/config`.
+//! paths resolve against `packages/config`, or against an installed copy
+//! once the checkout is gone (see `session::asset_root`).
 
 mod drag_and_drop;
 mod flip_3d;
@@ -55,7 +56,7 @@ fn main() -> std::process::ExitCode {
     ConfigBuilder::new(setup)
         .name("minka")
         .hang_watchdog(session::hang_watchdog())
-        .asset_root(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/config"))
+        .asset_root(session::asset_root())
         .run()
 }
 

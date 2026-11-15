@@ -114,6 +114,30 @@ pub fn hang_watchdog() -> HangWatchdog {
     }
 }
 
+/// The checkout this binary was built from. The shaders and icons are read
+/// from disk when an effect is first drawn, not compiled in, so while this
+/// exists an edit to them here reaches the installed compositor.
+const BUILT_ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/config");
+/// Where MinkaDE's tester install.sh puts a copy, for a binary whose build
+/// checkout is gone, such as a release tarball's, built on CI. Only that
+/// installer makes it: a dist/install.sh install still needs its checkout.
+const INSTALLED_ASSETS: &str = "/usr/share/minka/shojiwm";
+
+/// Where relative asset paths resolve.
+pub fn asset_root() -> std::path::PathBuf {
+    pick_asset_root(BUILT_ASSETS, INSTALLED_ASSETS)
+}
+
+/// `built` while it holds the shaders, otherwise `installed`.
+fn pick_asset_root(built: &str, installed: &str) -> std::path::PathBuf {
+    let built = std::path::Path::new(built);
+    if built.join("src/effect").is_dir() {
+        built.to_path_buf()
+    } else {
+        installed.into()
+    }
+}
+
 /// A session that ended because the config hung leaves only a marker line
 /// and a core dump, and the next one starts like any other: say so once the
 /// shell can show it. Not from a nested run, whose notifications would land
@@ -216,4 +240,26 @@ pub fn start_session_apps() {
         ]),
         RuntimeProcessRestartPolicy::OnExit,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn assets_come_from_the_build_checkout_until_it_is_gone() {
+        let dir = std::env::temp_dir().join(format!("shojiwm-asset-root-{}", std::process::id()));
+        let (built, installed) = (dir.join("built"), dir.join("installed"));
+        let pick = || pick_asset_root(built.to_str().unwrap(), installed.to_str().unwrap());
+        std::fs::create_dir_all(built.join("src/effect")).unwrap();
+        assert_eq!(pick(), built);
+        std::fs::remove_dir_all(built.join("src/effect")).unwrap();
+        assert_eq!(pick(), installed);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Built here, so this checkout is the root, as on a developer's install.
+        assert_eq!(asset_root(), Path::new(BUILT_ASSETS));
+        assert!(Path::new(BUILT_ASSETS).join("./src/effect/liquid-glass.frag").is_file());
+    }
 }
