@@ -351,9 +351,14 @@ fn apply_cached_tree_update(
         (Some(_), false) => Err(DecorationEvaluationError::RuntimeProtocol(
             "cached composition returned both a full tree and patches".into(),
         )),
-        (None, true) => Err(DecorationEvaluationError::RuntimeProtocol(
-            "cached composition returned neither a full tree nor patches".into(),
-        )),
+        // Neither a tree nor patches: the tree did not change. The Rust config runtime
+        // answers like this when only the window's managed state, effects or uniforms changed,
+        // or when nothing did (a window moved to another output, say). Rejecting it threw
+        // away the rest of the evaluation and raised a config error box.
+        (None, true) => Ok(CachedTreeUpdate {
+            changed: false,
+            layout_equivalent: true,
+        }),
         (None, false) => {
             let mut changed = false;
             let mut layout_equivalent = true;
@@ -9221,6 +9226,26 @@ mod tests {
         assert!(node_id_matches_dirty_scope("w1/0/2", &dirty));
         assert!(!node_id_matches_dirty_scope("w1/0/21", &dirty));
         assert!(!node_id_matches_dirty_scope("root.Box#barista", &dirty));
+    }
+
+    #[test]
+    fn cached_update_with_neither_tree_nor_patches_means_unchanged() {
+        let mut slot = DecorationNode::new(DecorationNodeKind::WindowSlot);
+        slot.stable_id = Some("root.WindowSlot[0]".into());
+        let mut root = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Column,
+        }))
+        .with_children(vec![slot]);
+        root.stable_id = Some("root".into());
+        let mut tree = DecorationTree::new(root);
+        let before = tree.root.clone();
+
+        let update = apply_cached_tree_update(&mut tree, None, Vec::new())
+            .expect("an empty cached update is a valid \"nothing changed\"");
+
+        assert!(!update.changed);
+        assert!(update.layout_equivalent);
+        assert_eq!(tree.root, before);
     }
 
     #[test]
