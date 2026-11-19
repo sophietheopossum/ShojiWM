@@ -101,10 +101,7 @@ fn session_with(tiled: bool, settings: Option<&Value>) -> Session {
     // Log only: a slow parity test must never abort the whole test binary.
     let launcher = ConfigBuilder::new(setup)
         .hang_watchdog(HangWatchdog::log_only())
-        .asset_root(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../packages/config"
-        ));
+        .asset_root(crate::minka::session::BUILT_ASSETS);
     let runtime = {
         let _environment = lock_environment();
         // SAFETY: every session sets these under the lock, and the socket is

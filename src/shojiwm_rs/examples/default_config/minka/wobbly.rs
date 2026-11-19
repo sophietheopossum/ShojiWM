@@ -1,8 +1,8 @@
 //! Wobbly windows while dragging: a port of dcrey7's TypeScript
 //! `jelly-drag.ts`, which is itself a line-for-line port of KWin's
 //! wobblywindows effect (kwin/src/plugins/wobblywindows/wobblywindows.cpp),
-//! with KDE's defaults. The shader (`packages/config/src/effect/
-//! jelly-drag.frag`) is his, unchanged.
+//! with KDE's defaults. The shader (`assets/shaders/jelly-drag.frag`) is
+//! his, unchanged.
 //!
 //! A 4x4 grid of points sits on the window. Each point is joined to its
 //! neighbours by springs that want to keep the grid spacing. The point you
@@ -297,7 +297,7 @@ fn wobble_for(wobbles: &Wobbles, window: Window) -> Rc<Wobble> {
     }
     let bend: [Signal<[f64; 4]>; 8] = std::array::from_fn(|_| signal([0.0; 4]));
     let opacity = signal(1.0_f64);
-    let mut stage = shader_stage("./src/effect/jelly-drag.frag").uniform("opacity", opacity);
+    let mut stage = shader_stage("./shaders/jelly-drag.frag").uniform("opacity", opacity);
     for (i, signal) in bend.iter().enumerate() {
         stage = stage.uniform(&format!("d{i}"), *signal);
     }

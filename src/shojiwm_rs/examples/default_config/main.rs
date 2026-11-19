@@ -14,9 +14,9 @@
 //! pointing the session's systemd and D-Bus activation at the nested
 //! display.
 //!
-//! Shaders and icons are shared with the TypeScript config: relative asset
-//! paths resolve against `packages/config`, or against an installed copy
-//! once the checkout is gone (see `session::asset_root`).
+//! Shaders and icons are in `assets/` next to this file: relative asset
+//! paths resolve against it, or against an installed copy once the
+//! checkout is gone (see `session::asset_root`).
 
 mod drag_and_drop;
 mod flip_3d;
@@ -229,7 +229,7 @@ mod tests {
         let args = CommonArgs::parse(&[], &[]);
         let launcher = ConfigBuilder::new(setup)
             .hang_watchdog(HangWatchdog::log_only())
-            .asset_root(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/config"));
+            .asset_root(session::BUILT_ASSETS);
         let mut runtime = RuntimeBoot::new(Box::new(launcher), &args).launch(RuntimeHost::detached());
         runtime.preload().unwrap();
         runtime.enable().unwrap();

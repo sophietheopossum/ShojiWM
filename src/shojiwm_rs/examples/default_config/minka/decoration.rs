@@ -105,7 +105,7 @@ fn liquid_glass(switcher: &WindowSwitcher) -> Effect {
         .preserve_alpha()
         .stage(dual_kawase_blur(4, 2))
         .stage(
-            shader_stage("./src/effect/liquid-glass.frag")
+            shader_stage("./shaders/liquid-glass.frag")
                 // Follow the window's rounded corners.
                 .uniform("glass_radius_px", -1.0)
                 .uniform("distortion_depth", 0.2)
@@ -467,7 +467,7 @@ pub fn create_window_composition(
                     Style::new().right(0.0).top(halo).bottom(halo).width(halo),
                 ))
                 .child(tab(
-                    "./assets/drag-tab-top.svg",
+                    "./icons/drag-tab-top.svg",
                     Edge::Top,
                     Style::new()
                         .top(tab_inset)
@@ -476,7 +476,7 @@ pub fn create_window_composition(
                         .height(DRAG_TAB_THICKNESS),
                 ))
                 .child(tab(
-                    "./assets/drag-tab-bottom.svg",
+                    "./icons/drag-tab-bottom.svg",
                     Edge::Bottom,
                     Style::new()
                         .bottom(tab_inset)
@@ -485,7 +485,7 @@ pub fn create_window_composition(
                         .height(DRAG_TAB_THICKNESS),
                 ))
                 .child(tab(
-                    "./assets/drag-tab-left.svg",
+                    "./icons/drag-tab-left.svg",
                     Edge::Left,
                     Style::new()
                         .left(tab_inset)
@@ -494,7 +494,7 @@ pub fn create_window_composition(
                         .height(DRAG_TAB_LENGTH),
                 ))
                 .child(tab(
-                    "./assets/drag-tab-right.svg",
+                    "./icons/drag-tab-right.svg",
                     Edge::Right,
                     Style::new()
                         .right(tab_inset)

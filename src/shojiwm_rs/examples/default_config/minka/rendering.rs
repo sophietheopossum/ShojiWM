@@ -35,7 +35,7 @@ fn masked_blur(mask: Source, capture_padding: i32) -> Effect {
         .preserve_alpha()
         .stage(dual_kawase_blur(4, 2))
         .stage(
-            shader_stage("./src/effect/layer-blur-mask.frag")
+            shader_stage("./shaders/layer-blur-mask.frag")
                 .texture("layer_mask", mask)
                 .uniform("opacity_threshold", 0.25)
                 .uniform("mask_feather", 0.04),
@@ -45,7 +45,7 @@ fn masked_blur(mask: Source, capture_padding: i32) -> Effect {
 /// Window backdrop effects end with this stage so they can fade back in
 /// after the window switcher closes.
 pub fn backdrop_fade(switcher: &WindowSwitcher) -> ShaderStage {
-    shader_stage("./src/effect/backdrop-fade.frag").uniform("strength", switcher.backdrop_strength())
+    shader_stage("./shaders/backdrop-fade.frag").uniform("strength", switcher.backdrop_strength())
 }
 
 fn backdrop_blur(switcher: &WindowSwitcher) -> Effect {

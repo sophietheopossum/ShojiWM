@@ -114,10 +114,14 @@ pub fn hang_watchdog() -> HangWatchdog {
     }
 }
 
-/// The checkout this binary was built from. The shaders and icons are read
-/// from disk when an effect is first drawn, not compiled in, so while this
-/// exists an edit to them here reaches the installed compositor.
-const BUILT_ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/config");
+/// The config's `assets/` in the checkout this binary was built from. The
+/// shaders and icons are read from disk when an effect is first drawn, not
+/// compiled in, so while this exists an edit to them here reaches the
+/// installed compositor. The tests read them from here too.
+pub const BUILT_ASSETS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/examples/default_config/assets"
+);
 /// Where MinkaDE's tester install.sh puts a copy, for a binary whose build
 /// checkout is gone, such as a release tarball's, built on CI. Only that
 /// installer makes it: a dist/install.sh install still needs its checkout.
@@ -131,7 +135,7 @@ pub fn asset_root() -> std::path::PathBuf {
 /// `built` while it holds the shaders, otherwise `installed`.
 fn pick_asset_root(built: &str, installed: &str) -> std::path::PathBuf {
     let built = std::path::Path::new(built);
-    if built.join("src/effect").is_dir() {
+    if built.join("shaders").is_dir() {
         built.to_path_buf()
     } else {
         installed.into()
@@ -253,13 +257,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("shojiwm-asset-root-{}", std::process::id()));
         let (built, installed) = (dir.join("built"), dir.join("installed"));
         let pick = || pick_asset_root(built.to_str().unwrap(), installed.to_str().unwrap());
-        std::fs::create_dir_all(built.join("src/effect")).unwrap();
+        std::fs::create_dir_all(built.join("shaders")).unwrap();
         assert_eq!(pick(), built);
-        std::fs::remove_dir_all(built.join("src/effect")).unwrap();
+        std::fs::remove_dir_all(built.join("shaders")).unwrap();
         assert_eq!(pick(), installed);
         std::fs::remove_dir_all(&dir).unwrap();
         // Built here, so this checkout is the root, as on a developer's install.
         assert_eq!(asset_root(), Path::new(BUILT_ASSETS));
-        assert!(Path::new(BUILT_ASSETS).join("./src/effect/liquid-glass.frag").is_file());
+        assert!(
+            Path::new(BUILT_ASSETS)
+                .join("./shaders/liquid-glass.frag")
+                .is_file()
+        );
     }
 }
