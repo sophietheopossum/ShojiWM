@@ -4030,16 +4030,6 @@ impl ShojiWM {
             .seat
             .get_keyboard()
             .and_then(|keyboard| keyboard.current_focus());
-        self.activate_pointer_constraint_with_keyboard_focus(location, keyboard_focus.as_ref());
-    }
-
-    /// `keyboard_focus` is passed in because the keyboard is locked while
-    /// smithay reports a focus change.
-    fn activate_pointer_constraint_with_keyboard_focus(
-        &mut self,
-        location: smithay::utils::Point<f64, smithay::utils::Logical>,
-        keyboard_focus: Option<&WlSurface>,
-    ) {
         if self.app_lock_ignored {
             return;
         }
@@ -4050,7 +4040,7 @@ impl ShojiWM {
             return;
         };
         if pointer.current_focus().as_ref() != Some(&surface)
-            || !surface_has_keyboard_focus(&surface, keyboard_focus)
+            || !surface_has_keyboard_focus(&surface, keyboard_focus.as_ref())
         {
             return;
         }
@@ -4072,6 +4062,10 @@ impl ShojiWM {
     /// A client's lock or confinement holds only while its surface has the
     /// keyboard, as in sway and Hyprland: the keyboard moving to `focused`
     /// releases the one under the pointer, or takes a persistent one back.
+    ///
+    /// Smithay calls this with the keyboard locked, and a popup grab that
+    /// ends inside a pointer event hands the keyboard back with the pointer
+    /// locked too, so this must lock neither.
     pub(crate) fn sync_pointer_constraint_with_keyboard_focus(
         &mut self,
         focused: Option<&WlSurface>,
@@ -4083,12 +4077,15 @@ impl ShojiWM {
             return;
         };
         if surface_has_keyboard_focus(&surface, focused) {
-            self.activate_pointer_constraint_with_keyboard_focus(
-                pointer.current_location(),
-                focused,
-            );
+            // Taking one back reads the pointer and the keyboard, so it waits
+            // for an idle callback and checks both again then.
+            self.loop_handle.insert_idle(move |state| {
+                state.activate_pointer_constraint_at(pointer.current_location());
+            });
             return;
         }
+        // Releasing can happen now: finding the constraint does not lock the
+        // pointer.
         with_pointer_constraint(&surface, &pointer, |constraint| {
             if let Some(constraint) = constraint.filter(|constraint| constraint.is_active()) {
                 constraint.deactivate();
