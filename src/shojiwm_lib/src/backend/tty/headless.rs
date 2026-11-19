@@ -76,6 +76,7 @@ impl HeadlessTarget {
             cursor_plane_assigned: false,
             states,
             cross_gpu_pending: None,
+            sync: None,
         })
     }
 

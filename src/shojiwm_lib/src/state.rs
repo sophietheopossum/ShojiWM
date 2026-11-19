@@ -158,6 +158,27 @@ fn runtime_dirty_debug_enabled() -> bool {
     })
 }
 
+/// A frame the tty backend is rendering, from the runtime tick and the
+/// decoration refreshes at its start, which it draws (`open`), to its end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FramePreparation {
+    pub output: String,
+    pub open: bool,
+    /// A change was left to this frame instead of asking for another one: if
+    /// the frame does not get drawn, the output still needs one.
+    pub changes_left: bool,
+}
+
+impl FramePreparation {
+    /// Whether this frame draws a change shown on `output`, which then needs
+    /// no frame of its own.
+    pub fn takes_change(&mut self, output: &str) -> bool {
+        let takes = self.open && self.output == output;
+        self.changes_left |= takes;
+        takes
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedDamageRect {
     pub owner: String,
@@ -440,6 +461,7 @@ pub struct ShojiWM {
     /// Windows marked dirty while a decoration refresh pass runs (by a host
     /// message it drains, say): the pass must not clear them with the
     /// windows it processed earlier, or their changes are never refreshed.
+    /// Kept by the outermost pass when one runs inside another.
     pub runtime_dirty_marked_during_refresh: Option<std::collections::HashSet<String>>,
     pub runtime_managed_only_window_ids: std::collections::HashSet<String>,
     pub runtime_node_only_window_ids: std::collections::HashSet<String>,
@@ -476,6 +498,11 @@ pub struct ShojiWM {
     pub pending_output_redraws: std::collections::HashSet<String>,
     /// A redraw of every output is pending (`schedule_redraw`).
     pub redraw_all_outputs: bool,
+    /// The frame the tty backend is rendering (`schedule_window_redraw`).
+    pub frame_in_preparation: Option<FramePreparation>,
+    /// The windows each output's last frame drew from its own stack, so a
+    /// window that leaves an output still redraws it once.
+    pub output_drawn_windows: HashMap<String, Vec<Window>>,
     /// Per-output frame pacing from the config (`COMPOSITOR.rendering.framePacing`).
     pub frame_pacing: crate::frame_pacing::FramePacingConfig,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
@@ -1767,6 +1794,8 @@ impl ShojiWM {
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
         let data_control_state =
             DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        // Both protocol generations share Smithay's seat selection. Modern
+        // clipboard clients (including Dux) use ext_data_control exclusively.
         let ext_data_control_state =
             ExtDataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
 
@@ -1990,6 +2019,8 @@ impl ShojiWM {
             runtime_schedule_last_timer_tick_ms: None,
             pending_output_redraws: Default::default(),
             redraw_all_outputs: false,
+            frame_in_preparation: None,
+            output_drawn_windows: HashMap::new(),
             frame_pacing: Default::default(),
             runtime_scheduler_kick_generation: 0,
             runtime_scheduler_kick_active: false,
@@ -2970,9 +3001,97 @@ impl ShojiWM {
     }
 
     /// Render `output_name` on the next pass, without redrawing the others.
+    #[track_caller]
     pub fn schedule_output_redraw(&mut self, output_name: &str) {
+        if crate::frame_stats::debugging() {
+            crate::frame_stats::record_redraw_request(
+                std::panic::Location::caller(),
+                [output_name.to_owned()],
+            );
+        }
         self.pending_output_redraws.insert(output_name.to_owned());
         self.needs_redraw = true;
+    }
+
+    /// Render the outputs that draw `window`, now or in their last frame, after
+    /// a change of it, instead of every output: a wallpaper step on one output
+    /// used to render the others too, and the output whose frame was drawing
+    /// the step once more after it. Every output while that is not known.
+    #[track_caller]
+    pub fn schedule_window_redraw(&mut self, window: &Window) {
+        if !crate::perf_options::PerfOption::TargetedRedraw.enabled() {
+            return self.schedule_redraw();
+        }
+        match self.window_redraw_outputs(window) {
+            Some(outputs) => self.schedule_change_redraw(outputs),
+            None => self.schedule_redraw(),
+        }
+    }
+
+    /// Redraw `outputs` after a change, except the one whose frame is being
+    /// prepared: that frame draws the change (`FramePreparation`).
+    #[track_caller]
+    fn schedule_change_redraw(&mut self, outputs: Vec<String>) {
+        if !crate::perf_options::PerfOption::TargetedRedraw.enabled() {
+            return self.schedule_redraw();
+        }
+        for output in outputs {
+            if !self
+                .frame_in_preparation
+                .as_mut()
+                .is_some_and(|frame| frame.takes_change(&output))
+            {
+                self.schedule_output_redraw(&output);
+            }
+        }
+    }
+
+    /// The outputs that draw `window` now or drew it in their last frame: the
+    /// ones it overlaps, as the renderer picks them, and the ones whose
+    /// composition picks it by id. `None` for a window not evaluated yet (it
+    /// has no id) or drawn nowhere.
+    fn window_redraw_outputs(&self, window: &Window) -> Option<Vec<String>> {
+        let id = &self.window_decorations.get(window)?.snapshot.id;
+        let outputs = self
+            .space
+            .outputs()
+            .filter(|output| {
+                let name = output.name();
+                self.window_intersects_output(window, output)
+                    || self
+                        .output_drawn_windows
+                        .get(&name)
+                        .is_some_and(|windows| windows.contains(window))
+                    || self.composition_windows.get(&name).is_some_and(|ids| ids.contains(id))
+                    || self
+                        .output_compositions
+                        .get(&name)
+                        .is_some_and(|plan| plan.picks_window(id))
+            })
+            .map(Output::name)
+            .collect::<Vec<_>>();
+        (!outputs.is_empty()).then_some(outputs)
+    }
+
+    /// The outputs that draw the windows `ids` names (`window_redraw_outputs`);
+    /// `None` when one of them is not a known window (a closing one, say).
+    fn windows_redraw_outputs<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a String>,
+    ) -> Option<Vec<String>> {
+        let mut outputs = Vec::new();
+        for id in ids {
+            let window = self
+                .window_decorations
+                .iter()
+                .find_map(|(window, decoration)| (decoration.snapshot.id == *id).then_some(window))?;
+            for output in self.window_redraw_outputs(window)? {
+                if !outputs.contains(&output) {
+                    outputs.push(output);
+                }
+            }
+        }
+        (!outputs.is_empty()).then_some(outputs)
     }
 
     /// Whether rendered frames are currently ticking the runtime scheduler, in which case
@@ -3079,13 +3198,30 @@ impl ShojiWM {
                 // not force layer/popup effect evaluation every frame.
                 self.layer_effect_evaluation_cache.clear();
             }
+            // The outputs drawing the dirty windows; every output for anything else
+            // (layers, the runtime as a whole, a window it cannot place).
+            let redraw_outputs = (!tick.runtime_dirty
+                && tick.dirty_layer_ids.is_empty()
+                && tick.dirty_layer_node_ids.is_empty())
+            .then(|| {
+                self.windows_redraw_outputs(
+                    tick.dirty_window_ids
+                        .iter()
+                        .chain(&tick.dirty_managed_window_ids)
+                        .chain(tick.dirty_window_node_ids.keys()),
+                )
+            })
+            .flatten();
             self.mark_runtime_dirty_windows(
                 tick.dirty_window_ids,
                 tick.dirty_managed_window_ids,
                 &tick.dirty_window_node_ids,
             );
             self.request_tty_maintenance("runtime-scheduler-dirty");
-            self.schedule_redraw();
+            match redraw_outputs {
+                Some(outputs) => self.schedule_change_redraw(outputs),
+                None => self.schedule_redraw(),
+            }
         }
 
         self.drain_runtime_host_messages();
@@ -4029,6 +4165,7 @@ impl ShojiWM {
             self.hdr_cursor_caches.remove(&name);
             self.cursor_transform_caches.remove(&name);
             self.runtime_animation_outputs.remove(&name);
+            self.output_drawn_windows.remove(&name);
             self.layer_effect_evaluation_cache.remove(&name);
             self.popup_effect_evaluation_cache.remove(&name);
             self.session_lock_surfaces.remove(&name);
@@ -5499,8 +5636,13 @@ impl ShojiWM {
         self.full_damage_pending_outputs.remove(output_name) || self.force_full_damage
     }
 
+    /// `SHOJI_REDRAW_STATS` / `SHOJI_REDRAW_REASON_DEBUG` name the caller.
+    #[track_caller]
     pub fn schedule_redraw(&mut self) {
         let caller = std::panic::Location::caller();
+        if crate::frame_stats::debugging() {
+            crate::frame_stats::record_redraw_request(caller, self.space.outputs().map(Output::name));
+        }
         if std::env::var_os("SHOJI_REDRAW_STATS")
             .is_some_and(|value| value != "0" && !value.is_empty())
         {
@@ -6244,6 +6386,29 @@ fn process_command_for_pid(pid: i32) -> Option<String> {
     fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
         .map(|value| value.trim().to_owned())
+}
+
+#[cfg(test)]
+mod frame_preparation_tests {
+    use super::FramePreparation;
+
+    #[test]
+    fn an_open_frame_takes_the_changes_it_draws() {
+        let mut frame = FramePreparation {
+            output: "DP-1".to_owned(),
+            open: true,
+            changes_left: false,
+        };
+        assert!(!frame.takes_change("DP-2"));
+        assert!(!frame.changes_left);
+        assert!(frame.takes_change("DP-1"));
+        assert!(frame.changes_left);
+        // Past the tick and the refreshes (the scene, the next frame's
+        // pretick) a change needs a frame again.
+        frame.open = false;
+        assert!(!frame.takes_change("DP-1"));
+        assert!(frame.changes_left);
+    }
 }
 
 #[cfg(test)]

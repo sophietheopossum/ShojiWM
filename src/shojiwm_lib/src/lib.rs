@@ -36,6 +36,7 @@ pub mod dnd;
 pub mod drawing;
 pub mod foreign_toplevel;
 pub mod frame_pacing;
+pub mod frame_stats;
 pub mod gamma_control;
 pub mod gpu;
 pub mod grabs;
@@ -47,6 +48,7 @@ pub mod lid_switch;
 pub mod log_rate_limit;
 pub mod modifier_tap;
 pub mod output_power;
+pub mod perf_options;
 pub mod plasma_virtual_desktop;
 pub mod plasma_window_management;
 pub mod pointer_dispatch;
@@ -118,7 +120,12 @@ pub fn run(launcher: impl RuntimeLauncher + 'static) -> ExitCode {
     }
     if let Some(command) = args.control_command.clone() {
         return match control_socket::send(command) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(reply) => {
+                if let Some(reply) = reply {
+                    println!("{reply}");
+                }
+                ExitCode::SUCCESS
+            }
             Err(error) => {
                 eprintln!("Error: {error}");
                 ExitCode::FAILURE

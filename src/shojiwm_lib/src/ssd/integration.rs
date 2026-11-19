@@ -2744,6 +2744,30 @@ impl ShojiWM {
         &mut self,
         target_output_name: Option<&str>,
     ) -> Result<(), DecorationEvaluationError> {
+        // A pass can run inside another: one drains the runtime's messages,
+        // and a synthesized press among them refreshes before it is handled.
+        // Only the outermost pass opens and closes the record of windows
+        // marked meanwhile. An inner pass that replaced it would let the
+        // outer one clear a window marked after it was processed, and the
+        // runtime reports a window once until it is evaluated: it would
+        // never be refreshed again.
+        let outermost = self.runtime_dirty_marked_during_refresh.is_none();
+        if outermost {
+            self.runtime_dirty_marked_during_refresh = Some(Default::default());
+        }
+        let result = self.refresh_window_decorations_pass(target_output_name, outermost);
+        if outermost {
+            // Closed by the pass, unless it failed before its end.
+            self.runtime_dirty_marked_during_refresh = None;
+        }
+        result
+    }
+
+    fn refresh_window_decorations_pass(
+        &mut self,
+        target_output_name: Option<&str>,
+        outermost: bool,
+    ) -> Result<(), DecorationEvaluationError> {
         timescope::scope!("ssd refresh_window_decorations_for_output");
         let refresh_started_at = Instant::now();
         let spike_threshold_ms = animation_spike_threshold_ms();
@@ -2798,7 +2822,6 @@ impl ShojiWM {
         let mut closing_runtime_updates = 0usize;
         let mut animation_active_for_target = false;
         let mut processed_runtime_dirty_window_ids = std::collections::HashSet::new();
-        self.runtime_dirty_marked_during_refresh = Some(Default::default());
         let mut managed_rect_apply_window_ids = std::collections::HashSet::new();
         let now_ms = Duration::from(self.clock.now()).as_millis() as u64;
         let closing_active_count = self.closing_window_snapshots.len();
@@ -3820,7 +3843,8 @@ impl ShojiWM {
                             animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
                             processed_runtime_dirty_window_ids.insert(snapshot_id);
                             if rendered_changed {
-                                self.schedule_redraw();
+                                // Only uniforms changed: the window drew where it draws now.
+                                self.schedule_window_redraw(&window);
                             }
                             continue;
                         }
@@ -4892,10 +4916,12 @@ impl ShojiWM {
             elapsed_ms = refresh_elapsed_ms,
             "refresh_window_decorations finished"
         );
-        let marked_during_refresh = self
-            .runtime_dirty_marked_during_refresh
-            .take()
-            .unwrap_or_default();
+        let marked_during_refresh = if outermost {
+            self.runtime_dirty_marked_during_refresh.take()
+        } else {
+            self.runtime_dirty_marked_during_refresh.clone()
+        }
+        .unwrap_or_default();
         for window_id in processed_runtime_dirty_window_ids {
             // Marked again after it was processed: refresh it next time.
             if marked_during_refresh.contains(&window_id) {
@@ -4923,6 +4949,7 @@ impl ShojiWM {
         self.async_asset_dirty = false;
         self.sync_taskbar_window_states();
         self.sync_popup_dismissals();
+        self.refresh_decoration_hover();
 
         Ok(())
     }
@@ -6956,7 +6983,7 @@ fn collect_retargeted_text_buffers(
         );
     });
 
-    let super::DecorationNodeKind::Label(label) = &node.kind else {
+    let super::DecorationNodeKind::Label(_) = &node.kind else {
         return;
     };
 
@@ -6991,12 +7018,9 @@ fn collect_retargeted_text_buffers(
     buffer.clip_radius = node.effective_clip.map(|clip| clip.radius).unwrap_or(0);
     buffer.clip_rect_precise = clip_rect_precise;
     buffer.clip_radius_precise = clip_radius_precise;
-    buffer.text = label.text.clone();
-    buffer.color = node
-        .style
-        .color
-        .unwrap_or(super::Color::WHITE)
-        .with_opacity(node.style.opacity);
+    // Retargeting moves existing pixels; it does not rasterize new text or
+    // ink. Keep their metadata truthful so a later raster check can detect
+    // a pending content/appearance change instead of accepting stale pixels.
     buffers.push(buffer);
 }
 
@@ -7488,6 +7512,7 @@ fn collect_cached_buffers(
                 .filter(|clip| clip.radius.raw() > 0)
                 .or(clips.nearest_rounded);
             shader_buffers.push(CachedShaderEffect {
+                opacity: node.style.opacity.unwrap_or(1.0),
                 owner_node_id: node.stable_id.clone(),
                 stable_key: format!("{path}:shader"),
                 order: *order_map
@@ -7596,6 +7621,9 @@ fn collect_text_buffers(
         return;
     }
 
+    // A scale transform on the label or an ancestor shrinks its rect: the
+    // text shrinks with it, as borders and radii do (`node_geometry`).
+    let text_scale = node.transform_scale.0.min(node.transform_scale.1) as f32;
     let spec = LabelSpec {
         rect: node.rect,
         rect_precise: Some(
@@ -7604,20 +7632,26 @@ fn collect_text_buffers(
                 .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
         ),
         text: label.text.clone(),
-        color: color.with_opacity(node.style.opacity),
+        // Opacity is applied when drawn (the buffer's `opacity`): baked
+        // into the colour, every step of a fade would rasterize the text
+        // again.
+        color,
         font_size: node
             .style
             .font_size
-            .unwrap_or(crate::ssd::DEFAULT_LABEL_FONT_SIZE) as f32,
+            .unwrap_or(crate::ssd::DEFAULT_LABEL_FONT_SIZE) as f32
+            * text_scale,
         font_weight: node.style.font_weight.clone(),
         font_family: node.style.font_family.clone(),
         text_align: node.style.text_align.clone(),
         text_overflow: node.style.text_overflow.clone(),
-        line_height: node.style.line_height.map(|value| value as f32),
-        text_shadow: node.style.text_shadow.map(|shadow| crate::ssd::TextShadow {
-            color: shadow.color.with_opacity(node.style.opacity),
-            ..shadow
-        }),
+        line_height: node
+            .style
+            .line_height
+            .map(|value| value as f32 * text_scale),
+        // The shadow is rasterized into the same buffer, so the buffer's
+        // `opacity` fades it with the text.
+        text_shadow: node.style.text_shadow,
         raster_scale,
     };
 
@@ -7663,6 +7697,7 @@ fn collect_text_buffers(
         buffer.clip_radius = node.effective_clip.map(|clip| clip.radius).unwrap_or(0);
         buffer.clip_rect_precise = current_clip_rect_precise;
         buffer.clip_radius_precise = current_clip_radius_precise;
+        buffer.opacity = node.style.opacity.unwrap_or(1.0);
         if label_debug_enabled() {
             info!(
                 stable_key = %buffer.stable_key,
@@ -7716,7 +7751,10 @@ fn collect_text_buffers(
                 buffer.clip_radius_precise = None;
             }
         }
-        buffer.color = spec.color;
+        buffer.opacity = node.style.opacity.unwrap_or(1.0);
+        // These are still the previous pixels while the async job runs.
+        // Recording the requested color here would make the next raster
+        // check accept the old texture as already recolored.
         if label_debug_enabled() {
             info!(
                 stable_key = %buffer.stable_key,
@@ -7976,6 +8014,7 @@ fn collect_icon_buffers(
         buffer.clip_radius_precise = node
             .resolved_effective_clip
             .map(|clip| node.frame.logical_len(clip.radius).max(0.0));
+        buffer.opacity = node.style.opacity.unwrap_or(1.0);
         buffers.push(buffer);
     }
 }
@@ -8496,6 +8535,79 @@ mod tests {
         BorderStyle, BoxNode, Color, DecorationNode, DecorationNodeKind, DecorationStyle, Edges,
         LayoutDirection, Overflow, StylePosition,
     };
+
+    #[test]
+    fn pending_label_recolor_keeps_old_pixel_metadata_until_rasterized() {
+        use crate::backend::{async_assets::AsyncAssetJob, text::TextRasterizer};
+        let layout = |text: &str, color| {
+            let mut label =
+                DecorationNode::new(DecorationNodeKind::Label(super::super::LabelNode {
+                    text: text.into(),
+                }))
+                .with_style(DecorationStyle {
+                    width: Some(40.0),
+                    height: Some(20.0),
+                    color: Some(color),
+                    ..Default::default()
+                });
+            label.stable_id = Some("day".into());
+            DecorationTree::new(
+                DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                    direction: LayoutDirection::Column,
+                }))
+                .with_children(vec![
+                    label,
+                    DecorationNode::new(DecorationNodeKind::WindowSlot),
+                ]),
+            )
+            .layout_for_client(LogicalRect::new(0, 20, 100, 100))
+            .unwrap()
+        };
+        let old = layout("12", Color::rgba(0, 0, 0, 255));
+        let old_order = build_render_order_map(&old);
+        let mut sync = TextRasterizer::new(None);
+        let previous = build_text_buffers_with_fallback(&old, &old_order, 1.0, &mut sync, &[]);
+        assert_eq!(previous.len(), 1);
+        let new = layout("12", Color::WHITE);
+        let order = build_render_order_map(&new);
+        let geometry = build_node_geometry_map(&new);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut asynchronous = TextRasterizer::new(Some(sender));
+        let pending =
+            build_text_buffers_with_fallback(&new, &order, 1.0, &mut asynchronous, &previous);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AsyncAssetJob::Text { .. })
+        ));
+        assert_eq!(
+            pending[0].color, previous[0].color,
+            "fallback pixels still have the old ink"
+        );
+        assert!(text_buffers_need_raster_for_layout(
+            &new, &geometry, &pending, 1.0
+        ));
+        let moved = retarget_text_buffers_with_node_geometry(&new, &order, &geometry, &pending);
+        assert_eq!(
+            moved[0].color, previous[0].color,
+            "moving pixels cannot recolor them"
+        );
+        let replaced = layout("21", Color::WHITE);
+        let moved = retarget_text_buffers_with_node_geometry(
+            &replaced,
+            &build_render_order_map(&replaced),
+            &build_node_geometry_map(&replaced),
+            &pending,
+        );
+        assert_eq!(
+            moved[0].text, "12",
+            "moving pixels cannot change their text either"
+        );
+        let ready = build_text_buffers_with_fallback(&new, &order, 1.0, &mut sync, &pending);
+        assert_eq!(ready[0].color, Color::WHITE);
+        assert!(!text_buffers_need_raster_for_layout(
+            &new, &geometry, &ready, 1.0
+        ));
+    }
 
     #[test]
     fn shader_clip_coverage_stays_inside_border_ring_at_fractional_scale() {
