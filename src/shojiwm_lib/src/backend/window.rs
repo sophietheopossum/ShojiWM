@@ -1315,7 +1315,10 @@ mod alpha_modifier_tests {
 mod region_bounds_tests {
     use super::*;
 
-    fn region(rects: &[(RectangleKind, (i32, i32, i32, i32))]) -> RegionAttributes {
+    /// (kind, (x, y, width, height))
+    type RectSpec = (RectangleKind, (i32, i32, i32, i32));
+
+    fn region(rects: &[RectSpec]) -> RegionAttributes {
         RegionAttributes {
             rects: rects
                 .iter()
