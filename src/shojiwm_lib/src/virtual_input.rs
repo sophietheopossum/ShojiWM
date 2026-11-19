@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
-    DeviceCapability, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode,
-    PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent, PointerMotionEvent,
+    DeviceCapability, Event, InputBackend, InputEvent, InputTime, KeyState, KeyboardKeyEvent,
+    Keycode, PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent, PointerMotionEvent,
     UnusedEvent,
 };
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -103,8 +103,8 @@ pub struct VirtualAxis {
 macro_rules! virtual_event {
     ($($ty:ty),*) => {$(
         impl Event<VirtualInput> for $ty {
-            fn time(&self) -> u64 {
-                self.time
+            fn time(&self) -> InputTime {
+                InputTime::from_micros(self.time)
             }
 
             fn device(&self) -> VirtualDevice {

@@ -32,7 +32,7 @@ use std::{
 
 use shojiwm_lib::{
     runtime_api::{
-        ConfigRuntime, DecorationRequest as D, EffectRequest as E, InputRequest as I,
+        ConfigRuntime, DecorationRequest as D, EffectRequest as E, GpuRequest, InputRequest as I,
         ReloadPreparation, RuntimeError, RuntimeEvent as Ev, RuntimeReply, RuntimeRequest as R,
         WindowRequest as W, WorkspaceRequest,
     },
@@ -108,10 +108,15 @@ kinds! {
     LayerEffects = "evaluateLayerEffects",
     PopupEffects = "evaluatePopupEffects",
     WorkspaceActivate = "workspaceActivate",
+    SelectRenderGpu = "selectRenderGpu",
     DisplayState = "displayState",
     InputState = "inputState",
     KeyboardLayout = "keyboardLayout",
     KeyboardLocks = "keyboardLocks",
+    LidSwitch = "lidSwitch",
+    GpuState = "gpuState",
+    PowerState = "powerState",
+    Resume = "resume",
     PointerMoveAsync = "pointerMoveAsync",
     GestureSwipeAsync = "gestureSwipeAsync",
     GesturePinchAsync = "gesturePinchAsync",
@@ -474,6 +479,10 @@ impl<C: ConfigRuntime> ConfigRuntime for Watched<C> {
             Ev::InputState(_) => Kind::InputState,
             Ev::KeyboardLayout(_) => Kind::KeyboardLayout,
             Ev::KeyboardLocks(_) => Kind::KeyboardLocks,
+            Ev::LidSwitch(_) => Kind::LidSwitch,
+            Ev::GpuState(_) => Kind::GpuState,
+            Ev::PowerState(_) => Kind::PowerState,
+            Ev::Resume(_) => Kind::Resume,
             Ev::PointerMove(_) => Kind::PointerMoveAsync,
             Ev::GestureSwipe(_) => Kind::GestureSwipeAsync,
             Ev::GesturePinch(_) => Kind::GesturePinchAsync,
@@ -525,6 +534,7 @@ fn describe(request: R<'_>) -> (Kind, Option<&str>) {
         R::Effect(E::Layers { .. }) => (Kind::LayerEffects, None),
         R::Effect(E::Popups { .. }) => (Kind::PopupEffects, None),
         R::Workspace(WorkspaceRequest::Activate(_)) => (Kind::WorkspaceActivate, None),
+        R::Gpu(GpuRequest::SelectRender { .. }) => (Kind::SelectRenderGpu, None),
     }
 }
 
