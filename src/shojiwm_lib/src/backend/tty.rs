@@ -2460,7 +2460,8 @@ fn render_ahead_allowed(surface: &SurfaceData, policy_allows: bool) -> bool {
 }
 
 fn drop_ahead_frame(surface: &mut SurfaceData) {
-    // Every path that drops a rendered frame unshown comes through here.
+    // A frame dropped here or by the caller never flips: its elements still have to reach
+    // the screen.
     surface.frame_gate.forget();
     // Every caller drops the deferred frame too, so a frame still on the render GPU is
     // dropped whichever it was.
@@ -14616,9 +14617,11 @@ fn reset_surface_in_place(
     };
     // The old DrmOutput must drop before initialize_output runs for this
     // CRTC (the output manager answers DuplicateCrtc otherwise). The rest
-    // of the surface state goes with it, exactly as a reconnect would
-    // rebuild it; what carries over is the output itself, the presentation
-    // sequence (clients on this wl_output must not see it run backwards)
+    // of the old surface stays in `old` until this function returns. The
+    // new one starts from `SurfaceData::new`, as a reconnect's does; what
+    // carries over is the output itself, the frame-callback sequence (a
+    // surface remembers the one it last got a callback at on this output,
+    // so a count restarted from 0 could repeat it and hold a callback back)
     // and the power state (a reset must not resurrect a powered-off panel).
     let SurfaceData {
         output,
