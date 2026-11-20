@@ -15,7 +15,7 @@ use std::{cell::RefCell, rc::Rc, time::Duration};
 use lid_policy::{LidCloseAction, LidPolicyOptions, LidSleepContext, bind_lid_policy};
 use shojiwm_rs::power::PowerAction;
 use smithay::backend::input::{
-    Device, DeviceCapability, Event, InputBackend, InputEvent, Switch, SwitchState,
+    Device, DeviceCapability, Event, InputBackend, InputEvent, InputTime, Switch, SwitchState,
     SwitchToggleEvent, UnusedEvent,
 };
 
@@ -79,8 +79,8 @@ struct Toggle {
 }
 
 impl Event<Switches> for Toggle {
-    fn time(&self) -> u64 {
-        0
+    fn time(&self) -> InputTime {
+        InputTime::from_micros(0)
     }
 
     fn device(&self) -> SwitchDevice {

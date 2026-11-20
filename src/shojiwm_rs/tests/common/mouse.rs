@@ -1,7 +1,7 @@
 //! A mouse for driving the compositor's input path from a test.
 
 use smithay::backend::input::{
-    AbsolutePositionEvent, ButtonState, Device, DeviceCapability, Event, InputBackend,
+    AbsolutePositionEvent, ButtonState, Device, DeviceCapability, Event, InputBackend, InputTime,
     PointerButtonEvent, PointerMotionAbsoluteEvent, PointerMotionEvent, UnusedEvent,
 };
 
@@ -48,8 +48,8 @@ pub struct Absolute {
 }
 
 impl Event<Mouse> for Motion {
-    fn time(&self) -> u64 {
-        self.time
+    fn time(&self) -> InputTime {
+        InputTime::from_micros(self.time)
     }
 
     fn device(&self) -> MouseDevice {
@@ -58,8 +58,8 @@ impl Event<Mouse> for Motion {
 }
 
 impl Event<Mouse> for Absolute {
-    fn time(&self) -> u64 {
-        self.time
+    fn time(&self) -> InputTime {
+        InputTime::from_micros(self.time)
     }
 
     fn device(&self) -> MouseDevice {
@@ -113,8 +113,8 @@ pub struct Button {
 }
 
 impl Event<Mouse> for Button {
-    fn time(&self) -> u64 {
-        self.time
+    fn time(&self) -> InputTime {
+        InputTime::from_micros(self.time)
     }
 
     fn device(&self) -> MouseDevice {

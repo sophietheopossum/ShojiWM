@@ -5,7 +5,7 @@ mod common;
 
 use shojiwm_rs::prelude::*;
 use smithay::{
-    backend::input::{KeyState, Keycode},
+    backend::input::{InputTime, KeyState, Keycode},
     input::keyboard::FilterResult,
     utils::SERIAL_COUNTER,
 };
@@ -25,7 +25,7 @@ fn tap_key(session: &mut common::Session) {
             Keycode::new(30 + 8),
             state,
             SERIAL_COUNTER.next_serial(),
-            0,
+            InputTime::from_millis(0),
             |_, _, _| FilterResult::Forward,
         );
     }

@@ -558,6 +558,7 @@ fn layer(id: &str, output: &str, exclusive: u32) -> shojiwm_rs::ssd::WaylandLaye
         },
     };
     shojiwm_rs::ssd::WaylandLayerSnapshot {
+        pid: None,
         id: id.into(),
         namespace: Some("bar".into()),
         layer: LayerKindSnapshot::Top,

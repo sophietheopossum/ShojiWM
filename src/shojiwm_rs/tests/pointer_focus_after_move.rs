@@ -15,7 +15,7 @@ use std::{
 
 use shojiwm_rs::{ipc::IpcServer, prelude::*};
 use smithay::{
-    backend::input::ButtonState,
+    backend::input::{ButtonState, InputTime},
     input::pointer::{ButtonEvent, MotionEvent},
     reexports::wayland_server::Resource,
     utils::SERIAL_COUNTER,
@@ -102,7 +102,7 @@ fn move_pointer(session: &mut common::Session, x: f64, y: f64) {
         &MotionEvent {
             location,
             serial: SERIAL_COUNTER.next_serial(),
-            time: 0,
+            time: InputTime::from_millis(0),
         },
     );
     pointer.frame(state);
@@ -115,7 +115,7 @@ fn button(session: &mut common::Session, state: ButtonState) {
         &mut session.state,
         &ButtonEvent {
             serial: SERIAL_COUNTER.next_serial(),
-            time: 0,
+            time: InputTime::from_millis(0),
             button: BTN_LEFT,
             state,
         },

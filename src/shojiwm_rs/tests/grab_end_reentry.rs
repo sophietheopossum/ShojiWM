@@ -12,7 +12,7 @@ use shojiwm_rs::{
     ssd::{WindowMovePhaseSnapshot, WindowMoveSourceSnapshot},
 };
 use smithay::{
-    backend::input::ButtonState,
+    backend::input::{ButtonState, InputTime},
     input::pointer::{ButtonEvent, Focus, GrabStartData},
     reexports::{calloop::EventLoop, wayland_server::Display},
     utils::{Rectangle, SERIAL_COUNTER},
@@ -110,7 +110,7 @@ fn input_grab_from_window_move_end_does_not_deadlock() {
             &mut state,
             &ButtonEvent {
                 serial: SERIAL_COUNTER.next_serial(),
-                time: 0,
+                time: InputTime::from_millis(0),
                 button: BTN_LEFT,
                 state: ButtonState::Released,
             },
