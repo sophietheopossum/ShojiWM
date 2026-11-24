@@ -1,0 +1,19 @@
+# !tyml @cargo/Cargo
+[package]
+name = "shojiwm_minka"
+version = "0.1.0"
+edition = "2024"
+
+# Minka's config (shojiwm_rs's examples/default_config) as a library, so that
+# a binary holding more than the compositor, MinkaDE's one binary, can run it.
+# The example is still what `cargo run --example default_config` and the
+# config's tests build: this builds the same files, so nothing is copied.
+[lib]
+path = "../shojiwm_rs/examples/default_config/main.rs"
+test = false
+doctest = false
+
+[dependencies]
+shojiwm_rs = { path = "../shojiwm_rs" }
+serde_json = "1.0.140"
+tracing = "0.1.41"

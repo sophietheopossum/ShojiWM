@@ -4,9 +4,14 @@ name = "xdg-desktop-portal-shojiwm"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+path = "src/lib.rs"
+doctest = false
+
 [[bin]]
 name = "xdg-desktop-portal-shojiwm"
 path = "src/main.rs"
+test = false
 
 [dependencies]
 tracing = "0.1.41"

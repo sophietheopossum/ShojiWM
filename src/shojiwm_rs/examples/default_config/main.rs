@@ -52,7 +52,9 @@ enum WindowSwitcherStyle {
 }
 const WINDOW_SWITCHER_STYLE: WindowSwitcherStyle = WindowSwitcherStyle::Flip3D;
 
-fn main() -> std::process::ExitCode {
+/// Public for the shojiwm_minka library, which builds this same file for
+/// MinkaDE's one binary.
+pub fn main() -> std::process::ExitCode {
     ConfigBuilder::new(setup)
         .name("minka")
         .hang_watchdog(session::hang_watchdog())

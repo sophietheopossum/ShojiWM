@@ -4556,6 +4556,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shojiwm_minka"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "shojiwm_rs",
+ "tracing",
+]
+
+[[package]]
 name = "shojiwm_rs"
 version = "0.1.0"
 dependencies = [

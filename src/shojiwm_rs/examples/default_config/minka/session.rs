@@ -117,14 +117,16 @@ pub fn hang_watchdog() -> HangWatchdog {
 /// The config's `assets/` in the checkout this binary was built from. The
 /// shaders and icons are read from disk when an effect is first drawn, not
 /// compiled in, so while this exists an edit to them here reaches the
-/// installed compositor. The tests read them from here too.
+/// installed compositor. The tests read them from here too. Two packages
+/// build this file, shojiwm_rs (as its example) and shojiwm_minka, and both
+/// sit in src/, so the path goes through src/ to suit either.
 pub const BUILT_ASSETS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/examples/default_config/assets"
+    "/../shojiwm_rs/examples/default_config/assets"
 );
-/// Where MinkaDE's tester install.sh puts a copy, for a binary whose build
-/// checkout is gone, such as a release tarball's, built on CI. Only that
-/// installer makes it: a dist/install.sh install still needs its checkout.
+/// Where MinkaDE's minkade package and tester install.sh put a copy, for a
+/// binary whose build checkout is gone, such as a release tarball's, built on
+/// CI. A dist/install.sh install still needs its checkout.
 const INSTALLED_ASSETS: &str = "/usr/share/minka/shojiwm";
 
 /// Where relative asset paths resolve.

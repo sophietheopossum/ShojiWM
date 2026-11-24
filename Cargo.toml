@@ -6,6 +6,7 @@ members = [
     "src/shojiwm",
     "src/shojiwm_rs",
     "src/xdg-desktop-portal-shojiwm",
+    "src/shojiwm_minka",
 ]
 
 # The smithay fork, pinned once for every crate that uses it: bump the rev
