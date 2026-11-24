@@ -174,22 +174,17 @@ pub fn start_session_apps() {
         return;
     }
     // MinkaShell is the session shell; shoji-bar-2 is retired. Its launcher
-    // (dist/minkashell in the shell's directory) runs the AntiWebUI binary,
-    // or the Quickshell shell it replaced when there is no binary, and
-    // appends the output to ~/.local/state/minka/minkashell.log, so what a
-    // shell printed before it died outlives the session. MINKA_SHELL_DIR
-    // overrides the installed location for repo-checkout sessions (set in
-    // shojiwm-env.fish); tarball installs land in /usr/share/minka.
-    //
-    // A tree from before the launcher gets the Quickshell shell directly.
-    // --log-times there so window-creation lines can be matched against
-    // kernel events: that shell has hung its first GPU job on newly created
-    // contexts (xe GT0 engine reset, always seqno 0xFFFFFF81), and without
-    // timestamps there is nothing to correlate the reset against.
+    // (dist/minkashell in the shell's directory) runs the shell from minka,
+    // restarts it if it dies, and appends the output to
+    // ~/.local/state/minka/minkashell.log, so what a shell printed before it
+    // died outlives the session. MINKA_SHELL_DIR overrides the installed
+    // location for repo-checkout sessions (set in shojiwm-env.fish); the
+    // package installs it in /usr/share/minka. There is no other shell to
+    // fall back to (the Quickshell one is gone).
     COMPOSITOR.process.once(
         "shell",
         Command::shell(
-            "DIR=\"${MINKA_SHELL_DIR:-/usr/share/minka/MinkaShell}\"; [ -x \"$DIR/dist/minkashell\" ] && exec \"$DIR/dist/minkashell\" \"$DIR\"; exec qs --log-times -p \"$DIR\" > /tmp/minkashell.log 2>&1",
+            "DIR=\"${MINKA_SHELL_DIR:-/usr/share/minka/MinkaShell}\"; exec \"$DIR/dist/minkashell\" \"$DIR\"",
         ),
     );
     // MinkaShot: freeze-frame screenshot tool. Runs as a daemon so the
