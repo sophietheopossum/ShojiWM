@@ -187,13 +187,16 @@ pub fn start_session_apps() {
             "DIR=\"${MINKA_SHELL_DIR:-/usr/share/minka/MinkaShell}\"; exec \"$DIR/dist/minkashell\" \"$DIR\"",
         ),
     );
-    // MinkaShot: freeze-frame screenshot tool. Runs as a daemon so the
-    // Print binding's ui.minkashot broadcast always has a listener.
+    // MinkaShot: freeze-frame screenshot tool. Its Rust daemon
+    // (`minkashot daemon`) runs all session, so the Print binding's
+    // ui.minkashot broadcast always has a listener. minka-keep runs it from
+    // minka, appends its output to ~/.local/state/minka/minkashot.log and
+    // restarts it if it dies, as the shell's launcher does. Exec'd, so the
+    // compositor is its parent. MINKA_SHOT_DIR is no longer read here: the
+    // QML tree it named is not started.
     COMPOSITOR.process.once(
         "minkashot",
-        Command::shell(
-            "qs -p \"${MINKA_SHOT_DIR:-/usr/share/minka/MinkaShot}\" > /tmp/minkashot.log 2>&1",
-        ),
+        Command::shell("exec /usr/lib/minka/minka-keep minkashot daemon"),
     );
     // MinkaMon: the system monitor. Started with the session because duo
     // mode designs it in: the ScreenPad's side panel and dock reserve their
