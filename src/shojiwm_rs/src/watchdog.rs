@@ -219,7 +219,8 @@ impl HangWatchdog {
 
 /// `SHOJI_RUNTIME_WATCHDOG=off|0|false`: only log. The environment can turn
 /// the watchdog down, never on, so a session it never reaches stays safe.
-fn env_says_off(value: Option<&str>) -> bool {
+/// `SHOJI_PIN_MEMORY` is read the same way ([`memory_pin`](crate::memory_pin)).
+pub(crate) fn env_says_off(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some("off" | "0" | "false"))
 }
 
@@ -1022,9 +1023,53 @@ fn utc(secs: u64) -> String {
     )
 }
 
+/// Re-run the test `name` of `module` (the caller's `module_path!()`) alone
+/// in a child process, with each variable of `environment` set to its value
+/// or, at `None`, removed. Returns the child's exit status and stderr, and
+/// how long it ran. For a test of what the harness itself is not to go
+/// through: the abort here, a lock on the whole process in `memory_pin`.
+#[cfg(test)]
+pub(crate) fn run_test_in_child(
+    module: &str,
+    name: &str,
+    environment: &[(&str, Option<&std::ffi::OsStr>)],
+) -> (std::process::ExitStatus, String, Duration) {
+    let test = format!(
+        "{}::{name}",
+        module.split_once("::").map_or(module, |(_, path)| path)
+    );
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    for (variable, value) in environment {
+        match value {
+            Some(value) => command.env(variable, value),
+            None => command.env_remove(variable),
+        };
+    }
+    let started = Instant::now();
+    let mut child = command.spawn().unwrap();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(30) {
+            let _ = child.kill(); // this child, by pid
+            panic!("the child never ended");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let elapsed = started.elapsed();
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    (status, stderr, elapsed)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::process::ExitStatusExt, process::Command};
+    use std::os::unix::process::ExitStatusExt;
 
     use super::*;
 
@@ -1598,35 +1643,15 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let test = format!(
-            "{}::{name}",
-            module_path!()
-                .split_once("::")
-                .map_or(module_path!(), |(_, path)| path)
+        let (status, stderr, elapsed) = run_test_in_child(
+            module_path!(),
+            name,
+            &[
+                (CHILD, Some(std::ffi::OsStr::new(scenario))),
+                (CHILD_DIR, Some(dir.as_os_str())),
+                ("SHOJI_RUNTIME_WATCHDOG", None),
+            ],
         );
-        let started = Instant::now();
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-            .env(CHILD, scenario)
-            .env(CHILD_DIR, &dir)
-            .env_remove("SHOJI_RUNTIME_WATCHDOG")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if started.elapsed() > Duration::from_secs(30) {
-                let _ = child.kill(); // this child, by pid
-                panic!("the child never ended");
-            }
-            thread::sleep(10 * MS);
-        };
-        let elapsed = started.elapsed();
-        let mut stderr = String::new();
-        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
         let marker = std::fs::read_to_string(dir.join(MARKER_FILE)).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&dir);
         (status, stderr, marker, elapsed)

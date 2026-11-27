@@ -114,6 +114,14 @@ pub fn hang_watchdog() -> HangWatchdog {
     }
 }
 
+/// Keeps the compositor's memory in RAM (`shojiwm_rs::memory_pin`), so the
+/// desktop does not stand still while one of the compositor's pages comes
+/// back from disk. Off for a nested run: only the compositor that draws the
+/// desktop holds its memory, not a `--dev` instance or a test beside it.
+pub fn pin_memory() -> bool {
+    !nested()
+}
+
 /// The config's `assets/` in the checkout this binary was built from. The
 /// shaders and icons are read from disk when an effect is first drawn, not
 /// compiled in, so while this exists an edit to them here reaches the

@@ -73,6 +73,7 @@ pub mod effect;
 pub mod gpu;
 pub mod input_grab;
 pub mod ipc;
+pub mod memory_pin;
 pub mod output_composition;
 pub mod overlay;
 pub mod power;
@@ -171,6 +172,7 @@ pub struct RustLauncher<F> {
     name: &'static str,
     factory: F,
     hang_watchdog: Option<HangWatchdog>,
+    pin_memory: bool,
 }
 
 impl<F, R> RustLauncher<F>
@@ -185,6 +187,7 @@ where
             name: "rust",
             factory,
             hang_watchdog: Some(HangWatchdog::log_only()),
+            pin_memory: false,
         }
     }
 
@@ -200,6 +203,14 @@ where
         self.hang_watchdog = watchdog.into();
         self
     }
+
+    /// Keep the compositor's memory in RAM, as
+    /// [`ConfigBuilder::pin_memory`] does (see [`memory_pin`]). Off by
+    /// default.
+    pub fn with_pin_memory(mut self, pin: bool) -> Self {
+        self.pin_memory = pin;
+        self
+    }
 }
 
 impl<F, R> RuntimeLauncher for RustLauncher<F>
@@ -212,6 +223,7 @@ where
     }
 
     fn launch(&self, context: LaunchContext) -> Box<dyn ConfigRuntime> {
+        memory_pin::apply(self.pin_memory);
         watchdog::launch(self.hang_watchdog.clone(), || (self.factory)(context))
     }
 }

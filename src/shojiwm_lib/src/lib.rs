@@ -82,6 +82,11 @@ pub mod xwayland_satellite;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+/// Whether this is a `heap-debug` build (the feature of that name): mimalloc
+/// then runs in its `secure` and `debug` modes, and `debug` turns on its
+/// internal assertions.
+pub const HEAP_DEBUG: bool = cfg!(feature = "heap-debug");
+
 /// Start ShojiWM with `launcher`'s config runtime. This is the whole `main` of
 /// a ShojiWM binary:
 ///

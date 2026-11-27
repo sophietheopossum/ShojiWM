@@ -35,6 +35,7 @@ use crate::{
     compositor::{
         self, DisableEvent, EnableEvent, InputChangeEvent, OutputChangeEvent, SurfaceRef,
     },
+    memory_pin,
     reactive::{Observer, Scope, batch, untrack},
     runtime::{self, ComposedView, WindowEntry, emit, with_registry},
     view::{Child, Composition, DirtySet, Flex, MountedNode, ViewContext, ViewTree},
@@ -51,6 +52,7 @@ pub struct ConfigBuilder {
     asset_root: Option<PathBuf>,
     start_locked: bool,
     hang_watchdog: Option<HangWatchdog>,
+    pin_memory: bool,
 }
 
 impl ConfigBuilder {
@@ -61,6 +63,7 @@ impl ConfigBuilder {
             asset_root: None,
             start_locked: false,
             hang_watchdog: Some(HangWatchdog::log_only()),
+            pin_memory: false,
         }
     }
 
@@ -94,6 +97,18 @@ impl ConfigBuilder {
         self
     }
 
+    /// Keep the compositor's memory in RAM: at launch, lock every page the
+    /// process has touched or touches later (`mlockall`), so the compositor
+    /// thread does not wait for one to come back from swap or from a file.
+    /// Done only when the hard memlock limit is unlimited (a lower soft
+    /// limit is raised to it), and one line in the log says what happened.
+    /// `SHOJI_PIN_MEMORY=off` turns it off; see [`memory_pin`] for what it
+    /// covers and what it costs. Off by default.
+    pub fn pin_memory(mut self, pin: bool) -> Self {
+        self.pin_memory = pin;
+        self
+    }
+
     /// Run the compositor with this config. This is the whole `main`.
     pub fn run(self) -> std::process::ExitCode {
         shojiwm_lib::run(self)
@@ -106,6 +121,7 @@ impl RuntimeLauncher for ConfigBuilder {
     }
 
     fn launch(&self, context: LaunchContext) -> Box<dyn ConfigRuntime> {
+        memory_pin::apply(self.pin_memory);
         let (setup, asset_root) = (self.setup.clone(), self.asset_root.clone());
         watchdog::launch(self.hang_watchdog.clone(), move || {
             ReactiveRuntime::start(setup, asset_root, context)

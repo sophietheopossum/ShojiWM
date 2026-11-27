@@ -58,6 +58,7 @@ pub fn main() -> std::process::ExitCode {
     ConfigBuilder::new(setup)
         .name("minka")
         .hang_watchdog(session::hang_watchdog())
+        .pin_memory(session::pin_memory())
         .asset_root(session::asset_root())
         .run()
 }
